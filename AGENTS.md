@@ -33,6 +33,8 @@ cargo test --all-features
 
 - Conventional Commits (see CONTRIBUTING.md). Write the subject in the present tense, imperative
   voice: `feat: add fetch TTL`, not `added` or `adds`.
+- Keep the body minimal. The subject alone is often enough; add body lines only for the
+  non-obvious *why*. Do not restate the diff or enumerate every file changed.
 - Disclose AI with an `Assisted-by: Claude:claude-opus-4-8` trailer. Never `Co-Authored-By`, and
   never add a human's `Signed-off-by`.
 
