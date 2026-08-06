@@ -7,6 +7,7 @@
 //!   POST <repo>/git-upload-pack                    -> packfile (streamed)
 //!   anything git-receive-pack                      -> 403 (read-only)
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -91,6 +92,19 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
         let body = match axum::body::to_bytes(body, MAX_BODY).await {
             Ok(b) => b,
             Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
+        };
+        // Git's smart-HTTP client gzips the upload-pack request body (any
+        // normally-sized want/have negotiation) and sends `Content-Encoding:
+        // gzip`. `git upload-pack` reads its stdin as raw pkt-lines, so we must
+        // undo the transport encoding before handing the body over - otherwise
+        // it chokes on the gzip magic with "bad line length character".
+        let content_encoding = parts
+            .headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+        let body = match decode_body(content_encoding, body) {
+            Ok(b) => b,
+            Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
         };
         return upload_pack(st, &path, git_protocol.as_deref(), body).await;
     }
@@ -198,6 +212,25 @@ fn check_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
             StatusCode::UNAUTHORIZED,
             "missing or invalid bearer token",
         ))
+    }
+}
+
+/// Undo the request's `Content-Encoding`. Git only ever gzips, so that is the
+/// single encoding we decode; an absent/`identity` header passes through
+/// untouched, and any other encoding is rejected by the caller as a bad body.
+fn decode_body(content_encoding: Option<&str>, body: Bytes) -> std::io::Result<Bytes> {
+    match content_encoding.map(str::trim) {
+        Some(enc) if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") => {
+            let mut out = Vec::with_capacity(body.len() * 4);
+            flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out)?;
+            Ok(Bytes::from(out))
+        }
+        None => Ok(body),
+        Some(enc) if enc.is_empty() || enc.eq_ignore_ascii_case("identity") => Ok(body),
+        Some(other) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported content-encoding: {other}"),
+        )),
     }
 }
 

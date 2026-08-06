@@ -7,15 +7,19 @@
 //!
 //! Requires `git` on PATH (the proxy's whole design delegates to it).
 
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::ServiceExt; // for `oneshot`
 
 /// Run a git command in `cwd` with a hermetic identity/config, asserting success.
 fn git(cwd: &Path, args: &[&str]) -> String {
@@ -35,6 +39,97 @@ fn git(cwd: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Frame a string as a single pkt-line, the way git builds a protocol-v2 request.
+fn pkt(s: &str) -> Vec<u8> {
+    let mut v = format!("{:04x}", s.len() + 4).into_bytes();
+    v.extend_from_slice(s.as_bytes());
+    v
+}
+
+/// Regression test for the gzip transport bug: git's smart-HTTP client
+/// compresses the `git-upload-pack` request body and sends `Content-Encoding:
+/// gzip`. The proxy must decode it before handing the bytes to `git
+/// upload-pack`; before the fix it forwarded the gzip stream verbatim and
+/// upload-pack died with "protocol error: bad line length character". The happy
+/// path above never caught this because git only gzips past a size threshold, so
+/// a tiny clone slips through uncompressed. Here we build a protocol-v2 `ls-refs`
+/// request, gzip it ourselves, and assert the proxy still serves the refs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_pack_decodes_gzip_encoded_request() {
+    // Upstream bare repo with a known branch.
+    let work = tempfile::tempdir().unwrap();
+    git(work.path(), &["init", "-q", "-b", "main", "."]);
+    std::fs::write(work.path().join("README.md"), "hello\n").unwrap();
+    git(work.path(), &["add", "."]);
+    git(work.path(), &["commit", "-q", "-m", "init"]);
+
+    let up = tempfile::tempdir().unwrap();
+    let upstream_repo = up.path().join("repo.git");
+    git(
+        work.path(),
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            ".",
+            upstream_repo.to_str().unwrap(),
+        ],
+    );
+
+    // Proxy over the file:// upstream (in-process, driven via `oneshot`).
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let cfg = GitConfig {
+        git_binary: "git".into(),
+        upstream_auth_header: None,
+        fetch_ttl: Duration::from_secs(0),
+    };
+    let state = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone())),
+        upstream_base: format!("file://{}", up.path().display()),
+        cache_root: cache.path().to_path_buf(),
+        serve_token: None,
+        metrics,
+    };
+
+    // Build a minimal protocol-v2 `ls-refs` request and gzip it, exactly as a
+    // real client frames + compresses the POST body.
+    let mut req = Vec::new();
+    req.extend_from_slice(&pkt("command=ls-refs\n"));
+    req.extend_from_slice(&pkt("object-format=sha1\n"));
+    req.extend_from_slice(b"0001"); // delim-pkt: end of capabilities
+    req.extend_from_slice(b"0000"); // flush-pkt: end of request
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&req).unwrap();
+    let gz = enc.finish().unwrap();
+
+    let resp = router(state)
+        .oneshot(
+            Request::post("/repo.git/git-upload-pack")
+                .header("content-type", "application/x-git-upload-pack-request")
+                .header("content-encoding", "gzip")
+                .header("git-protocol", "version=2")
+                .body(Body::from(gz))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "gzip-encoded upload-pack POST should be accepted"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("refs/heads/main"),
+        "ls-refs response should list refs/heads/main; got: {text:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

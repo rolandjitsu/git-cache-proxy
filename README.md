@@ -73,7 +73,7 @@ Every flag has an environment-variable equivalent.
 | `--bind`                 | `GITCACHEPROXY_BIND`                 | `0.0.0.0:8080`               | Listen address                                                                 |
 | `--cache-root`           | `GITCACHEPROXY_CACHE_ROOT`           | `/var/cache/git-cache-proxy` | Where bare mirrors live                                                        |
 | `--upstream`             | `GITCACHEPROXY_UPSTREAM`             | - (required)                 | Origin git base URL                                                            |
-| `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | e.g. `Authorization: Bearer <token>`; injected via env so it stays out of argv |
+| `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if refreshed within this window (`0` = always fetch)       |
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
@@ -83,9 +83,35 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus).
 ## Auth model
 
 - **Upstream:** the proxy holds a single read-only credential (`--upstream-auth-header`)
-  used only to `fetch`/`clone`. It never writes upstream.
+  used only to `fetch`/`clone`. It never writes upstream. The value is the full
+  header line and is passed verbatim to git as `http.extraHeader`. If it is
+  unset/blank the proxy warns at startup and contacts upstream anonymously.
 - **Clients:** anonymous by default (intended for a network-restricted
   deployment); set `--serve-token` to require a bearer token.
+
+### GitLab with a personal access token
+
+GitLab's git smart-HTTP endpoint authenticates a PAT via **HTTP Basic** auth
+(the PAT is the password; any non-empty username works) — not `Authorization:
+Bearer` (OAuth2 access tokens only) and not the `PRIVATE-TOKEN` header (REST API
+only). Build the header as Basic auth:
+
+```bash
+export GITCACHEPROXY_UPSTREAM_AUTH_HEADER="Authorization: Basic $(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
+```
+
+Verify it against the git endpoint before wiring up the proxy — a `200` means
+the header works, a `401` means the scheme is wrong:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "$GITCACHEPROXY_UPSTREAM_AUTH_HEADER" \
+  "https://gitlab.example.com/group/repo.git/info/refs?service=git-upload-pack"
+```
+
+When passing it into a container, prefer `-e GITCACHEPROXY_UPSTREAM_AUTH_HEADER`
+(no `=`) so an unset variable is dropped with a warning rather than silently
+forwarded as an empty string.
 
 ## Deploy
 

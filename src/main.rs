@@ -28,9 +28,28 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("create cache root {}", cfg.cache_root.display()))?;
 
+    // Normalize the upstream auth header: an env var set to an empty string
+    // (the classic `-e VAR="$UNSET"` footgun) parses as `Some("")`, which would
+    // inject a blank `http.extraHeader` - auth-less, but silently so. Collapse
+    // any blank value to `None` and warn, so a missing token is visible at
+    // startup instead of surfacing later as an upstream 401.
+    let upstream_auth_header = cfg
+        .upstream_auth_header
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string);
+    if upstream_auth_header.is_none() {
+        tracing::warn!(
+            "no upstream auth header set; contacting upstream anonymously - \
+             private repos will fail with an upstream 401 \
+             (set --upstream-auth-header / GITCACHEPROXY_UPSTREAM_AUTH_HEADER)"
+        );
+    }
+
     let git_cfg = git::GitConfig {
         git_binary: cfg.git_binary.clone(),
-        upstream_auth_header: cfg.upstream_auth_header.clone(),
+        upstream_auth_header,
         fetch_ttl: Duration::from_secs(cfg.fetch_ttl_seconds),
     };
 
