@@ -9,8 +9,8 @@ use anyhow::{Result, bail};
 /// A resolved repository: where to fetch it from and where it is cached.
 #[derive(Debug, Clone)]
 pub struct RepoRef {
-    /// Normalised repo path, e.g. `mujin/dev/foo.git`. Used as the cache key and
-    /// as the sub-path under the cache root.
+    /// Normalised repo path, e.g. `group/team/foo.git`. Used as the cache key
+    /// and as the sub-path under the cache root.
     pub name: String,
     /// Full upstream clone URL.
     pub upstream_url: String,
@@ -58,8 +58,8 @@ mod tests {
     #[test]
     fn strips_suffixes() {
         assert_eq!(
-            repo_name_from_path("/mujin/dev/foo.git/info/refs", "/info/refs").as_deref(),
-            Some("mujin/dev/foo.git")
+            repo_name_from_path("/group/team/foo.git/info/refs", "/info/refs").as_deref(),
+            Some("group/team/foo.git")
         );
         assert_eq!(
             repo_name_from_path("/a/b.git/git-upload-pack", "/git-upload-pack").as_deref(),

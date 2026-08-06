@@ -89,14 +89,32 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus).
 
 ## Deploy
 
-The runtime image must contain `git`. See `Dockerfile`.
+The `Dockerfile` builds a statically linked (musl) binary and drops it onto a
+minimal Alpine base. Because all wire-protocol work is delegated to the system
+`git` binary, the runtime image must contain `git` - so it is Alpine-with-git
+rather than a fully distroless/`FROM scratch` image. Removing that dependency
+(and enabling a git-free image) means moving the git plumbing in-process to a
+Rust library - see the roadmap below.
 
 ## Status / scope
 
-Working and end-to-end tested (v2 + v0 clone, incremental delta fetch, push
-rejection). Not yet implemented, in rough priority order: LRU disk eviction of
-idle mirrors, per-repo fetch metrics/latency histograms, and a background
-refresh option. Contributions welcome.
+Working and end-to-end tested against both Git wire protocol versions — the
+modern **v2** (`git-protocol` header, the default since Git 2.26) and the legacy
+**v0/v1** advertisement — covering full clone, incremental delta fetch, and
+push rejection.
+
+Not yet implemented, in rough priority order:
+
+- LRU disk eviction of idle mirrors (the cache currently grows unbounded).
+- Per-repo latency histograms (fetch/serve durations); per-repo counters exist.
+- A background/scheduled refresh option (today every `info/refs` triggers an
+  on-demand, TTL-coalesced fetch).
+- No external `git` binary: move the plumbing in-process to a Rust library
+  (`gitoxide`/`git2`). More robust (no subprocess/argv surface, structured
+  errors) and unlocks a fully distroless, git-free image - a larger change,
+  tracked as a possible v2.
+
+Contributions welcome.
 
 ## License
 
