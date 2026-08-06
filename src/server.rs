@@ -62,7 +62,7 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
         .map(str::to_string);
 
     if let Some(resp) = check_auth(&st, &parts.headers) {
-        st.metrics.record_request("auth", "unauthorized");
+        st.metrics.record_request("auth", "unauthorized", "-");
         return resp;
     }
 
@@ -70,7 +70,7 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
     if path.ends_with(&format!("/{RECEIVE_PACK}"))
         || query.contains(&format!("service={RECEIVE_PACK}"))
     {
-        st.metrics.record_request("receive_pack", "rejected");
+        st.metrics.record_request("receive_pack", "rejected", "-");
         return err(
             StatusCode::FORBIDDEN,
             "read-only proxy: pushes are not allowed",
@@ -79,7 +79,7 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
 
     if parts.method == Method::GET && path.ends_with("/info/refs") {
         if !query.contains(&format!("service={UPLOAD_PACK}")) {
-            st.metrics.record_request("info_refs", "error");
+            st.metrics.record_request("info_refs", "error", "-");
             return err(
                 StatusCode::BAD_REQUEST,
                 "only smart-http git-upload-pack is supported",
@@ -114,13 +114,13 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
 
 async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Response {
     let Some(name) = repo::repo_name_from_path(path, "/info/refs") else {
-        st.metrics.record_request("info_refs", "error");
+        st.metrics.record_request("info_refs", "error", "-");
         return err(StatusCode::NOT_FOUND, "bad path");
     };
     let repo = match repo::resolve(&name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
-            st.metrics.record_request("info_refs", "error");
+            st.metrics.record_request("info_refs", "error", "-");
             return err(StatusCode::BAD_REQUEST, &e.to_string());
         }
     };
@@ -128,14 +128,15 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
     // The upstream clone/fetch counters (per repo, including their own errors) are
     // recorded inside `GitCache`; here we only account for the client request.
     if let Err(e) = st.cache.ensure_fresh(&repo, true).await {
-        st.metrics.record_request("info_refs", "upstream_error");
+        st.metrics
+            .record_request("info_refs", "upstream_error", &name);
         tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
         return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
     }
 
     match st.cache.advertise_refs(&repo, git_protocol).await {
         Ok(body) => {
-            st.metrics.record_request("info_refs", "ok");
+            st.metrics.record_request("info_refs", "ok", &name);
             Response::builder()
                 .header(
                     header::CONTENT_TYPE,
@@ -146,7 +147,7 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
                 .expect("valid response")
         }
         Err(e) => {
-            st.metrics.record_request("info_refs", "error");
+            st.metrics.record_request("info_refs", "error", &name);
             tracing::warn!(repo = %name, error = %e, "advertise_refs failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "advertise-refs failed")
         }
@@ -160,13 +161,13 @@ async fn upload_pack(
     body: Bytes,
 ) -> Response {
     let Some(name) = repo::repo_name_from_path(path, &format!("/{UPLOAD_PACK}")) else {
-        st.metrics.record_request("upload_pack", "error");
+        st.metrics.record_request("upload_pack", "error", "-");
         return err(StatusCode::NOT_FOUND, "bad path");
     };
     let repo = match repo::resolve(&name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
-            st.metrics.record_request("upload_pack", "error");
+            st.metrics.record_request("upload_pack", "error", "-");
             return err(StatusCode::BAD_REQUEST, &e.to_string());
         }
     };
@@ -174,14 +175,15 @@ async fn upload_pack(
     // The preceding info/refs already refreshed; here just ensure the mirror is
     // present (a client could POST against a not-yet-cloned repo).
     if let Err(e) = st.cache.ensure_fresh(&repo, false).await {
-        st.metrics.record_request("upload_pack", "upstream_error");
+        st.metrics
+            .record_request("upload_pack", "upstream_error", &name);
         tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
         return err(StatusCode::BAD_GATEWAY, "upstream unavailable");
     }
 
     match st.cache.upload_pack_rpc(&repo, git_protocol, body).await {
         Ok(stream) => {
-            st.metrics.record_request("upload_pack", "ok");
+            st.metrics.record_request("upload_pack", "ok", &name);
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
                 .header(header::CACHE_CONTROL, "no-cache")
@@ -189,7 +191,7 @@ async fn upload_pack(
                 .expect("valid response")
         }
         Err(e) => {
-            st.metrics.record_request("upload_pack", "error");
+            st.metrics.record_request("upload_pack", "error", &name);
             tracing::warn!(repo = %name, error = %e, "upload_pack_rpc failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "upload-pack failed")
         }

@@ -217,6 +217,20 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         scraped.contains(r#"op="clone""#) && scraped.contains(r#"repo="repo.git""#),
         "missing per-repo clone metric:\n{scraped}"
     );
+    // The client-request counters carry the repo label too: a clone drives both
+    // an info/refs advertisement and an upload-pack, each recorded per repo.
+    assert!(
+        scraped.contains(
+            r#"gitcacheproxy_requests_total{kind="info_refs",repo="repo.git",result="ok"}"#
+        ),
+        "missing per-repo info_refs request metric:\n{scraped}"
+    );
+    assert!(
+        scraped.contains(
+            r#"gitcacheproxy_requests_total{kind="upload_pack",repo="repo.git",result="ok"}"#
+        ),
+        "missing per-repo upload_pack request metric:\n{scraped}"
+    );
 
     // A second clone finds the mirror present and (fetch_ttl = 0) drives an
     // incremental fetch rather than a re-clone - exercising the fetch path and
