@@ -1,8 +1,12 @@
-# macOS
+/target
+Cargo.lock.bak
+*.swp
+
+### macOS ###
 .DS_Store
 .localized
 __MACOSX/
 .AppleDouble
 .LSOverride
 Icon[]
-
+._*

@@ -1,0 +1,5 @@
+# Project-specific spellings that the typos dictionary would otherwise flag.
+[default.extend-words]
+# `healthz`/`readyz` are conventional Kubernetes probe endpoint names, not typos.
+healthz = "healthz"
+readyz = "readyz"

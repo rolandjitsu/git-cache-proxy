@@ -1,0 +1,6 @@
+# Keep the build context small: the Dockerfile only needs the crate sources and the
+# lockfile. Everything else (build output, git, CI, docs) is excluded.
+target/
+.git/
+.github/
+*.md

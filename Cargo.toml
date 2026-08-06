@@ -1,0 +1,39 @@
+# A read-only caching proxy for Git repositories. Self-contained (no workspace
+# path deps) so it can be lifted into its own repo and open-sourced as-is.
+[package]
+name = "git_cache_proxy"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Read-only caching proxy for Git: serves clones/fetches from an in-region mirror, pulling only deltas from upstream."
+repository = "https://github.com/rolandjitsu/git-proxy-server"
+keywords = ["git", "cache", "proxy", "ci", "mirror"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "git-cache-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.7"
+bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+prometheus = { version = "0.13", default-features = false }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "process",
+    "io-util",
+    "fs",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

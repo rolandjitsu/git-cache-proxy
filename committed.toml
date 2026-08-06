@@ -1,0 +1,5 @@
+# Enforce Conventional Commits (used by the local prek hook and the CI `committed` job).
+# Conventional types are lowercase, so the capitalized-subject rule is off.
+style = "conventional"
+subject_capitalized = false
+allowed_types = ["build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test"]
