@@ -25,6 +25,7 @@ use tokio::process::{ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
+use crate::metrics::Metrics;
 use crate::repo::RepoRef;
 
 /// What `ensure_fresh` did - for metrics.
@@ -48,22 +49,31 @@ pub struct GitConfig {
     pub fetch_ttl: Duration,
 }
 
-/// Per-repo serialization point. Holding `fetch_lock` both serializes concurrent
-/// fetches for one repo (so a burst of clones triggers a single upstream pull)
-/// and guards its last-fetch timestamp for the TTL check.
+/// Per-repo serialization point. `fetch_lock` is a `Mutex`, not an `RwLock`, on
+/// purpose: it does double duty as (1) the mutual-exclusion point that collapses a
+/// burst of concurrent clones for one repo into a single upstream pull, and (2) the
+/// guard for the last-fetch `Instant` it holds. Both uses need *exclusive* access
+/// while a fetch runs - there is no read-only fast path to share - so an `RwLock`
+/// would only add overhead and never grant a concurrent reader.
 struct RepoSlot {
     fetch_lock: Mutex<Option<Instant>>,
 }
 
 pub struct GitCache {
     cfg: GitConfig,
+    metrics: Arc<Metrics>,
+    /// Map of repo name -> its serialization slot. A plain `Mutex` (not `RwLock`)
+    /// because every access is a get-or-insert (`entry`), which needs a write lock
+    /// anyway, and the critical section is a single O(1) map operation - far too
+    /// short for reader/writer separation to pay off.
     slots: Mutex<HashMap<String, Arc<RepoSlot>>>,
 }
 
 impl GitCache {
-    pub fn new(cfg: GitConfig) -> Self {
+    pub fn new(cfg: GitConfig, metrics: Arc<Metrics>) -> Self {
         Self {
             cfg,
+            metrics,
             slots: Mutex::new(HashMap::new()),
         }
     }
@@ -163,9 +173,15 @@ impl GitCache {
             .context("write upload-pack request")?;
         drop(stdin); // EOF so upload-pack starts producing the pack
 
-        // Reap the child (so a non-zero exit is logged) while the caller streams
-        // stdout. Dropping `child` after take() does not kill the process, and
-        // stdout stays readable until EOF.
+        // The response is the stdout stream we return; the caller (and ultimately
+        // the HTTP client) drives it to completion by reading to EOF. We can't make
+        // this method block until the child exits without buffering the whole
+        // (potentially multi-GB) packfile in memory first, which defeats streaming.
+        // So we detach a task purely to *reap* the child - dropping `child` after
+        // `take()` neither kills it nor waits on it, leaving a zombie - and to log a
+        // non-zero exit. Its completion carries no result the caller needs: a failed
+        // upload-pack simply truncates the stream, which the git client detects as a
+        // broken pack. This is best-effort observability, not control flow.
         let name = repo.name.clone();
         tokio::spawn(async move {
             match child.wait().await {
@@ -190,6 +206,10 @@ impl GitCache {
         let tmp = repo.cache_dir.with_extension("tmp");
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tracing::info!(repo = %repo.name, "cloning mirror from upstream");
+        // `--mirror` copies *every* ref (all branches, tags, and notes) into a bare
+        // repo, not just HEAD, and maps them 1:1 so a later `fetch` keeps them in
+        // sync. The client then negotiates whatever ref it wants via upload-pack, so
+        // the mirror can serve any branch/tag/sha the origin has - never HEAD-only.
         let status = self
             .fetch_cmd()
             .arg("clone")
@@ -202,16 +222,22 @@ impl GitCache {
             .context("spawn git clone --mirror")?;
         if !status.success() {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
+            self.metrics.record_upstream("clone", "error", &repo.name);
             bail!("git clone --mirror failed for {}", repo.name);
         }
         tokio::fs::rename(&tmp, &repo.cache_dir)
             .await
             .context("rename mirror into place")?;
+        self.metrics.record_upstream("clone", "ok", &repo.name);
         Ok(())
     }
 
     async fn fetch(&self, repo: &RepoRef) -> Result<()> {
         tracing::debug!(repo = %repo.name, "fetching updates from upstream");
+        // Run inside the bare mirror and fetch `origin`: `clone --mirror` above sets
+        // up exactly one remote named `origin` (git's default remote name) pointing at
+        // the upstream URL, with a mirror refspec that updates all refs. So `origin`
+        // is not an assumption about the client - it is the remote this proxy created.
         let status = self
             .fetch_cmd()
             .current_dir(&repo.cache_dir)
@@ -223,8 +249,10 @@ impl GitCache {
             .await
             .context("spawn git fetch")?;
         if !status.success() {
+            self.metrics.record_upstream("fetch", "error", &repo.name);
             bail!("git fetch failed for {}", repo.name);
         }
+        self.metrics.record_upstream("fetch", "ok", &repo.name);
         Ok(())
     }
 

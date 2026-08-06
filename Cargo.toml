@@ -1,5 +1,4 @@
-# A read-only caching proxy for Git repositories. Self-contained (no workspace
-# path deps) so it can be lifted into its own repo and open-sourced as-is.
+# A read-only caching proxy for Git repositories.
 [package]
 name = "git_cache_proxy"
 version = "0.1.0"
@@ -33,7 +32,9 @@ tokio = { version = "1", features = [
 ] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

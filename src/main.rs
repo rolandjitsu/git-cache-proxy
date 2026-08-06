@@ -7,12 +7,6 @@
 //! only the delta crosses the WAN. Strictly pull-only: it never pushes and never
 //! proactively replicates.
 
-mod config;
-mod git;
-mod metrics;
-mod repo;
-mod server;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,17 +14,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use git_cache_proxy::config::{Config, LogFormat};
+use git_cache_proxy::{git, metrics, server};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cfg = Config::parse();
+    // Hold the non-blocking writer's guard for the whole process; its drop flushes
+    // any buffered log lines on exit.
+    let _log_guard = init_tracing(&cfg.log, cfg.log_format);
 
     tokio::fs::create_dir_all(&cfg.cache_root)
         .await
@@ -42,12 +34,13 @@ async fn main() -> Result<()> {
         fetch_ttl: Duration::from_secs(cfg.fetch_ttl_seconds),
     };
 
+    let metrics = Arc::new(metrics::Metrics::new());
     let state = server::AppState {
-        cache: Arc::new(git::GitCache::new(git_cfg)),
+        cache: Arc::new(git::GitCache::new(git_cfg, metrics.clone())),
         upstream_base: cfg.upstream.trim_end_matches('/').to_string(),
         cache_root: cfg.cache_root.clone(),
         serve_token: cfg.serve_token.clone(),
-        metrics: Arc::new(metrics::Metrics::new()),
+        metrics,
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
@@ -64,10 +57,49 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("http server")?;
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
+/// Initialize logging to a non-blocking stdout writer. Returns the writer's guard,
+/// which must be held for the process lifetime (its drop flushes buffered logs).
+/// The `RUST_LOG` env var, if set, overrides `filter`.
+fn init_tracing(filter: &str, format: LogFormat) -> tracing_appender::non_blocking::WorkerGuard {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let base = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .with_writer(writer);
+    match format {
+        LogFormat::Json => base.json().flatten_event(true).init(),
+        LogFormat::Text => base.init(),
+    }
+    guard
+}
+
+/// Completes on Ctrl-C or, on Unix, SIGTERM (Kubernetes/`docker stop` send SIGTERM
+/// on shutdown), so the server drains in-flight requests before exiting either way.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
+    tracing::info!("shutdown signal received; draining");
 }

@@ -3,7 +3,16 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogFormat {
+    /// Human-readable single-line text.
+    Text,
+    /// One JSON object per line (for log shippers).
+    Json,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -54,4 +63,18 @@ pub struct Config {
     /// Path to the git binary.
     #[arg(long, env = "GITCACHEPROXY_GIT_BINARY", default_value = "git")]
     pub git_binary: String,
+
+    /// Log filter directive (e.g. `info`, `git_cache_proxy=debug,tower=warn`).
+    /// Overridden by the `RUST_LOG` environment variable when set.
+    #[arg(long, env = "GITCACHEPROXY_LOG", default_value = "info")]
+    pub log: String,
+
+    /// Log output format.
+    #[arg(
+        long,
+        value_enum,
+        env = "GITCACHEPROXY_LOG_FORMAT",
+        default_value = "text"
+    )]
+    pub log_format: LogFormat,
 }
