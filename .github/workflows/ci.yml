@@ -59,9 +59,12 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Test and collect coverage
+        # Exclude the thin binary shim (src/main.rs: arg parsing, wiring, serve) from
+        # the coverage number - it is not unit-testable and the logic it wires up is
+        # covered via the library by the integration tests. Fail if under 80%.
         run: |
-          cargo llvm-cov --all-features --locked --lcov --output-path lcov.info
-          cargo llvm-cov report --summary-only
+          cargo llvm-cov --all-features --locked --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info
+          cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --summary-only --fail-under-lines 80
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
