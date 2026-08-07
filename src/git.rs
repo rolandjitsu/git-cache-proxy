@@ -222,7 +222,10 @@ impl GitCache {
             .context("spawn git clone --mirror")?;
         if !status.success() {
             let _ = tokio::fs::remove_dir_all(&tmp).await;
-            self.metrics.record_upstream("clone", "error", &repo.name);
+            // `-` not the repo name: a failed clone must not mint a per-repo series
+            // for an arbitrary client-supplied path (see `metrics`). The failing
+            // repo is still named in the returned error, which the caller logs.
+            self.metrics.record_upstream("clone", "error", "-");
             bail!("git clone --mirror failed for {}", repo.name);
         }
         tokio::fs::rename(&tmp, &repo.cache_dir)
@@ -249,7 +252,7 @@ impl GitCache {
             .await
             .context("spawn git fetch")?;
         if !status.success() {
-            self.metrics.record_upstream("fetch", "error", &repo.name);
+            self.metrics.record_upstream("fetch", "error", "-");
             bail!("git fetch failed for {}", repo.name);
         }
         self.metrics.record_upstream("fetch", "ok", &repo.name);

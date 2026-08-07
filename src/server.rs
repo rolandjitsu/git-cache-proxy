@@ -128,11 +128,13 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
         }
     };
 
-    // The upstream clone/fetch counters (per repo, including their own errors) are
-    // recorded inside `GitCache`; here we only account for the client request.
+    // The upstream clone/fetch counters (per repo) are recorded inside `GitCache`;
+    // here we only account for the client request. The `repo` label is emitted only
+    // once a request is served; failures use `-` so a flood of distinct but doomed
+    // repo paths cannot inflate label cardinality (see `metrics`).
     if let Err(e) = st.cache.ensure_fresh(&repo, true).await {
         st.metrics
-            .record_request("info_refs", "upstream_error", &name);
+            .record_request("info_refs", "upstream_error", "-");
         tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
         return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
     }
@@ -150,7 +152,7 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
                 .expect("valid response")
         }
         Err(e) => {
-            st.metrics.record_request("info_refs", "error", &name);
+            st.metrics.record_request("info_refs", "error", "-");
             tracing::warn!(repo = %name, error = %e, "advertise_refs failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "advertise-refs failed")
         }
@@ -179,7 +181,7 @@ async fn upload_pack(
     // present (a client could POST against a not-yet-cloned repo).
     if let Err(e) = st.cache.ensure_fresh(&repo, false).await {
         st.metrics
-            .record_request("upload_pack", "upstream_error", &name);
+            .record_request("upload_pack", "upstream_error", "-");
         tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
         return err(StatusCode::BAD_GATEWAY, "upstream unavailable");
     }
@@ -194,7 +196,7 @@ async fn upload_pack(
                 .expect("valid response")
         }
         Err(e) => {
-            st.metrics.record_request("upload_pack", "error", &name);
+            st.metrics.record_request("upload_pack", "error", "-");
             tracing::warn!(repo = %name, error = %e, "upload_pack_rpc failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "upload-pack failed")
         }
