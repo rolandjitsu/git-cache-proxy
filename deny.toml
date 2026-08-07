@@ -1,0 +1,33 @@
+# cargo-deny configuration: security advisories, license policy, and source
+# allowlisting for the dependency tree. Run locally with `cargo deny check`; the
+# CI `Dependencies` job runs the same check on every dependency change.
+
+[advisories]
+# RUSTSEC advisories. Fail on vulnerable, unsound, or unmaintained crates (the
+# defaults) and on any crate resolved to a yanked version. Add crate-specific
+# waivers to `ignore` with a comment justifying each.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The crate is Apache-2.0; only permissive, redistribution-compatible licenses
+# are allowed in the tree. Every dependency's SPDX expression must be satisfiable
+# from this set - note the `AND` expressions in the tree (e.g. `MIT AND
+# BSD-3-Clause`, `... AND Unicode-3.0`) require every listed term to be allowed.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Surface, but do not fail on, duplicate versions of a crate so dependency bloat
+# stays visible without blocking unrelated work.
+multiple-versions = "warn"
+
+[sources]
+# crates.io only: reject crates from unknown registries or git sources.
+unknown-registry = "deny"
+unknown-git = "deny"

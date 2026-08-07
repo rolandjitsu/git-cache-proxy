@@ -26,6 +26,7 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'deny.toml'
               - '.github/workflows/ci.yml'
 
   lint:
@@ -70,6 +71,19 @@ jobs:
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Scan the dependency tree for security advisories, disallowed licenses, and
+  # non-crates.io sources (config in deny.toml).
+  deny:
+    name: Dependencies
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
 
   # Spelling runs on everything, including docs.
   typos:

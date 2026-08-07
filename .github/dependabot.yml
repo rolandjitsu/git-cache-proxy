@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Rust dependencies. Group routine minor/patch bumps into one PR; majors come
+  # as individual PRs so breaking changes get their own review.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor:
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions pinned in the workflows (checkout, docker, etc.).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor:
+        update-types: ["minor", "patch"]
