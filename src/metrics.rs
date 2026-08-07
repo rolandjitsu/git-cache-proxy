@@ -3,10 +3,13 @@
 //!
 //! Cardinality note: both `requests_total` and `upstream_ops_total` carry a
 //! `repo` label so operators can see per-repo traffic and totals
-//! (`sum without (repo) (...)`). The repo set of a CI proxy is bounded (the repos
-//! its fleet clones), so this is safe. Requests rejected before a repo is
-//! resolved - failed auth, malformed paths - use a `-` sentinel, so
-//! unauthenticated or garbage traffic cannot inflate the series count.
+//! (`sum without (repo) (...)`). To keep the label set bounded, the real repo
+//! name is emitted only for operations that *succeeded* (a served request, a
+//! completed clone/fetch); every failure - failed auth, malformed path,
+//! upstream error, a resolved-but-nonexistent repo - uses a `-` sentinel. The
+//! set of successfully served repos is bounded (the repos the fleet actually
+//! clones), so a flood of distinct but doomed repo paths cannot inflate the
+//! series count.
 
 use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
 
@@ -14,9 +17,10 @@ pub struct Metrics {
     pub registry: Registry,
     /// `requests_total{kind, result, repo}` - kind = info_refs | upload_pack |
     /// auth | receive_pack; result = ok | error | upstream_error | unauthorized |
-    /// rejected; repo = resolved repo path, or `-` when rejected pre-resolution.
+    /// rejected; repo = the served repo path when result = ok, else `-`.
     requests: IntCounterVec,
-    /// `upstream_ops_total{op, result, repo}` - op = clone | fetch; result = ok | error.
+    /// `upstream_ops_total{op, result, repo}` - op = clone | fetch; result = ok |
+    /// error; repo = the repo path when result = ok, else `-`.
     upstream: IntCounterVec,
 }
 
@@ -49,16 +53,18 @@ impl Metrics {
         }
     }
 
-    /// Record the outcome of a client request against `repo` (the resolved repo
-    /// path, or `-` when rejected before a repo was resolved). `kind` is
-    /// `info_refs`, `upload_pack`, `auth` or `receive_pack`; `result` is `ok`,
-    /// `error`, `upstream_error`, `unauthorized` or `rejected`.
+    /// Record the outcome of a client request. `repo` is the served repo path on
+    /// success and `-` on any failure, so unbounded client-supplied paths cannot
+    /// inflate label cardinality. `kind` is `info_refs`, `upload_pack`, `auth` or
+    /// `receive_pack`; `result` is `ok`, `error`, `upstream_error`,
+    /// `unauthorized` or `rejected`.
     pub fn record_request(&self, kind: &str, result: &str, repo: &str) {
         self.requests.with_label_values(&[kind, result, repo]).inc();
     }
 
-    /// Record an upstream clone/fetch against a specific repo. Errors are recorded
-    /// too (`result = "error"`).
+    /// Record an upstream clone/fetch. Errors are recorded too (`result =
+    /// "error"`); pass the repo path on success and `-` on error, matching
+    /// `record_request`.
     pub fn record_upstream(&self, op: &str, result: &str, repo: &str) {
         self.upstream.with_label_values(&[op, result, repo]).inc();
     }

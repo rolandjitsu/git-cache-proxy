@@ -134,9 +134,15 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
     let scraped = metrics.gather();
+    // A failed clone records under the `-` sentinel, not the client-supplied path,
+    // so a flood of doomed repo names cannot inflate label cardinality.
     assert!(
-        scraped.contains(r#"op="clone",repo="missing.git",result="error""#),
-        "expected clone error metric, got:\n{scraped}"
+        scraped.contains(r#"op="clone",repo="-",result="error""#),
+        "expected clone error metric under `-`, got:\n{scraped}"
+    );
+    assert!(
+        !scraped.contains(r#"repo="missing.git""#),
+        "failed repo name must not appear as a label, got:\n{scraped}"
     );
     assert!(
         scraped.contains(r#"result="upstream_error""#),
