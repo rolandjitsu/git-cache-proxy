@@ -60,6 +60,14 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_FETCH_TTL_SECONDS", default_value_t = 10)]
     pub fetch_ttl_seconds: u64,
 
+    /// Maximum size, in MiB, of a decoded `git-upload-pack` request body (the
+    /// client's want/have negotiation). Bounds in-memory buffering and defuses a
+    /// gzip decompression bomb - a small compressed body can expand ~1000x. This
+    /// caps only the negotiation request, never the streamed packfile response,
+    /// so raising it is rarely needed even for very large repositories.
+    #[arg(long, env = "GITCACHEPROXY_MAX_DECODED_BODY_MB", default_value_t = 512)]
+    pub max_decoded_body_mb: u64,
+
     /// Path to the git binary.
     #[arg(long, env = "GITCACHEPROXY_GIT_BINARY", default_value = "git")]
     pub git_binary: String,
