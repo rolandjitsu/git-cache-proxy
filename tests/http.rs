@@ -31,6 +31,7 @@ fn state(serve_token: Option<String>) -> AppState {
         cache_root,
         serve_token,
         max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
         metrics,
     }
 }
@@ -127,6 +128,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
         max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
         metrics: metrics.clone(),
     };
 
@@ -148,6 +150,24 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         scraped.contains(r#"result="upstream_error""#),
         "expected request upstream_error metric, got:\n{scraped}"
     );
+}
+
+#[tokio::test]
+async fn concurrency_limit_serializes_without_deadlock() {
+    // The limit is shared across per-connection service clones, so three
+    // concurrent requests through a limit of 1 must serialize and all still
+    // complete - proving permits are released and reused, not leaked.
+    let mut st = state(None);
+    st.max_concurrent = 1;
+    let app = router(st);
+    let hit = || {
+        app.clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+    };
+    let (a, b, c) = tokio::join!(hit(), hit(), hit());
+    for r in [a, b, c] {
+        assert_eq!(r.unwrap().status(), StatusCode::OK);
+    }
 }
 
 #[tokio::test]
