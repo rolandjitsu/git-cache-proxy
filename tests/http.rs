@@ -30,6 +30,7 @@ fn state(serve_token: Option<String>) -> AppState {
         upstream_base: "https://upstream.invalid".into(),
         cache_root,
         serve_token,
+        max_decoded_body: 512 * 1024 * 1024,
         metrics,
     }
 }
@@ -125,6 +126,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
+        max_decoded_body: 512 * 1024 * 1024,
         metrics: metrics.clone(),
     };
 

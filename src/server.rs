@@ -32,6 +32,9 @@ pub struct AppState {
     pub upstream_base: String,
     pub cache_root: PathBuf,
     pub serve_token: Option<String>,
+    /// Upper bound (bytes) on a decoded upload-pack request body. See
+    /// `Config::max_decoded_body_mb`.
+    pub max_decoded_body: usize,
     pub metrics: Arc<Metrics>,
 }
 
@@ -102,7 +105,7 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
             .headers
             .get(header::CONTENT_ENCODING)
             .and_then(|v| v.to_str().ok());
-        let body = match decode_body(content_encoding, body) {
+        let body = match decode_body(content_encoding, body, st.max_decoded_body) {
             Ok(b) => b,
             Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
         };
@@ -220,11 +223,30 @@ fn check_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
 /// Undo the request's `Content-Encoding`. Git only ever gzips, so that is the
 /// single encoding we decode; an absent/`identity` header passes through
 /// untouched, and any other encoding is rejected by the caller as a bad body.
-fn decode_body(content_encoding: Option<&str>, body: Bytes) -> std::io::Result<Bytes> {
+///
+/// The decoded size is capped at `max_decoded`: DEFLATE reaches ~1000:1, so an
+/// unbounded read here would let a small compressed body expand into an
+/// out-of-memory kill (a decompression bomb). We read at most `max_decoded + 1`
+/// bytes so we can tell "exactly at the limit" from "over it" and reject the
+/// latter.
+fn decode_body(
+    content_encoding: Option<&str>,
+    body: Bytes,
+    max_decoded: usize,
+) -> std::io::Result<Bytes> {
     match content_encoding.map(str::trim) {
         Some(enc) if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") => {
-            let mut out = Vec::with_capacity(body.len() * 4);
-            flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out)?;
+            let mut out = Vec::new();
+            let limit = max_decoded as u64 + 1;
+            flate2::read::GzDecoder::new(&body[..])
+                .take(limit)
+                .read_to_end(&mut out)?;
+            if out.len() > max_decoded {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "decoded request body exceeds limit",
+                ));
+            }
             Ok(Bytes::from(out))
         }
         None => Ok(body),
@@ -238,4 +260,59 @@ fn decode_body(content_encoding: Option<&str>, body: Bytes) -> std::io::Result<B
 
 fn err(status: StatusCode, msg: &str) -> Response {
     (status, format!("{msg}\n")).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gzip(bytes: &[u8]) -> Bytes {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(bytes).unwrap();
+        Bytes::from(enc.finish().unwrap())
+    }
+
+    #[test]
+    fn identity_and_absent_encoding_pass_through() {
+        let raw = Bytes::from_static(b"want ...\n");
+        assert_eq!(decode_body(None, raw.clone(), 1024).unwrap(), raw);
+        assert_eq!(
+            decode_body(Some("identity"), raw.clone(), 1024).unwrap(),
+            raw
+        );
+        assert_eq!(decode_body(Some(""), raw.clone(), 1024).unwrap(), raw);
+    }
+
+    #[test]
+    fn gzip_within_limit_decodes() {
+        let payload = b"command=ls-refs\n";
+        let decoded = decode_body(Some("gzip"), gzip(payload), 1024).unwrap();
+        assert_eq!(&decoded[..], payload);
+        // Case-insensitive and the `x-gzip` alias both decode.
+        assert_eq!(
+            &decode_body(Some("GZIP"), gzip(payload), 1024).unwrap()[..],
+            payload
+        );
+        assert_eq!(
+            &decode_body(Some("x-gzip"), gzip(payload), 1024).unwrap()[..],
+            payload
+        );
+    }
+
+    #[test]
+    fn gzip_decompression_bomb_is_rejected() {
+        // 1 MiB of zeros compresses to ~1 KiB but must not be allowed to expand
+        // past the cap. Exactly-at-limit is accepted; one byte over is rejected.
+        let big = vec![0u8; 1024 * 1024];
+        assert!(decode_body(Some("gzip"), gzip(&big), 1024).is_err());
+        assert!(decode_body(Some("gzip"), gzip(&big), big.len()).is_ok());
+        assert!(decode_body(Some("gzip"), gzip(&big), big.len() - 1).is_err());
+    }
+
+    #[test]
+    fn unsupported_encoding_is_rejected() {
+        assert!(decode_body(Some("br"), Bytes::from_static(b"x"), 1024).is_err());
+        assert!(decode_body(Some("deflate"), Bytes::from_static(b"x"), 1024).is_err());
+    }
 }

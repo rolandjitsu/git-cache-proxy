@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
         upstream_base: cfg.upstream.trim_end_matches('/').to_string(),
         cache_root: cfg.cache_root.clone(),
         serve_token: cfg.serve_token.clone(),
+        max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),
         metrics,
     };
 
