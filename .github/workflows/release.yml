@@ -25,10 +25,22 @@ jobs:
       released: ${{ steps.release.outputs.released }}
       version: ${{ steps.release.outputs.version }}
     steps:
+      # The version-bump commit is pushed directly to `main`, which is protected by a
+      # branch ruleset that requires status checks. The built-in GITHUB_TOKEN cannot be
+      # granted a ruleset bypass, so mint a token for a GitHub App that is on the
+      # ruleset's bypass list and push with that instead.
+      - name: Mint a token for the release app
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - uses: actions/checkout@v4
         with:
           # Full history and tags so knope can read the commits since the last release.
           fetch-depth: 0
+          # Push the release commit as the app so it bypasses the branch ruleset.
+          token: ${{ steps.app-token.outputs.token }}
       - uses: knope-dev/action@v2.1.2
         with:
           version: 0.23.0
@@ -37,15 +49,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
       # knope bumps the version, updates the changelog, tags, and creates the GitHub
-      # release from the conventional commits since the last tag. Pushing with the
-      # built-in token does not retrigger this workflow, so the release event never
-      # reaches a separate workflow; the publish job below runs in this same run
-      # instead. `no_release` (no releasable commits since the last tag) is a normal
-      # no-op, not a failure.
+      # release from the conventional commits since the last tag. The push uses the app
+      # token, so - unlike the built-in token - it retriggers this workflow; that rerun
+      # finds no releasable commits and no-ops via `no_release`, so the publish job runs
+      # only in the run that actually released. `no_release` is a normal no-op, not a
+      # failure.
       - name: Release
         id: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set +e
           out="$(knope release 2>&1)"
