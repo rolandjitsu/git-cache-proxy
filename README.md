@@ -76,6 +76,8 @@ Every flag has an environment-variable equivalent.
 | `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if refreshed within this window (`0` = always fetch)       |
+| `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
+| `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus).
@@ -112,6 +114,33 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 When passing it into a container, prefer `-e GITCACHEPROXY_UPSTREAM_AUTH_HEADER`
 (no `=`) so an unset variable is dropped with a warning rather than silently
 forwarded as an empty string.
+
+## Security model
+
+The proxy is a shared, credentialed reader, so a few properties are worth making
+explicit before you expose it:
+
+- **Reachability is the trust boundary.** The proxy fetches from upstream with
+  its own single credential and serves the result to whoever asked. There is no
+  per-repo authorization: with `--serve-token` unset it serves anonymously, and
+  when set the token is one shared secret that grants access to _everything the
+  upstream credential can read_ - including repos a given client could not read
+  directly. Restrict who can reach the proxy (private network, security group,
+  mTLS at the ingress) and treat "can reach the port" as "can read every
+  mirrored repo".
+- **Plain HTTP.** The proxy speaks HTTP, so a `--serve-token` bearer travels in
+  cleartext. Terminate TLS in front of it (reverse proxy / ingress) on any
+  network you do not fully trust. Upstream fetches use whatever scheme the
+  `--upstream` URL specifies - use `https://`.
+- **Defaults are open.** It binds `0.0.0.0:8080` and serves anonymously unless
+  `--serve-token` is set. That is deliberate for a locked-down CI network; do
+  not place it on an untrusted one without a token and TLS.
+- **DoS knobs.** `--max-concurrent-requests` caps concurrent upstream
+  clone/fetch work and `--max-decoded-body-mb` bounds request-body memory
+  (defusing a decompression bomb). The on-disk cache still grows unbounded (no
+  eviction yet - see the roadmap), so isolate and monitor the cache volume.
+- **Read-only.** Only `git-upload-pack` (clone/fetch) is served; `git-receive-pack`
+  (push) is refused and upstream is only ever pulled from, never written.
 
 ## Deploy
 
