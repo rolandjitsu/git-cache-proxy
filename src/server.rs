@@ -17,6 +17,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use subtle::ConstantTimeEq;
 
 use crate::git::GitCache;
 use crate::metrics::Metrics;
@@ -207,12 +208,11 @@ async fn upload_pack(
 /// Returns `Some(401)` to short-circuit, `None` to allow.
 fn check_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
     let expected = st.serve_token.as_ref()?;
-    let ok = headers
+    let provided = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == expected);
-    if ok {
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if provided.is_some_and(|t| token_matches(t, expected)) {
         None
     } else {
         Some(err(
@@ -220,6 +220,13 @@ fn check_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
             "missing or invalid bearer token",
         ))
     }
+}
+
+/// Compare a client-supplied bearer token against the expected one in constant
+/// time, so response latency does not leak how many leading bytes matched. Only
+/// the length can differ observably, which is not sensitive for a shared secret.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Undo the request's `Content-Encoding`. Git only ever gzips, so that is the
@@ -316,5 +323,15 @@ mod tests {
     fn unsupported_encoding_is_rejected() {
         assert!(decode_body(Some("br"), Bytes::from_static(b"x"), 1024).is_err());
         assert!(decode_body(Some("deflate"), Bytes::from_static(b"x"), 1024).is_err());
+    }
+
+    #[test]
+    fn token_matches_only_the_exact_token() {
+        assert!(token_matches("s3cret", "s3cret"));
+        assert!(!token_matches("s3creT", "s3cret")); // last byte differs
+        assert!(!token_matches("s3cre", "s3cret")); // prefix, shorter
+        assert!(!token_matches("s3cret-extra", "s3cret")); // longer
+        assert!(!token_matches("", "s3cret"));
+        assert!(token_matches("", "")); // degenerate empty token
     }
 }
