@@ -18,6 +18,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use subtle::ConstantTimeEq;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::git::GitCache;
 use crate::metrics::Metrics;
@@ -36,16 +37,28 @@ pub struct AppState {
     /// Upper bound (bytes) on a decoded upload-pack request body. See
     /// `Config::max_decoded_body_mb`.
     pub max_decoded_body: usize,
+    /// Max concurrent in-flight requests (`0` = unlimited). See
+    /// `Config::max_concurrent_requests`.
+    pub max_concurrent: usize,
     pub metrics: Arc<Metrics>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let max_concurrent = state.max_concurrent;
+    let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ok" }))
         .route("/metrics", get(metrics_handler))
         .fallback(handle_git)
-        .with_state(state)
+        .with_state(state);
+    // One global semaphore shared across every per-connection clone of the
+    // service (axum clones it per connection), so the cap is process-wide rather
+    // than per-connection. `0` disables the limit entirely.
+    if max_concurrent == 0 {
+        app
+    } else {
+        app.layer(GlobalConcurrencyLimitLayer::new(max_concurrent))
+    }
 }
 
 async fn metrics_handler(State(st): State<AppState>) -> Response {

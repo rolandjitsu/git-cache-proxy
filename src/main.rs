@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         cache_root: cfg.cache_root.clone(),
         serve_token: cfg.serve_token.clone(),
         max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),
+        max_concurrent: cfg.max_concurrent_requests,
         metrics,
     };
 

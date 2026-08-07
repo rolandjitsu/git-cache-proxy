@@ -60,6 +60,19 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_FETCH_TTL_SECONDS", default_value_t = 10)]
     pub fetch_ttl_seconds: u64,
 
+    /// Maximum number of requests handled concurrently, shared across all
+    /// connections. Excess requests queue until a slot frees. This bounds the
+    /// concurrent upstream clone/fetch work a burst can trigger (the slot is held
+    /// for the handler, then released before the packfile streams, so it caps
+    /// setup rather than in-flight streaming). `0` = unlimited. Complementary to
+    /// any ingress-level rate limiting.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_MAX_CONCURRENT_REQUESTS",
+        default_value_t = 64
+    )]
+    pub max_concurrent_requests: usize,
+
     /// Maximum size, in MiB, of a decoded `git-upload-pack` request body (the
     /// client's want/have negotiation). Bounds in-memory buffering and defuses a
     /// gzip decompression bomb - a small compressed body can expand ~1000x. This

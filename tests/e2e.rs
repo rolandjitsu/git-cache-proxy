@@ -92,6 +92,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
         max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 8,
         metrics,
     };
 
@@ -172,6 +173,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
         max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 8,
         metrics: metrics.clone(),
     };
 
