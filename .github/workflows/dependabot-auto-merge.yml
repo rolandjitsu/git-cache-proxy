@@ -1,0 +1,29 @@
+name: Dependabot auto-merge
+
+# Turn on GitHub auto-merge for Dependabot patch-update PRs, so they merge once
+# the required status checks pass. Minor and major bumps are left for manual
+# review. This only sets the auto-merge flag; branch protection on `main`
+# decides which checks must pass first, and "Allow auto-merge" must be enabled
+# in the repository settings.
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Auto-merge patch updates
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch update metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+      - name: Enable auto-merge for patch updates
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
