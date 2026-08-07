@@ -81,9 +81,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny
+      - name: Check dependencies
+        run: cargo deny check
 
   # Spelling runs on everything, including docs.
   typos:
