@@ -1,11 +1,11 @@
 # A read-only caching proxy for Git repositories.
 [package]
-name = "git_cache_proxy"
+name = "git-cache-proxy"
 version = "0.1.4"
 edition = "2024"
 license = "Apache-2.0"
 description = "Read-only caching proxy for Git: serves clones/fetches from an in-region mirror, pulling only deltas from upstream."
-repository = "https://github.com/rolandjitsu/git-proxy-server"
+repository = "https://github.com/rolandjitsu/git-cache-proxy"
 keywords = ["git", "cache", "proxy", "ci", "mirror"]
 categories = ["command-line-utilities", "development-tools"]
 

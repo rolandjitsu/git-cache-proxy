@@ -4,15 +4,15 @@
 
 [package]
 # knope bumps [package].version in Cargo.toml and the crate's entry in Cargo.lock; keep
-# both in sync or `--locked` builds break after a bump. The dependency name is the crate
-# name (underscored), not the repository name.
+# both in sync or `--locked` builds break after a bump. The dependency name matches the
+# crate's package name as it appears in Cargo.lock, not the repository name.
 versioned_files = [
     "Cargo.toml",
-    { path = "Cargo.lock", dependency = "git_cache_proxy" },
+    { path = "Cargo.lock", dependency = "git-cache-proxy" },
 ]
 changelog = "CHANGELOG.md"
 
 # Create a GitHub release (not just a git tag) from the tag, using GITHUB_TOKEN in CI.
 [github]
 owner = "rolandjitsu"
-repo = "git-proxy-server"
+repo = "git-cache-proxy"
