@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/rolandjitsu/git-proxy-server
+  IMAGE: ghcr.io/rolandjitsu/git-cache-proxy
 
 jobs:
   release:

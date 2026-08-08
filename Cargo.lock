@@ -317,7 +317,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git_cache_proxy"
+name = "git-cache-proxy"
 version = "0.1.4"
 dependencies = [
  "anyhow",
