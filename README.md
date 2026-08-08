@@ -1,7 +1,7 @@
 # git-cache-proxy
 
-[![CI](https://img.shields.io/github/actions/workflow/status/rolandjitsu/git-proxy-server/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/rolandjitsu/git-proxy-server/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/codecov/c/github/rolandjitsu/git-proxy-server/main?style=flat-square)](https://codecov.io/gh/rolandjitsu/git-proxy-server)
+[![CI](https://img.shields.io/github/actions/workflow/status/rolandjitsu/git-cache-proxy/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/rolandjitsu/git-cache-proxy/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/rolandjitsu/git-cache-proxy/main?style=flat-square)](https://codecov.io/gh/rolandjitsu/git-cache-proxy)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](./LICENSE)
 
 A small, read-only **caching proxy for Git repositories**. It sits between many
@@ -29,6 +29,27 @@ a client always gets the ref it asked for, and nothing is ever proactively
 pushed or replicated to where the proxy runs. That last property tends to be
 the difference between "sure" and "absolutely not" when the origin is sensitive.
 
+## How it compares
+
+| Approach                                     | Caches `fetch` [1] | Lazy [2] | Fresh ref [3] | Delta-only WAN [4] | Pull-only [5] | Any origin [6] |
+| -------------------------------------------- | :----------------: | :------: | :-----------: | :----------------: | :-----------: | :------------: |
+| **git-cache-proxy**                          |        yes         |   yes    |      yes      |        yes         |      yes      |      yes       |
+| Generic HTTP cache (nginx / Varnish)         |         no         |   n/a    |      no       |         no         |      yes      |      yes       |
+| Scheduled mirror (Gitea / GitLab pull-mirror)|        yes         |    no    |      lag      |         no         |      no       |      yes       |
+| `git clone --reference` / alternates         |        n/a         |    no    |     seed      |        yes         |      yes      |      yes       |
+| GitLab Geo / server geo-replication          |        yes         |    no    |      yes      |         no         |      no       |       no       |
+
+1. Caches the _negotiated_ `git-upload-pack` response, not just static objects - a plain
+   HTTP cache can't, because every fetch is computed per request.
+2. Caches on first request; no repo enumeration or replication schedule to run.
+3. Serves the exact ref asked for. The proxy fetches upstream _before_ serving; a scheduled
+   mirror can lag its refresh interval (`lag`); `--reference` is only as fresh as its local
+   seed (`seed`).
+4. Only new objects cross the WAN per request; the bulk history is served from the local mirror.
+5. Never writes to or proactively replicates from the origin - it only ever pulls what a
+   client requested.
+6. Works against any unmodified Git smart-HTTP origin. GitLab Geo needs GitLab on both ends.
+
 ## How it works
 
 All git work is delegated to the system `git` binary, so protocol correctness -
@@ -47,6 +68,24 @@ anything git-receive-pack  -> 403 (read-only)
 Concurrent clients for the same repo are serialized so a burst triggers a single
 upstream fetch; a short TTL coalesces repeated requests.
 
+## Benchmark
+
+For a fleet of ephemeral clients cloning the same repo, only the first clone pays
+the WAN cost; the rest are served from the local mirror. Cloning a 64 MB repo over
+an emulated 20 Mbit/s, 60 ms-RTT link:
+
+| Scenario                      | Clone time | WAN bytes |
+| ----------------------------- | ---------: | --------: |
+| Direct clone (today)          |     28.1 s |     64 MB |
+| Via proxy, cold (runner 1)    |     28.5 s |     64 MB |
+| Via proxy, warm (runner 2..N) |      0.6 s |     ~0 MB |
+
+The first runner sees no penalty and every subsequent runner clones ~47x faster
+while nothing crosses the WAN; the saving scales with fleet size and link cost.
+Reproduce or retune (`TOTAL_MB`, `RATE_MBIT`, `RTT_MS`) with
+[`bench/run.sh`](./bench/run.sh) - see [`bench/README.md`](./bench/README.md) for
+the method and its caveats.
+
 ## Quick start
 
 ```sh
@@ -62,6 +101,21 @@ proxy:
 ```
 git config url."http://proxy:8080/".insteadOf            "https://git.example.com/"
 git config url."https://git.example.com/".pushInsteadOf  "https://git.example.com/"
+```
+
+### Try it
+
+The image on GHCR runs as-is against any public origin, no config file. Point it at
+GitHub and clone through it:
+
+```sh
+docker run --rm -p 8080:8080 ghcr.io/rolandjitsu/git-cache-proxy \
+  --upstream https://github.com
+
+# in another terminal - the proxy mirrors the repo on the first request and
+# serves it from the local mirror thereafter:
+git -c url."http://localhost:8080/".insteadOf="https://github.com/" \
+  clone https://github.com/rolandjitsu/git-cache-proxy
 ```
 
 ## Configuration
