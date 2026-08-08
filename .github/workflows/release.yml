@@ -111,3 +111,31 @@ jobs:
             ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Publish the crate to crates.io (which feeds docs.rs) in the same run that cut the
+  # release, at the tag knope just created. Uses crates.io trusted publishing: GitHub's
+  # OIDC token is exchanged for a short-lived crates.io token, so no API token secret is
+  # stored. One-time bootstrap before this can work: publish once manually to claim the
+  # name (`cargo publish`), then add a GitHub Actions trusted publisher on the crate's
+  # crates.io settings for this repo and the Release workflow.
+  publish-crate:
+    name: Publish crate
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
