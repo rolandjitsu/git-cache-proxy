@@ -2,6 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/rolandjitsu/git-cache-proxy/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/rolandjitsu/git-cache-proxy/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/codecov/c/github/rolandjitsu/git-cache-proxy/main?style=flat-square)](https://codecov.io/gh/rolandjitsu/git-cache-proxy)
+[![crates.io](https://img.shields.io/crates/v/git-cache-proxy?style=flat-square)](https://crates.io/crates/git-cache-proxy)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](./LICENSE)
 
 A small, read-only **caching proxy for Git repositories**. It sits between many
@@ -85,6 +86,20 @@ while nothing crosses the WAN; the saving scales with fleet size and link cost.
 Reproduce or retune (`TOTAL_MB`, `RATE_MBIT`, `RTT_MS`) with
 [`bench/run.sh`](./bench/run.sh) - see [`bench/README.md`](./bench/README.md) for
 the method and its caveats.
+
+## Install
+
+```sh
+cargo install git-cache-proxy
+```
+
+`cargo install` builds from source and needs a `git` binary on `PATH` at runtime
+(all wire-protocol work is delegated to it). Or pull the container image, which
+bundles `git`:
+
+```sh
+docker pull ghcr.io/rolandjitsu/git-cache-proxy
+```
 
 ## Quick start
 
