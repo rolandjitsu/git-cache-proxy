@@ -105,4 +105,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: crate-ci/committed@v1.1.11
+      # Dependabot commit messages are auto-generated: long changelog and URL
+      # lines in the body exceed line_length and long dep names exceed
+      # subject_length, neither of which is configurable. Exempt them (keyed on
+      # PR author so maintainer re-runs stay stable); the job still runs green.
+      - if: github.event.pull_request.user.login != 'dependabot[bot]'
+        uses: crate-ci/committed@v1.1.11
