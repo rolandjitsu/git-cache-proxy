@@ -67,7 +67,7 @@ jobs:
           cargo llvm-cov --all-features --locked --ignore-filename-regex 'src/main\.rs' --lcov --output-path lcov.info
           cargo llvm-cov report --ignore-filename-regex 'src/main\.rs' --summary-only --fail-under-lines 80
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
