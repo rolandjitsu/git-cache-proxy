@@ -13,7 +13,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/rolandjitsu/git-cache-proxy
+  # Derive the image name from the repository so it tracks a rename automatically
+  # instead of drifting (the hardcoded name once lagged a rename and published under
+  # the old name). `github.repository` is `owner/repo`, lowercase as GHCR requires.
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   release:
