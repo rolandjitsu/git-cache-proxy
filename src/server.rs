@@ -263,21 +263,32 @@ fn decode_body(
             flate2::read::GzDecoder::new(&body[..])
                 .take(limit)
                 .read_to_end(&mut out)?;
-            if out.len() > max_decoded {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "decoded request body exceeds limit",
-                ));
-            }
-            Ok(Bytes::from(out))
+            within_limit(Bytes::from(out), max_decoded)
         }
-        None => Ok(body),
-        Some(enc) if enc.is_empty() || enc.eq_ignore_ascii_case("identity") => Ok(body),
+        // Uncompressed: no expansion risk, but still enforce the cap so
+        // `--max-decoded-body-mb` bounds an identity request the same as a gzipped
+        // one - otherwise only the coarser transport cap (`MAX_BODY`) would apply.
+        None => within_limit(body, max_decoded),
+        Some(enc) if enc.is_empty() || enc.eq_ignore_ascii_case("identity") => {
+            within_limit(body, max_decoded)
+        }
         Some(other) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unsupported content-encoding: {other}"),
         )),
     }
+}
+
+/// Reject a decoded body that exceeds the configured cap. Shared by every encoding
+/// branch so the limit is enforced uniformly, not just when decoding gzip.
+fn within_limit(body: Bytes, max_decoded: usize) -> std::io::Result<Bytes> {
+    if body.len() > max_decoded {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decoded request body exceeds limit",
+        ));
+    }
+    Ok(body)
 }
 
 fn err(status: StatusCode, msg: &str) -> Response {
@@ -304,6 +315,17 @@ mod tests {
             raw
         );
         assert_eq!(decode_body(Some(""), raw.clone(), 1024).unwrap(), raw);
+    }
+
+    #[test]
+    fn identity_body_over_limit_is_rejected() {
+        // An uncompressed body must honor the decoded-body cap too, not just the
+        // gzip path. Exactly at the limit is accepted; one byte over is rejected.
+        let body = Bytes::from(vec![b'x'; 2048]);
+        for enc in [None, Some("identity"), Some("")] {
+            assert!(decode_body(enc, body.clone(), 2048).is_ok());
+            assert!(decode_body(enc, body.clone(), 2047).is_err());
+        }
     }
 
     #[test]
