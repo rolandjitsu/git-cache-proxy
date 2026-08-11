@@ -129,6 +129,62 @@ async fn serve_token_required_when_configured() {
 }
 
 #[tokio::test]
+async fn valid_token_passes_auth() {
+    // The correct bearer takes check_auth's success path; the request is then
+    // refused as a push (read-only). Reaching that 403 proves auth was accepted,
+    // not short-circuited with a 401.
+    let resp = router(state(Some("s3cret".into())))
+        .oneshot(
+            Request::get("/repo.git/info/refs?service=git-receive-pack")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn reserved_suffix_repo_path_is_rejected() {
+    // A client path carrying the internal staging suffix could otherwise resolve
+    // onto a mirror's in-flight clone dir; resolve rejects it before any upstream
+    // work, over both endpoints.
+    let resp = get(
+        state(None),
+        "/repo.__incoming__.git/info/refs?service=git-upload-pack",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = router(state(None))
+        .oneshot(
+            Request::post("/repo.__incoming__.git/git-upload-pack")
+                .body(Body::from("0000"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upload_pack_rejects_undecodable_body() {
+    // A gzip Content-Encoding with a body that is not gzip fails to decode -> 400,
+    // before any upstream work.
+    let resp = router(state(None))
+        .oneshot(
+            Request::post("/repo.git/git-upload-pack")
+                .header(header::CONTENT_ENCODING, "gzip")
+                .body(Body::from("this is not gzip"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn upstream_failure_returns_bad_gateway_and_records_error() {
     // A real (but doomed) clone: the upstream points at a path that does not
     // exist, so `git clone --mirror` fails and the request surfaces a 502.
