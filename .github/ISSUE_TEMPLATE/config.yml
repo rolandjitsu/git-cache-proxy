@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or usage help
+    url: https://github.com/rolandjitsu/git-cache-proxy/discussions
+    about: Ask and answer usage questions in Discussions. Check the README (configuration, auth, and security model) first.
