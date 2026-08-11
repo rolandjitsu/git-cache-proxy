@@ -3,6 +3,13 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.6 (2026-08-11)
+
+### Fixes
+
+- exempt probes and metrics from request limit
+- avoid staging-dir aliasing when cloning a mirror
+
 ## 0.1.5 (2026-08-10)
 
 ### Fixes
