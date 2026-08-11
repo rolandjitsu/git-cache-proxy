@@ -23,8 +23,9 @@ cargo test --all-features
 ## Writing: code, comments, docs, commits
 
 - Concise and to the point. No fluff. Explain the non-obvious; do not narrate the obvious.
-- ASCII only. No em-dash and no `--`; write `-`. Use `->` not the arrow glyph, `!=` not the
-  not-equal glyph, and so on.
+- ASCII only. No em-dash and no `--`; write `-`. Do not use any non-ASCII glyph: write `->` for
+  the right arrow, `<->` for the left-right arrow, `!=` for not-equal, straight quotes for curly
+  ones, and the same for every other Unicode symbol. Applies everywhere, including this file.
 - Comments justify *why*, not *what*. Delete any comment that restates the code.
 - Do not use the word "seam"; say boundary, interface, or extension point.
 - Do not use "bespoke"; say "custom".
