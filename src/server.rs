@@ -8,7 +8,7 @@
 //!   anything git-receive-pack                      -> 403 (read-only)
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -45,20 +45,30 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     let max_concurrent = state.max_concurrent;
-    let app = Router::new()
+
+    // Observability endpoints are deliberately kept *out* of the concurrency
+    // limit below: a liveness/readiness probe or a metrics scrape must stay
+    // responsive even when a burst of clones has saturated the semaphore -
+    // otherwise a healthy-but-busy pod fails its probes and gets restarted.
+    let observability = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_handler))
-        .fallback(handle_git)
-        .with_state(state);
-    // One global semaphore shared across every per-connection clone of the
-    // service (axum clones it per connection), so the cap is process-wide rather
-    // than per-connection. `0` disables the limit entirely.
-    if max_concurrent == 0 {
-        app
-    } else {
-        app.layer(GlobalConcurrencyLimitLayer::new(max_concurrent))
+        .with_state(state.clone());
+
+    // The git smart-HTTP surface has arbitrary-depth paths, so it is the router
+    // fallback, and it is the only thing the concurrency limit wraps (`0`
+    // disables it). One global semaphore shared across every per-connection
+    // clone of the service (axum clones it per connection) makes the cap
+    // process-wide rather than per-connection. `merge` keeps the (limited)
+    // fallback as the merged fallback, while the observability routes above are
+    // matched first and bypass it.
+    let mut git = Router::new().fallback(handle_git).with_state(state);
+    if max_concurrent != 0 {
+        git = git.layer(GlobalConcurrencyLimitLayer::new(max_concurrent));
     }
+
+    observability.merge(git)
 }
 
 async fn metrics_handler(State(st): State<AppState>) -> Response {
@@ -66,6 +76,38 @@ async fn metrics_handler(State(st): State<AppState>) -> Response {
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(st.metrics.gather()))
         .expect("valid response")
+}
+
+/// Readiness probe. Liveness (`/healthz`) only says the process is up; readiness
+/// additionally verifies the proxy can do its one job - write bare mirrors into
+/// the cache root - so a detached, unmounted, read-only, or unwritable cache
+/// volume surfaces as `503 Service Unavailable` here instead of a later flood of
+/// upstream `502`s. Kept out of the concurrency limit (see `router`).
+async fn readyz(State(st): State<AppState>) -> Response {
+    match cache_writable(&st.cache_root).await {
+        Ok(()) => (StatusCode::OK, "ok").into_response(),
+        Err(e) => {
+            tracing::warn!(
+                cache_root = %st.cache_root.display(),
+                error = %e,
+                "readiness check failed"
+            );
+            err(StatusCode::SERVICE_UNAVAILABLE, "cache root not writable")
+        }
+    }
+}
+
+/// Confirm the cache root exists and is writable by creating and removing a probe
+/// file - the same directory the mirrors live in, so it tests the real target
+/// rather than a proxy for it. A single create + unlink is cheap enough to run
+/// per probe and catches the failure modes that make "ready" a lie: a missing
+/// directory, a read-only remount, or a permissions problem.
+async fn cache_writable(cache_root: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(cache_root).await?;
+    let probe = cache_root.join(".readyz-probe");
+    tokio::fs::write(&probe, b"").await?;
+    let _ = tokio::fs::remove_file(&probe).await;
+    Ok(())
 }
 
 async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response {

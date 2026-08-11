@@ -53,9 +53,26 @@ async fn body_string(resp: axum::http::Response<Body>) -> String {
 #[tokio::test]
 async fn health_endpoints_return_ok() {
     assert_eq!(get(state(None), "/healthz").await.status(), StatusCode::OK);
-    let resp = get(state(None), "/readyz").await;
+
+    // `/readyz` now writes a probe file into the cache root, so give it a real
+    // writable dir (kept alive for the duration of the calls).
+    let cache = tempfile::tempdir().unwrap();
+    let mut st = state(None);
+    st.cache_root = cache.path().to_path_buf();
+    let resp = get(st, "/readyz").await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_string(resp).await, "ok");
+}
+
+#[tokio::test]
+async fn readyz_reports_unwritable_cache_as_not_ready() {
+    // Point the cache root *under a regular file* so `create_dir_all` fails;
+    // readiness must then report 503 rather than a hollow "ok".
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut st = state(None);
+    st.cache_root = file.path().join("cache");
+    let resp = get(st, "/readyz").await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -154,19 +171,24 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
 
 #[tokio::test]
 async fn concurrency_limit_serializes_without_deadlock() {
-    // The limit is shared across per-connection service clones, so three
+    // The limit wraps the git-serving fallback (health/readiness/metrics are
+    // exempt), and is shared across per-connection service clones. Three
     // concurrent requests through a limit of 1 must serialize and all still
-    // complete - proving permits are released and reused, not leaked.
+    // complete - proving permits are released and reused, not leaked. The
+    // push-rejection path is a limited route that returns without upstream work.
     let mut st = state(None);
     st.max_concurrent = 1;
     let app = router(st);
     let hit = || {
-        app.clone()
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        app.clone().oneshot(
+            Request::get("/repo.git/info/refs?service=git-receive-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
     };
     let (a, b, c) = tokio::join!(hit(), hit(), hit());
     for r in [a, b, c] {
-        assert_eq!(r.unwrap().status(), StatusCode::OK);
+        assert_eq!(r.unwrap().status(), StatusCode::FORBIDDEN);
     }
 }
 
