@@ -27,6 +27,12 @@ pub fn repo_name_from_path(path: &str, suffix: &str) -> Option<String> {
     Some(repo.trim_end_matches('/').to_string())
 }
 
+/// Reserved suffix for the staging directory a mirror is cloned into before its
+/// atomic rename into place (see `git::clone_mirror`). `resolve` rejects any
+/// client path containing it, so a request can never resolve onto another repo's
+/// in-flight clone directory.
+pub const INCOMING_SUFFIX: &str = ".__incoming__";
+
 /// Validate a repo path (no traversal / absolute / NUL) and resolve it against
 /// the upstream base and cache root.
 pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<RepoRef> {
@@ -37,6 +43,11 @@ pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<Rep
         if comp.is_empty() || comp == "." || comp == ".." {
             bail!("invalid repo path component in {name:?}");
         }
+    }
+    // Reserved: the clone staging dir is a sibling of the cache dir carrying this
+    // suffix, so a client path containing it could alias an in-flight clone.
+    if name.contains(INCOMING_SUFFIX) {
+        bail!("invalid repo path (reserved suffix) in {name:?}");
     }
     let cache_dir = cache_root.join(name);
     // Defence in depth against traversal that slipped past the component checks.
@@ -77,5 +88,14 @@ mod tests {
         let ok = resolve("g/r.git", "https://up/", root).unwrap();
         assert_eq!(ok.upstream_url, "https://up/g/r.git");
         assert_eq!(ok.cache_dir, Path::new("/cache/g/r.git"));
+    }
+
+    #[test]
+    fn rejects_reserved_incoming_suffix() {
+        let root = Path::new("/cache");
+        // A client must not be able to name a repo that maps onto the staging dir
+        // of another (`<cache_dir>.__incoming__`).
+        assert!(resolve(&format!("foo{INCOMING_SUFFIX}"), "https://up", root).is_err());
+        assert!(resolve(&format!("a/b{INCOMING_SUFFIX}"), "https://up", root).is_err());
     }
 }

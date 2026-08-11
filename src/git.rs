@@ -201,9 +201,17 @@ impl GitCache {
                 .await
                 .with_context(|| format!("create cache parent for {}", repo.name))?;
         }
-        // Clone into a temp dir and atomically rename, so a crashed clone never
-        // leaves a half-populated mirror that looks valid.
-        let tmp = repo.cache_dir.with_extension("tmp");
+        // Clone into a staging dir and atomically rename, so a crashed clone never
+        // leaves a half-populated mirror that looks valid. The staging path
+        // *appends* a reserved suffix to the full cache path rather than replacing
+        // the extension: `with_extension("tmp")` would map a repo literally named
+        // `foo.tmp` onto its own cache dir, and could collide with a sibling repo's
+        // dir - which hash to different fetch-lock slots and so are not serialized.
+        // `repo::resolve` rejects any client path containing the suffix, so this
+        // can never alias a real repo.
+        let mut tmp = repo.cache_dir.clone().into_os_string();
+        tmp.push(crate::repo::INCOMING_SUFFIX);
+        let tmp = std::path::PathBuf::from(tmp);
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tracing::info!(repo = %repo.name, "cloning mirror from upstream");
         // `--mirror` copies *every* ref (all branches, tags, and notes) into a bare
