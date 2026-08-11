@@ -16,8 +16,19 @@ repos:
   - repo: https://github.com/crate-ci/committed
     rev: v1.1.11
     hooks:
+      # Per-commit: lint the message as it is written.
       - id: committed
         stages: [commit-msg]
+      # Pre-push: lint every commit about to be pushed (mirrors CI's range check),
+      # so a subject that slipped past commit-msg (an --amend, a --no-verify) is
+      # caught before it reaches CI. Reuses the same managed committed binary.
+      - id: committed
+        alias: committed-range
+        name: committed (whole push range)
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false
+        args: [origin/main..HEAD]
 
   - repo: local
     hooks:
