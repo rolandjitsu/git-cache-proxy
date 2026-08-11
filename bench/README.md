@@ -31,3 +31,6 @@ saving, not a precise WAN emulator:
   under-models RTT-heavy negotiation. For faithful latency use `tc netem` (Linux).
 - The **byte counts are exact** - those are the headline result and do not depend
   on the emulation fidelity.
+- **Same WAN transport throughout** - the direct clone (A) and the proxy's upstream
+  fetch (B) both cross the shim over `git://`; the client-to-proxy hop is local HTTP
+  that never crosses the shim, so the byte comparison is like-for-like.
