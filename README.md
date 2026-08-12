@@ -227,6 +227,10 @@ modern **v2** (`git-protocol` header, the default since Git 2.26) and the legacy
 **v0/v1** advertisement — covering full clone, incremental delta fetch, and
 push rejection.
 
+This is early, single-maintainer software: no independent review or wide
+deployment yet. Pin a version and try it against your own setup before you
+rely on it.
+
 Not yet implemented, in rough priority order:
 
 - LRU disk eviction of idle mirrors (the cache currently grows unbounded).
