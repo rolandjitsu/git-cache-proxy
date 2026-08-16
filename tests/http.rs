@@ -26,7 +26,7 @@ fn state(serve_token: Option<String>) -> AppState {
         fetch_ttl: Duration::from_secs(10),
     };
     AppState {
-        cache: Arc::new(GitCache::new(cfg, metrics.clone())),
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
         upstream_base: "https://upstream.invalid".into(),
         cache_root,
         serve_token,
@@ -147,12 +147,19 @@ async fn valid_token_passes_auth() {
 
 #[tokio::test]
 async fn reserved_suffix_repo_path_is_rejected() {
-    // A client path carrying the internal staging suffix could otherwise resolve
-    // onto a mirror's in-flight clone dir; resolve rejects it before any upstream
-    // work, over both endpoints.
+    // A client path carrying an internal suffix could otherwise resolve onto a
+    // mirror's in-flight clone dir (`.__incoming__`) or a mirror mid-eviction
+    // (`.__evicting__`); resolve rejects both before any upstream work.
     let resp = get(
         state(None),
         "/repo.__incoming__.git/info/refs?service=git-upload-pack",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = get(
+        state(None),
+        "/repo.__evicting__.git/info/refs?service=git-upload-pack",
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -196,7 +203,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         fetch_ttl: Duration::from_secs(10),
     };
     let st = AppState {
-        cache: Arc::new(GitCache::new(cfg, metrics.clone())),
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
         upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,

@@ -11,7 +11,7 @@
 //! clones), so a flood of distinct but doomed repo paths cannot inflate the
 //! series count.
 
-use prometheus::{Encoder, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 
 pub struct Metrics {
     pub registry: Registry,
@@ -22,6 +22,14 @@ pub struct Metrics {
     /// `upstream_ops_total{op, result, repo}` - op = clone | fetch; result = ok |
     /// error; repo = the repo path when result = ok, else `-`.
     upstream: IntCounterVec,
+    /// `cache_bytes` - total size of the on-disk mirror cache, maintained
+    /// incrementally as mirrors are added, refreshed, and evicted. Populated only
+    /// when a cap is configured (`--cache-max-mb`); with no cap it stays `0`.
+    cache_bytes: IntGauge,
+    /// `cache_mirrors` - number of cached mirrors (same caveat as `cache_bytes`).
+    cache_mirrors: IntGauge,
+    /// `evictions_total` - idle mirrors evicted to keep the cache under the cap.
+    evictions: IntCounter,
 }
 
 impl Metrics {
@@ -40,16 +48,43 @@ impl Metrics {
             &["op", "result", "repo"],
         )
         .expect("valid metric");
+        let cache_bytes = IntGauge::new(
+            "gitcacheproxy_cache_bytes",
+            "Total size of the on-disk mirror cache in bytes",
+        )
+        .expect("valid metric");
+        let cache_mirrors = IntGauge::new(
+            "gitcacheproxy_cache_mirrors",
+            "Number of cached mirrors on disk",
+        )
+        .expect("valid metric");
+        let evictions = IntCounter::new(
+            "gitcacheproxy_evictions_total",
+            "Idle mirrors evicted to keep the cache under the configured cap",
+        )
+        .expect("valid metric");
         registry
             .register(Box::new(requests.clone()))
             .expect("register requests");
         registry
             .register(Box::new(upstream.clone()))
             .expect("register upstream");
+        registry
+            .register(Box::new(cache_bytes.clone()))
+            .expect("register cache_bytes");
+        registry
+            .register(Box::new(cache_mirrors.clone()))
+            .expect("register cache_mirrors");
+        registry
+            .register(Box::new(evictions.clone()))
+            .expect("register evictions");
         Self {
             registry,
             requests,
             upstream,
+            cache_bytes,
+            cache_mirrors,
+            evictions,
         }
     }
 
@@ -67,6 +102,17 @@ impl Metrics {
     /// `record_request`.
     pub fn record_upstream(&self, op: &str, result: &str, repo: &str) {
         self.upstream.with_label_values(&[op, result, repo]).inc();
+    }
+
+    /// Refresh the cache-size gauges from the eviction index.
+    pub fn set_cache_size(&self, bytes: u64, mirrors: usize) {
+        self.cache_bytes.set(bytes as i64);
+        self.cache_mirrors.set(mirrors as i64);
+    }
+
+    /// Record one evicted mirror.
+    pub fn record_eviction(&self) {
+        self.evictions.inc();
     }
 
     pub fn gather(&self) -> String {
@@ -95,8 +141,14 @@ mod tests {
         m.record_request("upload_pack", "error", "group/bar.git");
         m.record_upstream("fetch", "ok", "group/foo.git");
         m.record_upstream("clone", "error", "group/bar.git");
+        m.set_cache_size(2048, 3);
+        m.record_eviction();
+        m.record_eviction();
 
         let out = m.gather();
+        assert!(out.contains("gitcacheproxy_cache_bytes 2048"));
+        assert!(out.contains("gitcacheproxy_cache_mirrors 3"));
+        assert!(out.contains("gitcacheproxy_evictions_total 2"));
         assert!(out.contains(
             r#"gitcacheproxy_requests_total{kind="info_refs",repo="group/foo.git",result="ok"} 1"#
         ));

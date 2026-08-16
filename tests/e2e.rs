@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
@@ -87,7 +88,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         fetch_ttl: Duration::from_secs(0),
     };
     let state = AppState {
-        cache: Arc::new(GitCache::new(cfg, metrics.clone())),
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
@@ -167,8 +168,12 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         upstream_auth_header: None,
         fetch_ttl: Duration::from_secs(0),
     };
+    // Eviction enabled with an effectively unbounded cap: no mirror is ever
+    // evicted, but the on-request index bookkeeping (touch on serve, mark-changed
+    // on clone/fetch) runs, which the assertion below checks.
+    let idx = CacheIndex::new(cache.path().to_path_buf(), u64::MAX, metrics.clone());
     let state = AppState {
-        cache: Arc::new(GitCache::new(cfg, metrics.clone())),
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), Some(idx.clone()))),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
@@ -258,6 +263,14 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
     assert!(
         scraped.contains(r#"op="fetch""#) && scraped.contains(r#"repo="repo.git""#),
         "missing per-repo fetch metric after second clone:\n{scraped}"
+    );
+
+    // The clone and fetch both flowed through the cache index: it tracks the one
+    // mirror the proxy created.
+    assert_eq!(
+        idx.totals().1,
+        1,
+        "cache index should track the cloned repo"
     );
 
     // --- A push attempt is rejected over the wire (403). ---
