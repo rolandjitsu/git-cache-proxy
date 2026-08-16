@@ -14,6 +14,7 @@
 //! stale for the ref the client actually asked for.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,14 +68,23 @@ pub struct GitCache {
     /// anyway, and the critical section is a single O(1) map operation - far too
     /// short for reader/writer separation to pay off.
     slots: Mutex<HashMap<String, Arc<RepoSlot>>>,
+    /// Cache-size index for LRU eviction, or `None` when no cap is configured.
+    /// When present it is `touch`ed on every request and `record`ed after each
+    /// clone/fetch; when absent the eviction machinery is entirely inert.
+    index: Option<Arc<crate::evict::CacheIndex>>,
 }
 
 impl GitCache {
-    pub fn new(cfg: GitConfig, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        cfg: GitConfig,
+        metrics: Arc<Metrics>,
+        index: Option<Arc<crate::evict::CacheIndex>>,
+    ) -> Self {
         Self {
             cfg,
             metrics,
             slots: Mutex::new(HashMap::new()),
+            index,
         }
     }
 
@@ -91,11 +101,54 @@ impl GitCache {
             .clone()
     }
 
+    /// Flag a mirror as changed after a clone/fetch so the background evictor
+    /// (re)measures it and rebalances the cache. O(1) bookkeeping only - the size
+    /// walk and any eviction run off this request path. No-op when eviction is
+    /// disabled.
+    fn mark_changed(&self, repo: &RepoRef) {
+        if let Some(idx) = &self.index {
+            idx.mark_changed(&repo.name);
+        }
+    }
+
+    /// Evict a mirror: rename it out of the way, then remove it. Serialized against
+    /// clone/fetch for the same repo via its slot lock, so it never races the work
+    /// that populates the mirror. The rename is atomic and fast; the (possibly slow)
+    /// removal runs after the lock is released. `ensure_fresh` keys off
+    /// `HEAD.exists()`, so the next request for an evicted repo transparently
+    /// re-clones. An `upload-pack` already streaming from the old directory keeps
+    /// its open file descriptors and drains cleanly (POSIX unlink semantics).
+    pub async fn evict(&self, name: &str, cache_dir: &Path) -> Result<()> {
+        let slot = self.slot(name).await;
+        let guard = slot.fetch_lock.lock().await;
+        if !cache_dir.join("HEAD").exists() {
+            return Ok(()); // already gone (raced a prior eviction or manual removal)
+        }
+        // Rename to a reserved sibling (rejected as a client path by `repo::resolve`)
+        // and remove any leftover from a crashed prior eviction first. Appending the
+        // suffix to the full path mirrors `clone_mirror`'s staging discipline.
+        let mut trash = cache_dir.as_os_str().to_owned();
+        trash.push(crate::repo::EVICTING_SUFFIX);
+        let trash = std::path::PathBuf::from(trash);
+        let _ = tokio::fs::remove_dir_all(&trash).await;
+        tokio::fs::rename(cache_dir, &trash)
+            .await
+            .with_context(|| format!("rename mirror for eviction: {name}"))?;
+        drop(guard); // the mirror is gone from its path; free the slot before the slow delete
+        let _ = tokio::fs::remove_dir_all(&trash).await;
+        Ok(())
+    }
+
     /// Ensure the mirror exists and (when `want_fetch`) is fresh. Concurrent
     /// callers for the same repo are serialized; the first does the work, the
     /// rest see it already fresh.
     pub async fn ensure_fresh(&self, repo: &RepoRef, want_fetch: bool) -> Result<CacheOutcome> {
         let slot = self.slot(&repo.name).await;
+        // Mark the repo used on every request - a served cache hit counts as much as
+        // a fetch - so the eviction index keeps a truthful last-access ordering.
+        if let Some(idx) = &self.index {
+            idx.touch(&repo.name);
+        }
         let mut last = slot.fetch_lock.lock().await;
 
         if !repo.cache_dir.join("HEAD").exists() {
@@ -240,6 +293,7 @@ impl GitCache {
             .await
             .context("rename mirror into place")?;
         self.metrics.record_upstream("clone", "ok", &repo.name);
+        self.mark_changed(repo);
         Ok(())
     }
 
@@ -264,6 +318,7 @@ impl GitCache {
             bail!("git fetch failed for {}", repo.name);
         }
         self.metrics.record_upstream("fetch", "ok", &repo.name);
+        self.mark_changed(repo);
         Ok(())
     }
 

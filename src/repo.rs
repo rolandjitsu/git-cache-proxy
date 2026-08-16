@@ -33,6 +33,12 @@ pub fn repo_name_from_path(path: &str, suffix: &str) -> Option<String> {
 /// in-flight clone directory.
 pub const INCOMING_SUFFIX: &str = ".__incoming__";
 
+/// Reserved suffix for the trash directory a mirror is renamed to during eviction
+/// before its (possibly slow) removal (see `git::GitCache::evict`). Reserved for
+/// the same reason as `INCOMING_SUFFIX`: a client path must never alias a mirror
+/// mid-eviction.
+pub const EVICTING_SUFFIX: &str = ".__evicting__";
+
 /// Validate a repo path (no traversal / absolute / NUL) and resolve it against
 /// the upstream base and cache root.
 pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<RepoRef> {
@@ -44,9 +50,10 @@ pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<Rep
             bail!("invalid repo path component in {name:?}");
         }
     }
-    // Reserved: the clone staging dir is a sibling of the cache dir carrying this
-    // suffix, so a client path containing it could alias an in-flight clone.
-    if name.contains(INCOMING_SUFFIX) {
+    // Reserved: the clone staging and eviction trash dirs are siblings of the
+    // cache dir carrying these suffixes, so a client path containing one could
+    // alias an in-flight clone or a mirror mid-eviction.
+    if name.contains(INCOMING_SUFFIX) || name.contains(EVICTING_SUFFIX) {
         bail!("invalid repo path (reserved suffix) in {name:?}");
     }
     let cache_dir = cache_root.join(name);
@@ -91,11 +98,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_incoming_suffix() {
+    fn rejects_reserved_suffixes() {
         let root = Path::new("/cache");
         // A client must not be able to name a repo that maps onto the staging dir
-        // of another (`<cache_dir>.__incoming__`).
+        // (`<cache_dir>.__incoming__`) or eviction trash (`<cache_dir>.__evicting__`)
+        // of another.
         assert!(resolve(&format!("foo{INCOMING_SUFFIX}"), "https://up", root).is_err());
         assert!(resolve(&format!("a/b{INCOMING_SUFFIX}"), "https://up", root).is_err());
+        assert!(resolve(&format!("foo{EVICTING_SUFFIX}"), "https://up", root).is_err());
+        assert!(resolve(&format!("a/b{EVICTING_SUFFIX}"), "https://up", root).is_err());
     }
 }

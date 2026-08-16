@@ -19,6 +19,9 @@ axum = "0.8"
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 flate2 = "1"
+# default-features off drops the `hashbrown` backend (and its allocator-api2 /
+# foldhash / equivalent deps); the std `HashMap` backend is plenty for this.
+lru = { version = "0.18", default-features = false }
 prometheus = { version = "0.14", default-features = false }
 subtle = "2"
 tokio = { version = "1", features = [

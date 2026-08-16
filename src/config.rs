@@ -81,6 +81,14 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_MAX_DECODED_BODY_MB", default_value_t = 512)]
     pub max_decoded_body_mb: u64,
 
+    /// Maximum total size, in MiB, of the on-disk mirror cache. When a clone or
+    /// fetch pushes the total over this, least-recently-used idle mirrors are
+    /// evicted in the background until it is back under; an evicted mirror is
+    /// transparently re-cloned on its next request. `0` = unlimited: no eviction
+    /// and no accounting, so the cache grows without bound (the default).
+    #[arg(long, env = "GITCACHEPROXY_CACHE_MAX_MB", default_value_t = 0)]
+    pub cache_max_mb: u64,
+
     /// Path to the git binary.
     #[arg(long, env = "GITCACHEPROXY_GIT_BINARY", default_value = "git")]
     pub git_binary: String,

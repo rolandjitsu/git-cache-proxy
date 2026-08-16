@@ -147,6 +147,7 @@ Every flag has an environment-variable equivalent.
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if refreshed within this window (`0` = always fetch)       |
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
+| `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus).
@@ -206,8 +207,9 @@ explicit before you expose it:
   not place it on an untrusted one without a token and TLS.
 - **DoS knobs.** `--max-concurrent-requests` caps concurrent upstream
   clone/fetch work and `--max-decoded-body-mb` bounds request-body memory
-  (defusing a decompression bomb). The on-disk cache still grows unbounded (no
-  eviction yet - see the roadmap), so isolate and monitor the cache volume.
+  (defusing a decompression bomb). `--cache-max-mb` bounds on-disk growth by
+  evicting least-recently-used idle mirrors; it defaults to `0` (unlimited), so
+  set it - or isolate and monitor the cache volume - on an untrusted network.
 - **Read-only.** Only `git-upload-pack` (clone/fetch) is served; `git-receive-pack`
   (push) is refused and upstream is only ever pulled from, never written.
 
@@ -233,7 +235,6 @@ rely on it.
 
 Not yet implemented, in rough priority order:
 
-- LRU disk eviction of idle mirrors (the cache currently grows unbounded).
 - Per-repo latency histograms (fetch/serve durations); per-repo counters exist.
 - A background/scheduled refresh option (today every `info/refs` triggers an
   on-demand, TTL-coalesced fetch).

@@ -15,7 +15,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use git_cache_proxy::config::{Config, LogFormat};
-use git_cache_proxy::{git, metrics, server};
+use git_cache_proxy::{evict, git, metrics, server};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -54,15 +54,37 @@ async fn main() -> Result<()> {
     };
 
     let metrics = Arc::new(metrics::Metrics::new());
+
+    // Bound the cache on disk only when a cap is set; with `0` no index is built
+    // and the eviction machinery stays inert, preserving the zero-overhead
+    // unbounded-growth default. The startup scan runs here, before binding.
+    let index = (cfg.cache_max_mb > 0).then(|| {
+        tracing::info!("cache eviction enabled: cap {} MiB", cfg.cache_max_mb);
+        evict::CacheIndex::new(
+            cfg.cache_root.clone(),
+            cfg.cache_max_mb.saturating_mul(1024 * 1024),
+            metrics.clone(),
+        )
+    });
+
+    let cache = Arc::new(git::GitCache::new(git_cfg, metrics.clone(), index.clone()));
     let state = server::AppState {
-        cache: Arc::new(git::GitCache::new(git_cfg, metrics.clone())),
+        cache: cache.clone(),
         upstream_base: cfg.upstream.trim_end_matches('/').to_string(),
         cache_root: cfg.cache_root.clone(),
         serve_token: cfg.serve_token.clone(),
         max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),
         max_concurrent: cfg.max_concurrent_requests,
-        metrics,
+        metrics: metrics.clone(),
     };
+
+    // Spawn the event-driven evictor and keep its handle so shutdown can stop it
+    // cleanly rather than leaving it dangling. `watch` carries the shutdown signal.
+    let evictor = index.map(|idx| {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(evict::run(cache.clone(), idx, shutdown_rx));
+        (shutdown_tx, handle)
+    });
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
@@ -78,6 +100,14 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("http server")?;
+
+    // The server has drained; stop the evictor and wait for it to finish any
+    // in-progress eviction before exiting.
+    if let Some((shutdown_tx, handle)) = evictor {
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+    }
+
     tracing::info!("shutdown complete");
     Ok(())
 }
