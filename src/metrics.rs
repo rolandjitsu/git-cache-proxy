@@ -11,7 +11,16 @@
 //! clones), so a flood of distinct but doomed repo paths cannot inflate the
 //! series count.
 
-use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+    TextEncoder,
+};
+
+/// Histogram buckets, in seconds, for git operation latency: from a fast cached
+/// advertisement (tens of ms) to a large clone over a slow WAN (minutes).
+const DURATION_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
 
 pub struct Metrics {
     pub registry: Registry,
@@ -30,6 +39,13 @@ pub struct Metrics {
     cache_mirrors: IntGauge,
     /// `evictions_total` - idle mirrors evicted to keep the cache under the cap.
     evictions: IntCounter,
+    /// `upstream_duration_seconds{op, repo}` - clone/fetch wall-clock, observed
+    /// only on success (same bounded-`repo` discipline as the counters).
+    upstream_duration: HistogramVec,
+    /// `serve_duration_seconds{kind, repo}` - kind = info_refs (the buffered
+    /// advertisement) | upload_pack (the packfile stream, timed to EOF). Observed
+    /// only on success.
+    serve_duration: HistogramVec,
 }
 
 impl Metrics {
@@ -63,6 +79,24 @@ impl Metrics {
             "Idle mirrors evicted to keep the cache under the configured cap",
         )
         .expect("valid metric");
+        let upstream_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "gitcacheproxy_upstream_duration_seconds",
+                "Upstream clone/fetch duration in seconds",
+            )
+            .buckets(DURATION_BUCKETS.to_vec()),
+            &["op", "repo"],
+        )
+        .expect("valid metric");
+        let serve_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "gitcacheproxy_serve_duration_seconds",
+                "Client serve duration in seconds (info/refs advertisement, upload-pack stream)",
+            )
+            .buckets(DURATION_BUCKETS.to_vec()),
+            &["kind", "repo"],
+        )
+        .expect("valid metric");
         registry
             .register(Box::new(requests.clone()))
             .expect("register requests");
@@ -78,6 +112,12 @@ impl Metrics {
         registry
             .register(Box::new(evictions.clone()))
             .expect("register evictions");
+        registry
+            .register(Box::new(upstream_duration.clone()))
+            .expect("register upstream_duration");
+        registry
+            .register(Box::new(serve_duration.clone()))
+            .expect("register serve_duration");
         Self {
             registry,
             requests,
@@ -85,6 +125,8 @@ impl Metrics {
             cache_bytes,
             cache_mirrors,
             evictions,
+            upstream_duration,
+            serve_duration,
         }
     }
 
@@ -113,6 +155,22 @@ impl Metrics {
     /// Record one evicted mirror.
     pub fn record_eviction(&self) {
         self.evictions.inc();
+    }
+
+    /// Observe an upstream op's duration. Call only on success with the real repo,
+    /// matching the counters' bounded-`repo` cardinality discipline.
+    pub fn observe_upstream(&self, op: &str, repo: &str, seconds: f64) {
+        self.upstream_duration
+            .with_label_values(&[op, repo])
+            .observe(seconds);
+    }
+
+    /// Observe a client serve duration (`kind` = `info_refs` | `upload_pack`),
+    /// same cardinality discipline as `observe_upstream`.
+    pub fn observe_serve(&self, kind: &str, repo: &str, seconds: f64) {
+        self.serve_duration
+            .with_label_values(&[kind, repo])
+            .observe(seconds);
     }
 
     pub fn gather(&self) -> String {
@@ -144,11 +202,19 @@ mod tests {
         m.set_cache_size(2048, 3);
         m.record_eviction();
         m.record_eviction();
+        m.observe_upstream("clone", "group/foo.git", 1.5);
+        m.observe_serve("upload_pack", "group/foo.git", 2.0);
 
         let out = m.gather();
         assert!(out.contains("gitcacheproxy_cache_bytes 2048"));
         assert!(out.contains("gitcacheproxy_cache_mirrors 3"));
         assert!(out.contains("gitcacheproxy_evictions_total 2"));
+        assert!(out.contains(
+            r#"gitcacheproxy_upstream_duration_seconds_count{op="clone",repo="group/foo.git"} 1"#
+        ));
+        assert!(out.contains(
+            r#"gitcacheproxy_serve_duration_seconds_count{kind="upload_pack",repo="group/foo.git"} 1"#
+        ));
         assert!(out.contains(
             r#"gitcacheproxy_requests_total{kind="info_refs",repo="group/foo.git",result="ok"} 1"#
         ));

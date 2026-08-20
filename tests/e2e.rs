@@ -273,6 +273,20 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         "cache index should track the cloned repo"
     );
 
+    // Latency histograms were recorded per repo for the synchronous ops: the
+    // upstream clone + fetch, and the info/refs advertisement serve. (The streamed
+    // upload-pack serve is timed on EOF and covered by a unit test in `git.rs`.)
+    for series in [
+        r#"gitcacheproxy_upstream_duration_seconds_count{op="clone",repo="repo.git"}"#,
+        r#"gitcacheproxy_upstream_duration_seconds_count{op="fetch",repo="repo.git"}"#,
+        r#"gitcacheproxy_serve_duration_seconds_count{kind="info_refs",repo="repo.git"}"#,
+    ] {
+        assert!(
+            scraped.contains(series),
+            "missing latency histogram {series}:\n{scraped}"
+        );
+    }
+
     // --- A push attempt is rejected over the wire (403). ---
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let req = format!(

@@ -15,13 +15,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
@@ -182,6 +184,7 @@ impl GitCache {
             .arg("--stateless-rpc")
             .arg("--advertise-refs")
             .arg(&repo.cache_dir);
+        let started = Instant::now();
         let out = cmd
             .output()
             .await
@@ -193,6 +196,8 @@ impl GitCache {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+        self.metrics
+            .observe_serve("info_refs", &repo.name, started.elapsed().as_secs_f64());
         let mut body = pkt_line("# service=git-upload-pack\n");
         body.extend_from_slice(b"0000"); // flush-pkt
         body.extend_from_slice(&out.stdout);
@@ -208,7 +213,10 @@ impl GitCache {
         repo: &RepoRef,
         git_protocol: Option<&str>,
         body: Bytes,
-    ) -> Result<ReaderStream<ChildStdout>> {
+    ) -> Result<ReaderStream<TimedReader<ChildStdout>>> {
+        // Serve duration spans the whole RPC: spawn, negotiation write, and the
+        // streamed packfile, recorded when the stream reaches EOF (see `TimedReader`).
+        let started = Instant::now();
         let mut cmd = self.local_cmd(git_protocol);
         cmd.arg("upload-pack")
             .arg("--stateless-rpc")
@@ -245,7 +253,12 @@ impl GitCache {
                 _ => {}
             }
         });
-        Ok(ReaderStream::new(stdout))
+        let timed = TimedReader {
+            inner: stdout,
+            repo: repo.name.clone(),
+            recorder: Some((self.metrics.clone(), started)),
+        };
+        Ok(ReaderStream::new(timed))
     }
 
     async fn clone_mirror(&self, repo: &RepoRef) -> Result<()> {
@@ -271,6 +284,7 @@ impl GitCache {
         // repo, not just HEAD, and maps them 1:1 so a later `fetch` keeps them in
         // sync. The client then negotiates whatever ref it wants via upload-pack, so
         // the mirror can serve any branch/tag/sha the origin has - never HEAD-only.
+        let started = Instant::now();
         let status = self
             .fetch_cmd()
             .arg("clone")
@@ -289,10 +303,12 @@ impl GitCache {
             self.metrics.record_upstream("clone", "error", "-");
             bail!("git clone --mirror failed for {}", repo.name);
         }
+        let elapsed = started.elapsed().as_secs_f64();
         tokio::fs::rename(&tmp, &repo.cache_dir)
             .await
             .context("rename mirror into place")?;
         self.metrics.record_upstream("clone", "ok", &repo.name);
+        self.metrics.observe_upstream("clone", &repo.name, elapsed);
         self.mark_changed(repo);
         Ok(())
     }
@@ -303,6 +319,7 @@ impl GitCache {
         // up exactly one remote named `origin` (git's default remote name) pointing at
         // the upstream URL, with a mirror refspec that updates all refs. So `origin`
         // is not an assumption about the client - it is the remote this proxy created.
+        let started = Instant::now();
         let status = self
             .fetch_cmd()
             .current_dir(&repo.cache_dir)
@@ -318,6 +335,8 @@ impl GitCache {
             bail!("git fetch failed for {}", repo.name);
         }
         self.metrics.record_upstream("fetch", "ok", &repo.name);
+        self.metrics
+            .observe_upstream("fetch", &repo.name, started.elapsed().as_secs_f64());
         self.mark_changed(repo);
         Ok(())
     }
@@ -346,6 +365,51 @@ impl GitCache {
     }
 }
 
+/// Wraps `upload-pack`'s stdout to record how long the packfile took to serve.
+/// The duration spans from the RPC starting to the stream reaching EOF - or the
+/// client disconnecting, caught by `Drop` - so it includes the client's read
+/// speed: this is serve latency, not pure generation time. Recorded exactly once
+/// (the `Option` is `take`n on the first of EOF or drop).
+pub struct TimedReader<R> {
+    inner: R,
+    repo: String,
+    recorder: Option<(Arc<Metrics>, Instant)>,
+}
+
+impl<R> TimedReader<R> {
+    fn record(&mut self) {
+        if let Some((metrics, started)) = self.recorder.take() {
+            metrics.observe_serve("upload_pack", &self.repo, started.elapsed().as_secs_f64());
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TimedReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        // A ready read that produced no bytes is EOF: the packfile is fully served.
+        if let Poll::Ready(Ok(())) = &poll
+            && buf.filled().len() == before
+        {
+            this.record();
+        }
+        poll
+    }
+}
+
+impl<R> Drop for TimedReader<R> {
+    fn drop(&mut self) {
+        // Covers a client that hung up before EOF; a no-op if EOF already recorded.
+        self.record();
+    }
+}
+
 /// Encode a string as a single pkt-line (4-hex length prefix + payload).
 fn pkt_line(s: &str) -> Vec<u8> {
     let mut v = format!("{:04x}", s.len() + 4).into_bytes();
@@ -361,5 +425,23 @@ mod tests {
     fn pkt_line_encodes_length() {
         assert_eq!(pkt_line("a"), b"0005a");
         assert_eq!(&pkt_line("# service=git-upload-pack\n")[..4], b"001e");
+    }
+
+    #[tokio::test]
+    async fn timed_reader_records_serve_duration_at_eof() {
+        use tokio::io::AsyncReadExt;
+
+        let metrics = Arc::new(Metrics::new());
+        let mut reader = TimedReader {
+            inner: &b"packfile bytes"[..],
+            repo: "group/foo.git".into(),
+            recorder: Some((metrics.clone(), Instant::now())),
+        };
+        // Reading to EOF drives the final zero-byte read, which records once.
+        let mut sink = Vec::new();
+        reader.read_to_end(&mut sink).await.unwrap();
+        assert!(metrics.gather().contains(
+            r#"gitcacheproxy_serve_duration_seconds_count{kind="upload_pack",repo="group/foo.git"} 1"#
+        ));
     }
 }
