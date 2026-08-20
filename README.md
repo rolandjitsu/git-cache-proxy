@@ -150,7 +150,9 @@ Every flag has an environment-variable equivalent.
 | `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
 
-Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus).
+Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus - per-repo request and
+upstream counters, cache-size gauges, and `*_duration_seconds` fetch/serve
+latency histograms).
 
 ## Auth model
 
@@ -235,7 +237,8 @@ rely on it.
 
 Not yet implemented, in rough priority order:
 
-- Per-repo latency histograms (fetch/serve durations); per-repo counters exist.
+- A Helm chart for Kubernetes deployment (liveness/readiness probes,
+  single-writer RWO PVC, metrics scrape), shipped in-repo.
 - A background/scheduled refresh option (today every `info/refs` triggers an
   on-demand, TTL-coalesced fetch).
 - No external `git` binary: move the plumbing in-process to a Rust library
