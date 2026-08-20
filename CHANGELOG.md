@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.8 (2026-08-20)
+
+### Features
+
+- add per-repo fetch/serve latency histograms
+
 ## 0.1.7 (2026-08-17)
 
 ### Features
