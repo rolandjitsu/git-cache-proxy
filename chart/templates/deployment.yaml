@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: '{{ include "git-cache-proxy.fullname" . }}'
+  labels:
+    app: '{{ include "git-cache-proxy.fullname" . }}'
+spec:
+  # One writer by design: the bare mirrors sit on a single ReadWriteOnce volume
+  # and concurrent fetches are already coalesced in-process, so a second replica
+  # would only contend for the same PVC. Recreate (not RollingUpdate) so the PVC
+  # detaches from the old pod before the new one attaches. This is not HA.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: '{{ include "git-cache-proxy.fullname" . }}'
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        app: '{{ include "git-cache-proxy.fullname" . }}'
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: git-cache-proxy
+          image: '{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}'
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            - name: GITCACHEPROXY_BIND
+              value: '0.0.0.0:{{ .Values.service.port }}'
+            - name: GITCACHEPROXY_UPSTREAM
+              value: {{ .Values.upstream | quote }}
+            - name: GITCACHEPROXY_CACHE_ROOT
+              value: /var/cache/git-cache-proxy
+            - name: GITCACHEPROXY_FETCH_TTL_SECONDS
+              value: {{ .Values.config.fetchTtlSeconds | quote }}
+            - name: GITCACHEPROXY_CACHE_MAX_MB
+              value: {{ .Values.config.cacheMaxMb | quote }}
+            - name: GITCACHEPROXY_MAX_CONCURRENT_REQUESTS
+              value: {{ .Values.config.maxConcurrentRequests | quote }}
+            - name: GITCACHEPROXY_MAX_DECODED_BODY_MB
+              value: {{ .Values.config.maxDecodedBodyMb | quote }}
+            - name: GITCACHEPROXY_LOG
+              value: {{ .Values.config.logLevel | quote }}
+            - name: GITCACHEPROXY_LOG_FORMAT
+              value: {{ .Values.config.logFormat | quote }}
+            {{- if .Values.upstreamAuth.existingSecret }}
+            - name: GITCACHEPROXY_UPSTREAM_AUTH_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.upstreamAuth.existingSecret | quote }}
+                  key: {{ .Values.upstreamAuth.key | quote }}
+            {{- end }}
+            {{- if .Values.serveToken.existingSecret }}
+            - name: GITCACHEPROXY_SERVE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.serveToken.existingSecret | quote }}
+                  key: {{ .Values.serveToken.key | quote }}
+            {{- end }}
+            {{- if .Values.caTrust.enabled }}
+            # Validate upstream TLS against the CA bundle mounted below.
+            - name: GIT_SSL_CAINFO
+              value: /etc/ssl/certs/ca-certificates.crt
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Readiness checks the cache root is writable, so a detached or read-only
+          # volume surfaces as NotReady instead of a flood of upstream 502s.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/git-cache-proxy
+            {{- if .Values.caTrust.enabled }}
+            - name: ca-trust
+              mountPath: /etc/ssl/certs/ca-certificates.crt
+              subPath: ca-certificates.crt
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: cache
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (include "git-cache-proxy.fullname" .) }}
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.persistence.emptyDirSizeLimit }}
+          {{- end }}
+        {{- if .Values.caTrust.enabled }}
+        - name: ca-trust
+          configMap:
+            name: {{ .Values.caTrust.configMapName | quote }}
+            items:
+              - key: {{ .Values.caTrust.key | quote }}
+                path: ca-certificates.crt
+        {{- end }}

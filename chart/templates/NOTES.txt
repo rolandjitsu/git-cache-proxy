@@ -1,0 +1,30 @@
+git-cache-proxy is running as {{ include "git-cache-proxy.fullname" . }}, caching
+{{ .Values.upstream }}.
+
+Point CI clients at it in-cluster (it speaks git smart-HTTP, so clone/fetch as if
+it were the origin):
+
+    git clone http://{{ include "git-cache-proxy.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/<owner>/<repo>.git
+
+{{ if .Values.ingress.enabled -}}
+Externally, via the Ingress:
+
+    http://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
+{{ else -}}
+No Ingress is enabled. Reach it in-cluster (above), port-forward the Service, or
+set ingress.enabled=true.
+{{ end }}
+Health and metrics:
+
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "git-cache-proxy.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+    # then: curl localhost:{{ .Values.service.port }}/readyz  and  /metrics
+
+{{ if not .Values.upstreamAuth.existingSecret -}}
+No upstream auth is set, so only public repos on {{ .Values.upstream }} will work.
+Set upstreamAuth.existingSecret to a Secret holding the full Authorization header
+to cache private repos.
+{{ end -}}
+{{ if and (eq (int .Values.config.cacheMaxMb) 0) .Values.persistence.enabled -}}
+config.cacheMaxMb is 0 (unlimited): the cache volume can grow until full. Set it
+to bound on-disk usage with LRU eviction.
+{{ end -}}
