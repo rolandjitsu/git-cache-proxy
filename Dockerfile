@@ -6,16 +6,18 @@
 # dependency of its own. The runtime layer is a bare Alpine that adds only
 # `git` + CA certs.
 #
-# Why not a true "distroless" (gcr.io/distroless/static) image? The proxy
-# delegates all wire-protocol work to the system `git` binary, so the runtime
-# MUST contain git. distroless/static has no package manager and no git, so it
-# cannot host this design as-is. Alpine is the smallest base that still ships a
-# git package. A genuinely distroless (git-free) image only becomes possible if
-# the git plumbing moves in-process to a Rust library (gitoxide/libgit2) - see
-# the "no external git binary" item on the roadmap.
+# Why not a true "distroless" (gcr.io/distroless/static) image? The proxy delegates
+# the git wire protocol to the system `git` binary, so the runtime MUST contain git.
+# distroless/static has no package manager and no git, so it cannot host this design
+# as-is. Alpine is the smallest base that still ships a git package. The LFS HTTPS
+# transfer, by contrast, is in-process (reqwest + rustls), so it needs no runtime
+# tool - only CA certs. A genuinely git-free image only becomes possible if the git
+# plumbing also moves in-process - see the "no external git binary" roadmap item.
 
 FROM rust:alpine AS build
-RUN apk add --no-cache musl-dev
+# musl-dev for the static libc; build-base gives the C toolchain `ring` (rustls'
+# crypto provider) compiles its assembly with.
+RUN apk add --no-cache build-base
 WORKDIR /src
 COPY . .
 # Default target on rust:alpine is x86_64-unknown-linux-musl (static).

@@ -8,6 +8,7 @@
 pub mod config;
 pub mod evict;
 pub mod git;
+pub mod lfs;
 pub mod metrics;
 pub mod repo;
 pub mod server;

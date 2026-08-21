@@ -15,7 +15,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use git_cache_proxy::config::{Config, LogFormat};
-use git_cache_proxy::{evict, git, metrics, server};
+use git_cache_proxy::{evict, git, lfs, metrics, repo, server};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 
     let git_cfg = git::GitConfig {
         git_binary: cfg.git_binary.clone(),
-        upstream_auth_header,
+        upstream_auth_header: upstream_auth_header.clone(),
         fetch_ttl: Duration::from_secs(cfg.fetch_ttl_seconds),
     };
 
@@ -68,9 +68,32 @@ async fn main() -> Result<()> {
     });
 
     let cache = Arc::new(git::GitCache::new(git_cfg, metrics.clone(), index.clone()));
+
+    let upstream_base = cfg.upstream.trim_end_matches('/').to_string();
+
+    // Clear any in-flight LFS downloads left by a crash so they never linger; the
+    // objects themselves are content-addressed and re-fetched on demand.
+    let _ = tokio::fs::remove_dir_all(
+        cfg.cache_root
+            .join(repo::LFS_OBJECTS_DIR)
+            .join(lfs::INCOMING_DIR),
+    )
+    .await;
+
+    let lfs = Arc::new(lfs::Lfs::new(
+        lfs::LfsConfig {
+            upstream_base: upstream_base.clone(),
+            cache_root: cfg.cache_root.clone(),
+            upstream_auth_header,
+            serve_token: cfg.serve_token.clone(),
+        },
+        index.clone(),
+    ));
+
     let state = server::AppState {
         cache: cache.clone(),
-        upstream_base: cfg.upstream.trim_end_matches('/').to_string(),
+        lfs,
+        upstream_base,
         cache_root: cfg.cache_root.clone(),
         serve_token: cfg.serve_token.clone(),
         max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),

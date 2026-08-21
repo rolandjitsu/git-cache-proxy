@@ -25,8 +25,9 @@ const DURATION_BUCKETS: &[f64] = &[
 pub struct Metrics {
     pub registry: Registry,
     /// `requests_total{kind, result, repo}` - kind = info_refs | upload_pack |
-    /// auth | receive_pack; result = ok | error | upstream_error | unauthorized |
-    /// rejected; repo = the served repo path when result = ok, else `-`.
+    /// auth | receive_pack | lfs_batch | lfs_object; result = ok | error |
+    /// upstream_error | unauthorized | rejected; repo = the served repo path when
+    /// result = ok, else `-`.
     requests: IntCounterVec,
     /// `upstream_ops_total{op, result, repo}` - op = clone | fetch; result = ok |
     /// error; repo = the repo path when result = ok, else `-`.
@@ -39,6 +40,10 @@ pub struct Metrics {
     cache_mirrors: IntGauge,
     /// `evictions_total` - idle mirrors evicted to keep the cache under the cap.
     evictions: IntCounter,
+    /// `lfs_objects_total{result}` - cached git-LFS object lookups; result = hit
+    /// (served from disk) | miss (fetched from upstream, then cached) | error. No
+    /// `repo` label: objects are content-addressed and shared across repos.
+    lfs_objects: IntCounterVec,
     /// `upstream_duration_seconds{op, repo}` - clone/fetch wall-clock, observed
     /// only on success (same bounded-`repo` discipline as the counters).
     upstream_duration: HistogramVec,
@@ -79,6 +84,14 @@ impl Metrics {
             "Idle mirrors evicted to keep the cache under the configured cap",
         )
         .expect("valid metric");
+        let lfs_objects = IntCounterVec::new(
+            Opts::new(
+                "gitcacheproxy_lfs_objects_total",
+                "Cached git-LFS object lookups (hit/miss/error)",
+            ),
+            &["result"],
+        )
+        .expect("valid metric");
         let upstream_duration = HistogramVec::new(
             HistogramOpts::new(
                 "gitcacheproxy_upstream_duration_seconds",
@@ -113,6 +126,9 @@ impl Metrics {
             .register(Box::new(evictions.clone()))
             .expect("register evictions");
         registry
+            .register(Box::new(lfs_objects.clone()))
+            .expect("register lfs_objects");
+        registry
             .register(Box::new(upstream_duration.clone()))
             .expect("register upstream_duration");
         registry
@@ -125,6 +141,7 @@ impl Metrics {
             cache_bytes,
             cache_mirrors,
             evictions,
+            lfs_objects,
             upstream_duration,
             serve_duration,
         }
@@ -155,6 +172,11 @@ impl Metrics {
     /// Record one evicted mirror.
     pub fn record_eviction(&self) {
         self.evictions.inc();
+    }
+
+    /// Record a cached LFS object lookup: `result` = `hit` | `miss` | `error`.
+    pub fn record_lfs(&self, result: &str) {
+        self.lfs_objects.with_label_values(&[result]).inc();
     }
 
     /// Observe an upstream op's duration. Call only on success with the real repo,
@@ -202,6 +224,8 @@ mod tests {
         m.set_cache_size(2048, 3);
         m.record_eviction();
         m.record_eviction();
+        m.record_lfs("hit");
+        m.record_lfs("miss");
         m.observe_upstream("clone", "group/foo.git", 1.5);
         m.observe_serve("upload_pack", "group/foo.git", 2.0);
 
@@ -209,6 +233,8 @@ mod tests {
         assert!(out.contains("gitcacheproxy_cache_bytes 2048"));
         assert!(out.contains("gitcacheproxy_cache_mirrors 3"));
         assert!(out.contains("gitcacheproxy_evictions_total 2"));
+        assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="hit"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="miss"} 1"#));
         assert!(out.contains(
             r#"gitcacheproxy_upstream_duration_seconds_count{op="clone",repo="group/foo.git"} 1"#
         ));

@@ -11,6 +11,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use git_cache_proxy::git::{GitCache, GitConfig};
+use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
 use tower::ServiceExt; // for `oneshot`
@@ -25,8 +26,18 @@ fn state(serve_token: Option<String>) -> AppState {
         upstream_auth_header: None,
         fetch_ttl: Duration::from_secs(10),
     };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: "https://upstream.invalid".into(),
+            cache_root: cache_root.clone(),
+            upstream_auth_header: None,
+            serve_token: None,
+        },
+        None,
+    ));
     AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
         upstream_base: "https://upstream.invalid".into(),
         cache_root,
         serve_token,
@@ -202,8 +213,18 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         upstream_auth_header: None,
         fetch_ttl: Duration::from_secs(10),
     };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
+            cache_root: cache.path().to_path_buf(),
+            upstream_auth_header: None,
+            serve_token: None,
+        },
+        None,
+    ));
     let st = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
         upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,

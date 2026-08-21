@@ -17,6 +17,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
+use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,6 +90,15 @@ async fn upload_pack_decodes_gzip_encoded_request() {
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs: Arc::new(Lfs::new(
+            LfsConfig {
+                upstream_base: format!("file://{}", up.path().display()),
+                cache_root: cache.path().to_path_buf(),
+                upstream_auth_header: None,
+                serve_token: None,
+            },
+            None,
+        )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,
@@ -174,6 +184,15 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
     let idx = CacheIndex::new(cache.path().to_path_buf(), u64::MAX, metrics.clone());
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), Some(idx.clone()))),
+        lfs: Arc::new(Lfs::new(
+            LfsConfig {
+                upstream_base: format!("file://{}", up.path().display()),
+                cache_root: cache.path().to_path_buf(),
+                upstream_auth_header: None,
+                serve_token: None,
+            },
+            Some(idx.clone()),
+        )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         serve_token: None,

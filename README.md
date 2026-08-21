@@ -69,21 +69,46 @@ anything git-receive-pack  -> 403 (read-only)
 Concurrent clients for the same repo are serialized so a burst triggers a single
 upstream fetch; a short TTL coalesces repeated requests.
 
+### git-LFS
+
+LFS objects use a different HTTP API from the git protocol, so they are cached
+separately:
+
+```
+POST <repo>/info/lfs/objects/batch
+  -> forward to upstream, then rewrite each object's download URL back to this
+     proxy so the object fetch is cached here
+GET  <repo>/info/lfs/objects/<oid>
+  -> serve from the on-disk cache, or on a miss fetch it from upstream once
+     (verify sha256 == oid, store), then serve
+anything with operation=upload  -> 403 (read-only)
+```
+
+Objects are content-addressed and immutable, so a cached object is never stale and
+is shared across every repo that references the same oid; the first fetch across the
+fleet pays the WAN cost, the rest are served locally. The upstream LFS transfer is
+in-process over HTTPS (reqwest + rustls, no OpenSSL), so the binary stays statically
+linked. Cached objects share the `--cache-max-mb` budget and LRU eviction with the
+git mirrors. No configuration is needed: LFS is served on the same endpoints the git
+client already routes through the proxy.
+
 ## Benchmark
 
-For a fleet of ephemeral clients cloning the same repo, only the first clone pays
-the WAN cost; the rest are served from the local mirror. Cloning a 64 MB repo over
-an emulated 20 Mbit/s, 60 ms-RTT link:
+For a fleet of ephemeral clients fetching the same content, only the first fetch
+pays the WAN cost; the rest are served locally. Over an emulated 20 Mbit/s,
+60 ms-RTT link - cloning a 64 MB repo, and fetching a 32 MB git-LFS object:
 
-| Scenario                      | Clone time | WAN bytes |
-| ----------------------------- | ---------: | --------: |
-| Direct clone (today)          |     28.1 s |     64 MB |
-| Via proxy, cold (runner 1)    |     28.5 s |     64 MB |
-| Via proxy, warm (runner 2..N) |      0.6 s |     ~0 MB |
+| Scenario                          |    Time | WAN bytes |
+| --------------------------------- | ------: | --------: |
+| Clone, direct (today)             |  28.1 s |     64 MB |
+| Clone, via proxy cold (runner 1)  |  28.5 s |     64 MB |
+| Clone, via proxy warm (2..N)      |   0.6 s |     ~0 MB |
+| LFS object, cold (runner 1)       |  12.8 s |     32 MB |
+| LFS object, warm (2..N)           |   0.2 s |     ~0 MB |
 
-The first runner sees no penalty and every subsequent runner clones ~47x faster
+The first runner sees no penalty and every subsequent runner is served in-region
 while nothing crosses the WAN; the saving scales with fleet size and link cost.
-Reproduce or retune (`TOTAL_MB`, `RATE_MBIT`, `RTT_MS`) with
+Reproduce or retune (`TOTAL_MB`, `LFS_MB`, `RATE_MBIT`, `RTT_MS`) with
 [`bench/run.sh`](./bench/run.sh) - see [`bench/README.md`](./bench/README.md) for
 the method and its caveats.
 
@@ -151,8 +176,8 @@ Every flag has an environment-variable equivalent.
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus - per-repo request and
-upstream counters, cache-size gauges, and `*_duration_seconds` fetch/serve
-latency histograms).
+upstream counters, cache-size gauges, LFS object hit/miss counters, and
+`*_duration_seconds` fetch/serve latency histograms).
 
 ## Auth model
 
@@ -218,11 +243,12 @@ explicit before you expose it:
 ## Deploy
 
 The `Dockerfile` builds a statically linked (musl) binary and drops it onto a
-minimal Alpine base. Because all wire-protocol work is delegated to the system
-`git` binary, the runtime image must contain `git` - so it is Alpine-with-git
-rather than a fully distroless/`FROM scratch` image. Removing that dependency
-(and enabling a git-free image) means moving the git plumbing in-process to a
-Rust library - see the roadmap below.
+minimal Alpine base. Because the git wire protocol is delegated to the system `git`
+binary, the runtime image must contain `git` - so it is Alpine-with-git rather than a
+fully distroless/`FROM scratch` image. (The LFS transfer is in-process, so it adds no
+runtime tool - only CA certs.) Removing the git dependency and enabling a git-free
+image means moving the git plumbing in-process to a Rust library - see the roadmap
+below.
 
 On Kubernetes, a Helm chart lives in [`chart/`](./chart) (single-writer
 Deployment, `/healthz`+`/readyz` probes, cache PVC, optional Ingress and
@@ -240,7 +266,9 @@ See the [chart README](./chart/README.md) for the full values reference.
 Working and end-to-end tested against both Git wire protocol versions — the
 modern **v2** (`git-protocol` header, the default since Git 2.26) and the legacy
 **v0/v1** advertisement — covering full clone, incremental delta fetch, and
-push rejection.
+push rejection. **git-LFS** is cached too: the batch API is proxied and objects are
+stored content-addressed on disk, covered by the LFS integration tests (miss/fetch/
+verify, cache hit, corrupted-object rejection, upload refusal).
 
 This is early, single-maintainer software: no independent review or wide
 deployment yet. Pin a version and try it against your own setup before you
