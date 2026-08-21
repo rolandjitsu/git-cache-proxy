@@ -59,12 +59,14 @@ impl CacheIndex {
     /// tail), so recency roughly survives a restart. Blocking, but runs at startup
     /// before the server binds.
     pub fn new(cache_root: PathBuf, max_bytes: u64, metrics: Arc<Metrics>) -> Arc<Self> {
-        let mut mirrors = find_mirrors(&cache_root);
-        mirrors.sort_by_key(|m| m.mtime); // oldest first -> pushed to the LRU tail first
+        // Both bare mirrors and cached LFS objects share one byte budget and LRU.
+        let mut entries = find_mirrors(&cache_root);
+        entries.extend(find_lfs_blobs(&cache_root));
+        entries.sort_by_key(|m| m.mtime); // oldest first -> pushed to the LRU tail first
         // Unbounded: the cap is enforced by byte total, not `LruCache`'s item count.
         let mut cache: LruCache<String, u64> = LruCache::unbounded();
         let mut total = 0u64;
-        for m in mirrors {
+        for m in entries {
             total += m.size;
             cache.put(m.name, m.size);
         }
@@ -94,6 +96,20 @@ impl CacheIndex {
     pub fn touch(&self, name: &str) {
         // `get` promotes to most-recently-used; the value itself is unused.
         let _ = self.lock().cache.get(name);
+    }
+
+    /// Record a cached LFS object with its exact size and wake the background task in
+    /// case the cache is now over cap. Unlike a mirror, an object is immutable and its
+    /// size is known at store time, so it needs no deferred measurement - it goes
+    /// straight into the index at its final size and is promoted to most-recently-used.
+    pub fn record_blob(&self, key: &str, size: u64) {
+        {
+            let mut inner = self.lock();
+            let old = inner.cache.put(key.to_string(), size); // inserts and promotes to MRU
+            inner.total = inner.total - old.unwrap_or(0) + size;
+            self.set_gauges(&inner);
+        }
+        self.work.notify_one();
     }
 
     /// Flag a mirror as changed after a clone/fetch: promote it (it was just used),
@@ -219,16 +235,35 @@ async fn maintain(cache: &GitCache, index: &CacheIndex) {
     }
 
     for (name, dir) in index.take_victims() {
-        match cache.evict(&name, &dir).await {
+        // An LFS object is a single immutable file: a plain unlink is enough (an open
+        // reader keeps the inode via POSIX unlink semantics), so it skips the mirror's
+        // rename-then-remove dance. A mirror goes through `GitCache::evict`, which
+        // serializes against an in-flight clone/fetch for that repo.
+        let result = if is_lfs_blob(&name) {
+            match tokio::fs::remove_file(&dir).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        } else {
+            cache.evict(&name, &dir).await
+        };
+        match result {
             Ok(()) => {
                 index.metrics.record_eviction();
-                tracing::info!(repo = %name, "evicted idle mirror");
+                tracing::info!(entry = %name, "evicted idle cache entry");
             }
             // The entry is already out of the index; a failed unlink just leaves an
-            // untracked dir on disk, which the next startup scan picks back up.
-            Err(e) => tracing::warn!(repo = %name, error = %e, "evict failed"),
+            // untracked file/dir on disk, which the next startup scan picks back up.
+            Err(e) => tracing::warn!(entry = %name, error = %e, "evict failed"),
         }
     }
+}
+
+/// Whether a cache key names an LFS object (under the reserved store dir) rather than
+/// a bare mirror. Determines how [`maintain`] removes an evicted entry.
+fn is_lfs_blob(name: &str) -> bool {
+    name.split('/').next() == Some(crate::repo::LFS_OBJECTS_DIR)
 }
 
 /// A mirror found on disk during the startup scan.
@@ -271,10 +306,46 @@ fn find_mirrors(cache_root: &Path) -> Vec<Scanned> {
             let fname = fname.to_string_lossy();
             if fname.ends_with(crate::repo::INCOMING_SUFFIX)
                 || fname.ends_with(crate::repo::EVICTING_SUFFIX)
+                || fname == crate::repo::LFS_OBJECTS_DIR
             {
-                continue;
+                continue; // the LFS store is scanned separately by `find_lfs_blobs`
             }
             stack.push(entry.path());
+        }
+    }
+    out
+}
+
+/// Discover every cached LFS object under the reserved store (`<root>/.__lfs__/<shard>/
+/// <oid>`, two levels deep). Each object is one immutable file whose size is known
+/// from its metadata, so - unlike a mirror - it needs no later re-measurement. The
+/// in-flight-download subdir is skipped. Startup-only; steady state uses `record_blob`.
+fn find_lfs_blobs(cache_root: &Path) -> Vec<Scanned> {
+    let mut out = Vec::new();
+    let lfs_root = cache_root.join(crate::repo::LFS_OBJECTS_DIR);
+    let Ok(shards) = std::fs::read_dir(&lfs_root) else {
+        return out; // no LFS store yet
+    };
+    for shard in shards.flatten() {
+        let Ok(ft) = shard.file_type() else { continue };
+        if !ft.is_dir() || shard.file_name().to_string_lossy() == crate::lfs::INCOMING_DIR {
+            continue;
+        }
+        let shard_name = shard.file_name().to_string_lossy().into_owned();
+        let Ok(objects) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for object in objects.flatten() {
+            let Ok(md) = object.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let oid = object.file_name().to_string_lossy().into_owned();
+            out.push(Scanned {
+                name: format!("{}/{shard_name}/{oid}", crate::repo::LFS_OBJECTS_DIR),
+                size: md.len(),
+                mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
         }
     }
     out
@@ -485,6 +556,53 @@ mod tests {
         let dir = tmp.path().join("absent.git");
         cache.evict("absent.git", &dir).await.unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn record_blob_tracks_exact_size_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = CacheIndex::new(tmp.path().to_path_buf(), u64::MAX, Arc::new(Metrics::new()));
+        let key = format!("{}/ab/oid", crate::repo::LFS_OBJECTS_DIR);
+        idx.record_blob(&key, 500);
+        assert_eq!(idx.totals(), (500, 1));
+        // Re-storing the same oid updates its size rather than double-counting.
+        idx.record_blob(&key, 700);
+        assert_eq!(idx.totals(), (700, 1));
+    }
+
+    #[tokio::test]
+    async fn lfs_blobs_are_scanned_at_startup_and_evicted_over_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A cached LFS object on disk under the reserved store, sharded by oid[..2].
+        let oid = format!("ab{}", "c".repeat(62));
+        let blob = root
+            .join(crate::repo::LFS_OBJECTS_DIR)
+            .join("ab")
+            .join(&oid);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        // A stray file in the in-flight-download dir must be ignored by the scan.
+        let incoming = root
+            .join(crate::repo::LFS_OBJECTS_DIR)
+            .join(crate::lfs::INCOMING_DIR);
+        std::fs::create_dir_all(&incoming).unwrap();
+        write_file(&incoming.join("half"), &[b'x'; 10], None);
+        write_file(&blob, &vec![b'x'; 4096], None);
+
+        let metrics = Arc::new(Metrics::new());
+        // Cap below the blob: the startup scan tracks it, then it is over cap.
+        let idx = CacheIndex::new(root.to_path_buf(), 1000, metrics.clone());
+        assert_eq!(
+            idx.totals(),
+            (4096, 1),
+            "only the blob is tracked, not the in-flight file"
+        );
+
+        let cache = GitCache::new(dummy_cfg(), metrics.clone(), Some(idx.clone()));
+        maintain(&cache, &idx).await; // over cap -> the blob file is unlinked
+        assert!(!blob.exists(), "over-cap LFS blob should be evicted");
+        assert_eq!(idx.totals(), (0, 0));
+        assert!(metrics.gather().contains("gitcacheproxy_evictions_total 1"));
     }
 
     fn dummy_cfg() -> GitConfig {

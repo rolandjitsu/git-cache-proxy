@@ -21,16 +21,20 @@ use subtle::ConstantTimeEq;
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::git::GitCache;
+use crate::lfs::{Lfs, Outcome};
 use crate::metrics::Metrics;
 use crate::repo;
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 const UPLOAD_PACK: &str = "git-upload-pack";
 const RECEIVE_PACK: &str = "git-receive-pack";
+const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
+const LFS_BATCH_SUFFIX: &str = "/info/lfs/objects/batch";
 
 #[derive(Clone)]
 pub struct AppState {
     pub cache: Arc<GitCache>,
+    pub lfs: Arc<Lfs>,
     pub upstream_base: String,
     pub cache_root: PathBuf,
     pub serve_token: Option<String>,
@@ -168,7 +172,141 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
         return upload_pack(st, &path, git_protocol.as_deref(), body).await;
     }
 
+    // git-LFS rides a separate HTTP API alongside the git endpoints.
+    if parts.method == Method::POST && path.ends_with(LFS_BATCH_SUFFIX) {
+        let body = match axum::body::to_bytes(body, MAX_BODY).await {
+            Ok(b) => b,
+            Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
+        };
+        return lfs_batch(st, &path, &parts.headers, body).await;
+    }
+    if parts.method == Method::GET
+        && let Some((repo_name, oid)) = repo::lfs_object_from_path(&path)
+    {
+        return lfs_object(st, repo_name, oid, &query).await;
+    }
+
     err(StatusCode::NOT_FOUND, "not a git smart-http endpoint")
+}
+
+/// Proxy an LFS batch request to upstream, rewriting each object's download URL back
+/// to this proxy so the object fetch is cached here. An `upload` batch is refused:
+/// the proxy is read-only, like `git-receive-pack`.
+async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -> Response {
+    let Some(name) = repo::lfs_batch_repo(path) else {
+        st.metrics.record_request("lfs_batch", "error", "-");
+        return err(StatusCode::NOT_FOUND, "bad lfs batch path");
+    };
+    if is_lfs_upload(&body) {
+        st.metrics.record_request("lfs_batch", "rejected", "-");
+        return err(
+            StatusCode::FORBIDDEN,
+            "read-only proxy: lfs upload is not allowed",
+        );
+    }
+    let advertise = advertise_base(headers);
+    match st.lfs.batch(&name, &body, &advertise).await {
+        Ok(json) => {
+            st.metrics.record_request("lfs_batch", "ok", &name);
+            Response::builder()
+                .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(json))
+                .expect("valid response")
+        }
+        Err(e) => {
+            st.metrics
+                .record_request("lfs_batch", "upstream_error", "-");
+            tracing::warn!(repo = %name, error = %e, "lfs batch failed");
+            err(StatusCode::BAD_GATEWAY, "upstream lfs batch failed")
+        }
+    }
+}
+
+/// Serve a cached LFS object, fetching and caching it from upstream on a miss. The
+/// `repo` label is `-` because objects are content-addressed and shared across repos
+/// (the cache hit/miss is tracked separately in `lfs_objects_total`).
+async fn lfs_object(st: AppState, repo_name: String, oid: String, query: &str) -> Response {
+    let size = size_from_query(query);
+    match st.lfs.ensure_object(&repo_name, &oid, size).await {
+        Ok((path, outcome)) => {
+            st.metrics.record_lfs(match outcome {
+                Outcome::Hit => "hit",
+                Outcome::Miss => "miss",
+            });
+            match lfs_file_response(&path).await {
+                Ok(resp) => {
+                    st.metrics.record_request("lfs_object", "ok", "-");
+                    resp
+                }
+                Err(e) => {
+                    st.metrics.record_request("lfs_object", "error", "-");
+                    tracing::warn!(oid = %oid, error = %e, "serve cached lfs object failed");
+                    err(StatusCode::INTERNAL_SERVER_ERROR, "serve lfs object failed")
+                }
+            }
+        }
+        Err(e) => {
+            st.metrics.record_lfs("error");
+            st.metrics
+                .record_request("lfs_object", "upstream_error", "-");
+            tracing::warn!(oid = %oid, error = %e, "lfs object fetch failed");
+            err(StatusCode::BAD_GATEWAY, "upstream lfs object fetch failed")
+        }
+    }
+}
+
+/// Stream a cached LFS object file to the client with its length.
+async fn lfs_file_response(path: &Path) -> std::io::Result<Response> {
+    let file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, len)
+        .body(Body::from_stream(stream))
+        .expect("valid response"))
+}
+
+/// Whether an LFS batch request asks to upload (write). Best-effort: an unparsable
+/// body is treated as not-upload and forwarded, letting upstream decide.
+fn is_lfs_upload(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    v.get("operation").and_then(serde_json::Value::as_str) == Some("upload")
+}
+
+/// The `size` query parameter of an object request, which the proxy embeds in the
+/// download URLs it advertises (the upstream batch API needs it on a cache miss).
+fn size_from_query(query: &str) -> Option<u64> {
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("size="))
+        .and_then(|v| v.parse().ok())
+}
+
+/// The proxy's own base URL (`scheme://host`) as the client reached it, used to
+/// rewrite LFS object download URLs back to this proxy. Honors `X-Forwarded-Proto` /
+/// `X-Forwarded-Host` from a TLS-terminating ingress and otherwise falls back to the
+/// request `Host` over plain http, which is what the proxy itself speaks.
+fn advertise_base(headers: &HeaderMap) -> String {
+    let first = |v: &axum::http::HeaderValue| {
+        v.to_str()
+            .ok()
+            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+    };
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(first)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http".to_string());
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(first)
+        .unwrap_or_default();
+    format!("{scheme}://{host}")
 }
 
 async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Response {
@@ -410,5 +548,40 @@ mod tests {
         assert!(!token_matches("s3cret-extra", "s3cret")); // longer
         assert!(!token_matches("", "s3cret"));
         assert!(token_matches("", "")); // degenerate empty token
+    }
+
+    #[test]
+    fn advertise_base_uses_forwarded_headers_then_host() {
+        use axum::http::HeaderValue;
+
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_static("svc.local:8080"));
+        assert_eq!(advertise_base(&h), "http://svc.local:8080");
+        // A TLS-terminating ingress advertises via X-Forwarded-*.
+        h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        h.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("proxy.example"),
+        );
+        assert_eq!(advertise_base(&h), "https://proxy.example");
+        // A comma-listed forwarded chain uses the first hop.
+        h.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
+        assert_eq!(advertise_base(&h), "https://proxy.example");
+    }
+
+    #[test]
+    fn size_from_query_parses_only_a_valid_size() {
+        assert_eq!(size_from_query("size=42"), Some(42));
+        assert_eq!(size_from_query("a=1&size=7&b=2"), Some(7));
+        assert_eq!(size_from_query(""), None);
+        assert_eq!(size_from_query("size=notanumber"), None);
+    }
+
+    #[test]
+    fn is_lfs_upload_detects_the_operation() {
+        assert!(is_lfs_upload(br#"{"operation":"upload","objects":[]}"#));
+        assert!(!is_lfs_upload(br#"{"operation":"download"}"#));
+        assert!(!is_lfs_upload(b"not json")); // unparsable -> forwarded, not upload
+        assert!(!is_lfs_upload(b"{}"));
     }
 }

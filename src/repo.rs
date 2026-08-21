@@ -39,6 +39,56 @@ pub const INCOMING_SUFFIX: &str = ".__incoming__";
 /// mid-eviction.
 pub const EVICTING_SUFFIX: &str = ".__evicting__";
 
+/// Reserved top-level directory under the cache root holding cached git-LFS objects
+/// (content-addressed by oid, shared across repos - see `lfs_object_path`). Reserved
+/// like the suffixes above so a client repo path can never resolve into the LFS store.
+pub const LFS_OBJECTS_DIR: &str = ".__lfs__";
+
+/// The path marker that identifies a git-LFS endpoint, `<repo>/info/lfs/objects/...`.
+const LFS_MARKER: &str = "/info/lfs/objects/";
+
+/// Repo name for the LFS batch endpoint (`<repo>/info/lfs/objects/batch`), or `None`
+/// if the path is not a batch request.
+pub fn lfs_batch_repo(path: &str) -> Option<String> {
+    repo_name_from_path(path, &format!("{LFS_MARKER}batch"))
+}
+
+/// Split an LFS object path (`<repo>/info/lfs/objects/<oid>`) into `(repo, oid)`.
+/// Any query string must be stripped by the caller. `None` if the path is not an
+/// object request or the oid is malformed.
+pub fn lfs_object_from_path(path: &str) -> Option<(String, String)> {
+    let p = path.trim_start_matches('/');
+    let idx = p.find(LFS_MARKER)?;
+    let repo = &p[..idx];
+    let oid = &p[idx + LFS_MARKER.len()..];
+    if repo.is_empty() || !valid_lfs_oid(oid) {
+        return None;
+    }
+    Some((repo.to_string(), oid.to_string()))
+}
+
+/// An LFS oid is the lowercase-hex sha256 of the object's content: 64 hex digits.
+/// Validated before use as both a filesystem path component and the cache key.
+pub fn valid_lfs_oid(oid: &str) -> bool {
+    oid.len() == 64
+        && oid
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Cache key of an LFS object: its path relative to the cache root, `/`-joined so it
+/// matches the keys the eviction index uses for mirrors. Content-addressed and shared
+/// across all repos (the oid is the content hash), sharded by the first two hex chars
+/// so no single directory holds every object. Caller must pass a `valid_lfs_oid`.
+pub fn lfs_object_key(oid: &str) -> String {
+    format!("{LFS_OBJECTS_DIR}/{}/{oid}", &oid[..2])
+}
+
+/// On-disk path of a cached LFS object (`cache_root` joined with `lfs_object_key`).
+pub fn lfs_object_path(cache_root: &Path, oid: &str) -> PathBuf {
+    cache_root.join(lfs_object_key(oid))
+}
+
 /// Validate a repo path (no traversal / absolute / NUL) and resolve it against
 /// the upstream base and cache root.
 pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<RepoRef> {
@@ -51,9 +101,13 @@ pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<Rep
         }
     }
     // Reserved: the clone staging and eviction trash dirs are siblings of the
-    // cache dir carrying these suffixes, so a client path containing one could
-    // alias an in-flight clone or a mirror mid-eviction.
-    if name.contains(INCOMING_SUFFIX) || name.contains(EVICTING_SUFFIX) {
+    // cache dir carrying these suffixes, and the LFS store is a reserved top-level
+    // dir - so a client path containing any of these could alias an in-flight clone,
+    // a mirror mid-eviction, or the LFS object store.
+    if name.contains(INCOMING_SUFFIX)
+        || name.contains(EVICTING_SUFFIX)
+        || name.contains(LFS_OBJECTS_DIR)
+    {
         bail!("invalid repo path (reserved suffix) in {name:?}");
     }
     let cache_dir = cache_root.join(name);
@@ -102,10 +156,54 @@ mod tests {
         let root = Path::new("/cache");
         // A client must not be able to name a repo that maps onto the staging dir
         // (`<cache_dir>.__incoming__`) or eviction trash (`<cache_dir>.__evicting__`)
-        // of another.
+        // of another, or the LFS object store (`.__lfs__`).
         assert!(resolve(&format!("foo{INCOMING_SUFFIX}"), "https://up", root).is_err());
         assert!(resolve(&format!("a/b{INCOMING_SUFFIX}"), "https://up", root).is_err());
         assert!(resolve(&format!("foo{EVICTING_SUFFIX}"), "https://up", root).is_err());
         assert!(resolve(&format!("a/b{EVICTING_SUFFIX}"), "https://up", root).is_err());
+        assert!(resolve(LFS_OBJECTS_DIR, "https://up", root).is_err());
+        assert!(resolve(&format!("{LFS_OBJECTS_DIR}/ab/cd"), "https://up", root).is_err());
+    }
+
+    #[test]
+    fn parses_lfs_batch_and_object_paths() {
+        assert_eq!(
+            lfs_batch_repo("/group/foo.git/info/lfs/objects/batch").as_deref(),
+            Some("group/foo.git")
+        );
+        assert_eq!(lfs_batch_repo("/group/foo.git/info/refs"), None);
+
+        let oid = "a".repeat(64);
+        let (repo, got) =
+            lfs_object_from_path(&format!("/g/r.git/info/lfs/objects/{oid}")).unwrap();
+        assert_eq!(repo, "g/r.git");
+        assert_eq!(got, oid);
+        // A non-hex or wrong-length oid is not an object path.
+        assert!(lfs_object_from_path("/g/r.git/info/lfs/objects/NOTHEX").is_none());
+        assert!(lfs_object_from_path("/g/r.git/info/lfs/objects/abc").is_none());
+        // The batch endpoint is not an object (batch is not a valid oid).
+        assert!(lfs_object_from_path("/g/r.git/info/lfs/objects/batch").is_none());
+    }
+
+    #[test]
+    fn validates_oids_and_shards_the_object_path() {
+        assert!(valid_lfs_oid(&"0".repeat(64)));
+        assert!(valid_lfs_oid(&format!(
+            "{}{}",
+            "a".repeat(32),
+            "f".repeat(32)
+        )));
+        assert!(!valid_lfs_oid(&"A".repeat(64))); // uppercase is not git-lfs's form
+        assert!(!valid_lfs_oid(&"a".repeat(63)));
+        assert!(!valid_lfs_oid(&"g".repeat(64))); // not hex
+
+        let oid = format!("ab{}", "c".repeat(62));
+        assert_eq!(
+            lfs_object_path(Path::new("/cache"), &oid),
+            Path::new("/cache")
+                .join(LFS_OBJECTS_DIR)
+                .join("ab")
+                .join(&oid)
+        );
     }
 }
