@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.9 (2026-08-21)
+
+### Features
+
+- add a Helm chart for Kubernetes deployment
+
 ## 0.1.8 (2026-08-20)
 
 ### Features
