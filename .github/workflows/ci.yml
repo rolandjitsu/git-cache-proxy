@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      helm: ${{ steps.filter.outputs.helm }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -27,6 +28,9 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              - '.github/workflows/ci.yml'
+            helm:
+              - 'chart/**'
               - '.github/workflows/ci.yml'
 
   lint:
@@ -86,6 +90,44 @@ jobs:
           tool: cargo-deny
       - name: Check dependencies
         run: cargo deny check
+
+  helm:
+    name: Lint and validate Helm chart
+    needs: changes
+    if: needs.changes.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # kubeconform release used to validate rendered manifests against the
+      # Kubernetes schemas.
+      KUBECONFORM_VERSION: v0.6.7
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+      - name: Install kubeconform
+        run: |
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+      - name: Lint, render, and validate the chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm lint chart
+          # Render under a few value combinations so the conditional templates
+          # (Ingress, emptyDir, ServiceMonitor, CA trust, auth secrets) are all
+          # exercised, then validate each render against the Kubernetes schemas.
+          # -strict rejects unknown fields; -ignore-missing-schemas skips CRDs
+          # (the ServiceMonitor).
+          for args in \
+            "" \
+            "--set ingress.enabled=true" \
+            "--set persistence.enabled=false" \
+            "--set serviceMonitor.enabled=true" \
+            "--set caTrust.enabled=true,caTrust.configMapName=ca" \
+            "--set upstreamAuth.existingSecret=up,serveToken.existingSecret=srv"; do
+            echo "-- helm template chart $args"
+            helm template release chart $args \
+              | kubeconform -strict -summary -ignore-missing-schemas
+          done
 
   # Spelling runs on everything, including docs.
   typos:

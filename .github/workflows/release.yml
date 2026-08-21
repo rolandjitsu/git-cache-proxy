@@ -17,6 +17,9 @@ env:
   # instead of drifting (the hardcoded name once lagged a rename and published under
   # the old name). `github.repository` is `owner/repo`, lowercase as GHCR requires.
   IMAGE: ghcr.io/${{ github.repository }}
+  # OCI namespace for the Helm chart, shared across this owner's charts. The chart is
+  # pushed as `<owner>/charts/git-cache-proxy`.
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
 
 jobs:
   release:
@@ -142,3 +145,30 @@ jobs:
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # Package and push the Helm chart to GHCR as an OCI artifact, in the same run that
+  # cut the release, at the tag knope just created. The published GHCR package starts
+  # private; make it public once to allow anonymous `helm pull`.
+  publish-chart:
+    name: Publish chart
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ needs.release.outputs.version }}
+      - uses: azure/setup-helm@v5
+      # Version the chart in lockstep with the app: package at the released version
+      # (overriding the static Chart.yaml version) with the matching appVersion, so a
+      # pulled chart deploys the image it was cut with.
+      - name: Package and push the chart
+        run: |
+          helm package chart -d dist \
+            --version "${{ needs.release.outputs.version }}" \
+            --app-version "${{ needs.release.outputs.version }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push dist/git-cache-proxy-*.tgz "${{ env.CHART_REPO }}"

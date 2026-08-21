@@ -224,6 +224,17 @@ rather than a fully distroless/`FROM scratch` image. Removing that dependency
 (and enabling a git-free image) means moving the git plumbing in-process to a
 Rust library - see the roadmap below.
 
+On Kubernetes, a Helm chart lives in [`chart/`](./chart) (single-writer
+Deployment, `/healthz`+`/readyz` probes, cache PVC, optional Ingress and
+Prometheus `ServiceMonitor`):
+
+```shell
+helm install git-cache-proxy oci://ghcr.io/rolandjitsu/charts/git-cache-proxy \
+  --set upstream=https://your-git-host.example.com
+```
+
+See the [chart README](./chart/README.md) for the full values reference.
+
 ## Status / scope
 
 Working and end-to-end tested against both Git wire protocol versions — the
@@ -237,8 +248,6 @@ rely on it.
 
 Not yet implemented, in rough priority order:
 
-- A Helm chart for Kubernetes deployment (liveness/readiness probes,
-  single-writer RWO PVC, metrics scrape), shipped in-repo.
 - A background/scheduled refresh option (today every `info/refs` triggers an
   on-demand, TTL-coalesced fetch).
 - No external `git` binary: move the plumbing in-process to a Rust library

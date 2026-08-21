@@ -1,0 +1,22 @@
+apiVersion: v2
+name: git-cache-proxy
+description: Read-only caching proxy for Git - serves clones/fetches from an in-region mirror, pulling only deltas from upstream.
+type: application
+# Chart version. Overridden at release time with the app version (see
+# release.yml); this static value is for installs straight from the git source.
+version: 0.1.0
+# The git-cache-proxy release this chart deploys by default - the image tag used
+# when image.tag is empty. Set to the released version at publish time.
+appVersion: "0.1.8"
+home: https://github.com/rolandjitsu/git-cache-proxy
+sources:
+  - https://github.com/rolandjitsu/git-cache-proxy
+keywords:
+  - git
+  - cache
+  - proxy
+  - ci
+  - mirror
+maintainers:
+  - name: Roland Groza
+    url: https://github.com/rolandjitsu

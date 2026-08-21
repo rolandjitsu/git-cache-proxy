@@ -1,0 +1,138 @@
+# git-cache-proxy container image. Defaults to the published image; override
+# repository/tag to point at a fork or mirror. An empty tag uses the chart
+# appVersion, so the chart and the image it deploys stay in lockstep.
+image:
+  repository: ghcr.io/rolandjitsu/git-cache-proxy
+  tag: ""
+  pullPolicy: IfNotPresent
+# Pull secrets for a private registry. Empty for the public default image.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Upstream git server base URL. Requested repo paths are appended to it, so
+# `https://github.com` serves `github.com/<owner>/<repo>.git`. Point it at your
+# own GitHub/GitLab/Gitea host to cache that.
+upstream: https://github.com
+
+# Optional auth for upstream clone/fetch. The proxy reads a full HTTP header from
+# GITCACHEPROXY_UPSTREAM_AUTH_HEADER (injected via env so the token never lands in
+# argv). Supply it from a Secret holding the full header value, for example
+# `Authorization: Bearer <token>` or `Authorization: Basic <base64>` (GitLab: the
+# base64 of `oauth2:<pat>`). Leave existingSecret empty to contact upstream
+# anonymously - public repos only.
+upstreamAuth:
+  existingSecret: ""
+  # Key in the Secret whose value is the full Authorization header line.
+  key: auth-header
+
+# Optional bearer token clients must present (Authorization: Bearer <token>),
+# sourced from a Secret. Empty serves anonymously; only safe on a
+# network-restricted deployment (the token grants access to every mirrored repo -
+# see the chart README).
+serveToken:
+  existingSecret: ""
+  key: token
+
+# Proxy configuration (each maps to a GITCACHEPROXY_* env var / flag).
+config:
+  # Skip the upstream fetch on info/refs if the mirror was refreshed within this
+  # many seconds; coalesces bursts of clones for one repo. 0 = always fetch.
+  fetchTtlSeconds: 10
+  # Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle
+  # mirrors when exceeded. 0 = unlimited (no eviction). Set this whenever the
+  # cache volume is bounded.
+  cacheMaxMb: 0
+  # Max concurrent in-flight requests; excess queue. Bounds the upstream
+  # clone/fetch a burst can trigger. 0 = unlimited.
+  maxConcurrentRequests: 64
+  # Cap on a decoded upload-pack request body, in MiB (bounds memory, defuses a
+  # gzip bomb). Caps only the negotiation request, never the streamed packfile.
+  maxDecodedBodyMb: 512
+  # Log filter directive, e.g. `info` or `git_cache_proxy=debug,tower=warn`.
+  logLevel: info
+  # Log output: `text` (human) or `json` (for log shippers).
+  logFormat: text
+
+# On-disk cache holding the bare mirrors.
+persistence:
+  # true mounts a PersistentVolumeClaim so mirrors survive restarts; false uses an
+  # emptyDir (mirrors are lost on restart, then transparently re-cloned - fine for
+  # a pure accelerator).
+  enabled: true
+  # Mount this existing PVC instead of creating one. Empty creates one named after
+  # the release.
+  existingClaim: ""
+  size: 20Gi
+  # StorageClass for the created PVC. Empty uses the cluster default class.
+  storageClassName: ""
+  # ReadWriteOnce matches the single-writer design (one replica, see the README).
+  accessModes:
+    - ReadWriteOnce
+  # Size limit for the emptyDir when persistence is disabled.
+  emptyDirSizeLimit: 20Gi
+
+service:
+  type: ClusterIP
+  # Serves both the git smart-HTTP endpoints and /healthz, /readyz, /metrics. Also
+  # the port the container binds to.
+  port: 8080
+
+# Pod resource requests/limits. Empty by default; size to your repos and traffic.
+resources: {}
+  # requests:
+  #   cpu: 250m
+  #   memory: 256Mi
+  # limits:
+  #   memory: 1Gi
+
+# Seconds Kubernetes waits for in-flight clones/fetches to drain on shutdown. The
+# binary handles SIGTERM (stops accepting new requests, finishes in-flight ones);
+# a large clone can take a while, so keep this generous.
+terminationGracePeriodSeconds: 60
+
+# Extra annotations on the pod, e.g. to opt a plain Prometheus scraper into
+# /metrics on the service port. (For the Prometheus Operator use serviceMonitor.)
+podAnnotations: {}
+
+# Pod- and container-level security contexts. Empty uses the image defaults (it
+# runs as root and owns the cache dir). To harden, set a non-root runAsUser and a
+# matching podSecurityContext.fsGroup so the cache volume stays writable.
+podSecurityContext: {}
+securityContext: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Validate upstream TLS against a private CA. When enabled, mounts `key` from the
+# named ConfigMap over the system CA bundle and points git at it. Off by default
+# (public CAs).
+caTrust:
+  enabled: false
+  configMapName: ""
+  key: ca-certificates.crt
+
+# Prometheus Operator ServiceMonitor for /metrics. Off by default; use
+# podAnnotations for a plain scraper instead.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels, e.g. to match your Prometheus `serviceMonitorSelector`.
+  labels: {}
+
+# Optional standard networking.k8s.io/v1 Ingress in front of the Service. Off by
+# default (reach the ClusterIP in-cluster or port-forward it). For a non-standard
+# controller (e.g. a Traefik IngressRoute CRD), leave this off and manage the
+# route as a separate manifest.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: git-cache.example.com
+  path: /
+  pathType: Prefix
+  # List of { secretName, hosts: [] } for TLS.
+  tls: []
