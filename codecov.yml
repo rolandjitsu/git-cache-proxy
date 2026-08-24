@@ -1,0 +1,12 @@
+# Codecov status gates. Patch coverage must be at least 90%, and project coverage
+# must never drop against the base (0% tolerance) - so a change can only hold or
+# raise the line. ci.yml enforces a matching floor via `--fail-under-lines`.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0%
+    patch:
+      default:
+        target: 90%
