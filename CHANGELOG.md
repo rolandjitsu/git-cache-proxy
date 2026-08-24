@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.10 (2026-08-24)
+
+### Features
+
+- cache git-LFS objects via batch proxy
+
 ## 0.1.9 (2026-08-21)
 
 ### Features
