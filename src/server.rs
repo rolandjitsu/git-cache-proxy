@@ -22,7 +22,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::git::GitCache;
 use crate::lfs::{Lfs, Outcome};
-use crate::metrics::Metrics;
+use crate::metrics::{LfsResult, Metrics, RequestKind, Status};
 use crate::repo;
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -125,7 +125,8 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
         .map(str::to_string);
 
     if let Some(resp) = check_auth(&st, &parts.headers) {
-        st.metrics.record_request("auth", "unauthorized", "-");
+        st.metrics
+            .record_request(RequestKind::Auth, Status::Unauthorized, "-");
         return resp;
     }
 
@@ -133,7 +134,8 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
     if path.ends_with(&format!("/{RECEIVE_PACK}"))
         || query.contains(&format!("service={RECEIVE_PACK}"))
     {
-        st.metrics.record_request("receive_pack", "rejected", "-");
+        st.metrics
+            .record_request(RequestKind::ReceivePack, Status::Rejected, "-");
         return err(
             StatusCode::FORBIDDEN,
             "read-only proxy: pushes are not allowed",
@@ -142,7 +144,8 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
 
     if parts.method == Method::GET && path.ends_with("/info/refs") {
         if !query.contains(&format!("service={UPLOAD_PACK}")) {
-            st.metrics.record_request("info_refs", "error", "-");
+            st.metrics
+                .record_request(RequestKind::InfoRefs, Status::Error, "-");
             return err(
                 StatusCode::BAD_REQUEST,
                 "only smart-http git-upload-pack is supported",
@@ -172,7 +175,7 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
         return upload_pack(st, &path, git_protocol.as_deref(), body).await;
     }
 
-    // git-LFS rides a separate HTTP API alongside the git endpoints.
+    // git-LFS uses a different HTTP API alongside the git endpoints.
     if parts.method == Method::POST && path.ends_with(LFS_BATCH_SUFFIX) {
         let body = match axum::body::to_bytes(body, MAX_BODY).await {
             Ok(b) => b,
@@ -194,11 +197,13 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
 /// the proxy is read-only, like `git-receive-pack`.
 async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -> Response {
     let Some(name) = repo::lfs_batch_repo(path) else {
-        st.metrics.record_request("lfs_batch", "error", "-");
+        st.metrics
+            .record_request(RequestKind::LfsBatch, Status::Error, "-");
         return err(StatusCode::NOT_FOUND, "bad lfs batch path");
     };
     if is_lfs_upload(&body) {
-        st.metrics.record_request("lfs_batch", "rejected", "-");
+        st.metrics
+            .record_request(RequestKind::LfsBatch, Status::Rejected, "-");
         return err(
             StatusCode::FORBIDDEN,
             "read-only proxy: lfs upload is not allowed",
@@ -207,7 +212,8 @@ async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -
     let advertise = advertise_base(headers);
     match st.lfs.batch(&name, &body, &advertise).await {
         Ok(json) => {
-            st.metrics.record_request("lfs_batch", "ok", &name);
+            st.metrics
+                .record_request(RequestKind::LfsBatch, Status::Ok, &name);
             Response::builder()
                 .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
                 .header(header::CACHE_CONTROL, "no-cache")
@@ -216,7 +222,7 @@ async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -
         }
         Err(e) => {
             st.metrics
-                .record_request("lfs_batch", "upstream_error", "-");
+                .record_request(RequestKind::LfsBatch, Status::UpstreamError, "-");
             tracing::warn!(repo = %name, error = %e, "lfs batch failed");
             err(StatusCode::BAD_GATEWAY, "upstream lfs batch failed")
         }
@@ -231,25 +237,27 @@ async fn lfs_object(st: AppState, repo_name: String, oid: String, query: &str) -
     match st.lfs.ensure_object(&repo_name, &oid, size).await {
         Ok((path, outcome)) => {
             st.metrics.record_lfs(match outcome {
-                Outcome::Hit => "hit",
-                Outcome::Miss => "miss",
+                Outcome::Hit => LfsResult::Hit,
+                Outcome::Miss => LfsResult::Miss,
             });
             match lfs_file_response(&path).await {
                 Ok(resp) => {
-                    st.metrics.record_request("lfs_object", "ok", "-");
+                    st.metrics
+                        .record_request(RequestKind::LfsObject, Status::Ok, "-");
                     resp
                 }
                 Err(e) => {
-                    st.metrics.record_request("lfs_object", "error", "-");
+                    st.metrics
+                        .record_request(RequestKind::LfsObject, Status::Error, "-");
                     tracing::warn!(oid = %oid, error = %e, "serve cached lfs object failed");
                     err(StatusCode::INTERNAL_SERVER_ERROR, "serve lfs object failed")
                 }
             }
         }
         Err(e) => {
-            st.metrics.record_lfs("error");
+            st.metrics.record_lfs(LfsResult::Error);
             st.metrics
-                .record_request("lfs_object", "upstream_error", "-");
+                .record_request(RequestKind::LfsObject, Status::UpstreamError, "-");
             tracing::warn!(oid = %oid, error = %e, "lfs object fetch failed");
             err(StatusCode::BAD_GATEWAY, "upstream lfs object fetch failed")
         }
@@ -311,13 +319,15 @@ fn advertise_base(headers: &HeaderMap) -> String {
 
 async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Response {
     let Some(name) = repo::repo_name_from_path(path, "/info/refs") else {
-        st.metrics.record_request("info_refs", "error", "-");
+        st.metrics
+            .record_request(RequestKind::InfoRefs, Status::Error, "-");
         return err(StatusCode::NOT_FOUND, "bad path");
     };
     let repo = match repo::resolve(&name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
-            st.metrics.record_request("info_refs", "error", "-");
+            st.metrics
+                .record_request(RequestKind::InfoRefs, Status::Error, "-");
             return err(StatusCode::BAD_REQUEST, &e.to_string());
         }
     };
@@ -328,14 +338,15 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
     // repo paths cannot inflate label cardinality (see `metrics`).
     if let Err(e) = st.cache.ensure_fresh(&repo, true).await {
         st.metrics
-            .record_request("info_refs", "upstream_error", "-");
+            .record_request(RequestKind::InfoRefs, Status::UpstreamError, "-");
         tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
         return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
     }
 
     match st.cache.advertise_refs(&repo, git_protocol).await {
         Ok(body) => {
-            st.metrics.record_request("info_refs", "ok", &name);
+            st.metrics
+                .record_request(RequestKind::InfoRefs, Status::Ok, &name);
             Response::builder()
                 .header(
                     header::CONTENT_TYPE,
@@ -346,7 +357,8 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
                 .expect("valid response")
         }
         Err(e) => {
-            st.metrics.record_request("info_refs", "error", "-");
+            st.metrics
+                .record_request(RequestKind::InfoRefs, Status::Error, "-");
             tracing::warn!(repo = %name, error = %e, "advertise_refs failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "advertise-refs failed")
         }
@@ -360,13 +372,15 @@ async fn upload_pack(
     body: Bytes,
 ) -> Response {
     let Some(name) = repo::repo_name_from_path(path, &format!("/{UPLOAD_PACK}")) else {
-        st.metrics.record_request("upload_pack", "error", "-");
+        st.metrics
+            .record_request(RequestKind::UploadPack, Status::Error, "-");
         return err(StatusCode::NOT_FOUND, "bad path");
     };
     let repo = match repo::resolve(&name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
-            st.metrics.record_request("upload_pack", "error", "-");
+            st.metrics
+                .record_request(RequestKind::UploadPack, Status::Error, "-");
             return err(StatusCode::BAD_REQUEST, &e.to_string());
         }
     };
@@ -375,14 +389,15 @@ async fn upload_pack(
     // present (a client could POST against a not-yet-cloned repo).
     if let Err(e) = st.cache.ensure_fresh(&repo, false).await {
         st.metrics
-            .record_request("upload_pack", "upstream_error", "-");
+            .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
         tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
         return err(StatusCode::BAD_GATEWAY, "upstream unavailable");
     }
 
     match st.cache.upload_pack_rpc(&repo, git_protocol, body).await {
         Ok(stream) => {
-            st.metrics.record_request("upload_pack", "ok", &name);
+            st.metrics
+                .record_request(RequestKind::UploadPack, Status::Ok, &name);
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
                 .header(header::CACHE_CONTROL, "no-cache")
@@ -390,7 +405,8 @@ async fn upload_pack(
                 .expect("valid response")
         }
         Err(e) => {
-            st.metrics.record_request("upload_pack", "error", "-");
+            st.metrics
+                .record_request(RequestKind::UploadPack, Status::Error, "-");
             tracing::warn!(repo = %name, error = %e, "upload_pack_rpc failed");
             err(StatusCode::INTERNAL_SERVER_ERROR, "upload-pack failed")
         }

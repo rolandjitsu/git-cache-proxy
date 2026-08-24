@@ -22,6 +22,102 @@ const DURATION_BUCKETS: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
 
+/// The `kind` label on `requests_total`: which client endpoint served the request.
+#[derive(Debug, Clone, Copy)]
+pub enum RequestKind {
+    InfoRefs,
+    UploadPack,
+    Auth,
+    ReceivePack,
+    LfsBatch,
+    LfsObject,
+}
+
+/// The `result` label on `requests_total` / `upstream_ops_total`.
+#[derive(Debug, Clone, Copy)]
+pub enum Status {
+    Ok,
+    Error,
+    UpstreamError,
+    Unauthorized,
+    Rejected,
+}
+
+/// The `op` label on `upstream_ops_total` / `upstream_duration_seconds`.
+#[derive(Debug, Clone, Copy)]
+pub enum UpstreamOp {
+    Clone,
+    Fetch,
+}
+
+/// The `kind` label on `serve_duration_seconds`.
+#[derive(Debug, Clone, Copy)]
+pub enum ServeKind {
+    InfoRefs,
+    UploadPack,
+}
+
+/// The `result` label on `lfs_objects_total`.
+#[derive(Debug, Clone, Copy)]
+pub enum LfsResult {
+    Hit,
+    Miss,
+    Error,
+}
+
+impl RequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InfoRefs => "info_refs",
+            Self::UploadPack => "upload_pack",
+            Self::Auth => "auth",
+            Self::ReceivePack => "receive_pack",
+            Self::LfsBatch => "lfs_batch",
+            Self::LfsObject => "lfs_object",
+        }
+    }
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::UpstreamError => "upstream_error",
+            Self::Unauthorized => "unauthorized",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+impl UpstreamOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clone => "clone",
+            Self::Fetch => "fetch",
+        }
+    }
+}
+
+impl ServeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InfoRefs => "info_refs",
+            Self::UploadPack => "upload_pack",
+        }
+    }
+}
+
+impl LfsResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Error => "error",
+        }
+    }
+}
+
 pub struct Metrics {
     pub registry: Registry,
     /// `requests_total{kind, result, repo}` - kind = info_refs | upload_pack |
@@ -149,18 +245,19 @@ impl Metrics {
 
     /// Record the outcome of a client request. `repo` is the served repo path on
     /// success and `-` on any failure, so unbounded client-supplied paths cannot
-    /// inflate label cardinality. `kind` is `info_refs`, `upload_pack`, `auth` or
-    /// `receive_pack`; `result` is `ok`, `error`, `upstream_error`,
-    /// `unauthorized` or `rejected`.
-    pub fn record_request(&self, kind: &str, result: &str, repo: &str) {
-        self.requests.with_label_values(&[kind, result, repo]).inc();
+    /// inflate label cardinality.
+    pub fn record_request(&self, kind: RequestKind, result: Status, repo: &str) {
+        self.requests
+            .with_label_values(&[kind.as_str(), result.as_str(), repo])
+            .inc();
     }
 
-    /// Record an upstream clone/fetch. Errors are recorded too (`result =
-    /// "error"`); pass the repo path on success and `-` on error, matching
-    /// `record_request`.
-    pub fn record_upstream(&self, op: &str, result: &str, repo: &str) {
-        self.upstream.with_label_values(&[op, result, repo]).inc();
+    /// Record an upstream clone/fetch. Errors are recorded too (`Status::Error`);
+    /// pass the repo path on success and `-` on error, matching `record_request`.
+    pub fn record_upstream(&self, op: UpstreamOp, result: Status, repo: &str) {
+        self.upstream
+            .with_label_values(&[op.as_str(), result.as_str(), repo])
+            .inc();
     }
 
     /// Refresh the cache-size gauges from the eviction index.
@@ -174,24 +271,24 @@ impl Metrics {
         self.evictions.inc();
     }
 
-    /// Record a cached LFS object lookup: `result` = `hit` | `miss` | `error`.
-    pub fn record_lfs(&self, result: &str) {
-        self.lfs_objects.with_label_values(&[result]).inc();
+    /// Record a cached LFS object lookup (hit / miss / error).
+    pub fn record_lfs(&self, result: LfsResult) {
+        self.lfs_objects.with_label_values(&[result.as_str()]).inc();
     }
 
     /// Observe an upstream op's duration. Call only on success with the real repo,
     /// matching the counters' bounded-`repo` cardinality discipline.
-    pub fn observe_upstream(&self, op: &str, repo: &str, seconds: f64) {
+    pub fn observe_upstream(&self, op: UpstreamOp, repo: &str, seconds: f64) {
         self.upstream_duration
-            .with_label_values(&[op, repo])
+            .with_label_values(&[op.as_str(), repo])
             .observe(seconds);
     }
 
-    /// Observe a client serve duration (`kind` = `info_refs` | `upload_pack`),
-    /// same cardinality discipline as `observe_upstream`.
-    pub fn observe_serve(&self, kind: &str, repo: &str, seconds: f64) {
+    /// Observe a client serve duration, same cardinality discipline as
+    /// `observe_upstream`.
+    pub fn observe_serve(&self, kind: ServeKind, repo: &str, seconds: f64) {
         self.serve_duration
-            .with_label_values(&[kind, repo])
+            .with_label_values(&[kind.as_str(), repo])
             .observe(seconds);
     }
 
@@ -217,17 +314,17 @@ mod tests {
     #[test]
     fn gather_renders_recorded_series() {
         let m = Metrics::new();
-        m.record_request("info_refs", "ok", "group/foo.git");
-        m.record_request("upload_pack", "error", "group/bar.git");
-        m.record_upstream("fetch", "ok", "group/foo.git");
-        m.record_upstream("clone", "error", "group/bar.git");
+        m.record_request(RequestKind::InfoRefs, Status::Ok, "group/foo.git");
+        m.record_request(RequestKind::UploadPack, Status::Error, "group/bar.git");
+        m.record_upstream(UpstreamOp::Fetch, Status::Ok, "group/foo.git");
+        m.record_upstream(UpstreamOp::Clone, Status::Error, "group/bar.git");
         m.set_cache_size(2048, 3);
         m.record_eviction();
         m.record_eviction();
-        m.record_lfs("hit");
-        m.record_lfs("miss");
-        m.observe_upstream("clone", "group/foo.git", 1.5);
-        m.observe_serve("upload_pack", "group/foo.git", 2.0);
+        m.record_lfs(LfsResult::Hit);
+        m.record_lfs(LfsResult::Miss);
+        m.observe_upstream(UpstreamOp::Clone, "group/foo.git", 1.5);
+        m.observe_serve(ServeKind::UploadPack, "group/foo.git", 2.0);
 
         let out = m.gather();
         assert!(out.contains("gitcacheproxy_cache_bytes 2048"));
