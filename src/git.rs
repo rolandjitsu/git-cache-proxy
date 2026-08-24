@@ -28,7 +28,7 @@ use tokio::process::{ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
 use crate::repo::RepoRef;
 
 /// What `ensure_fresh` did - for metrics.
@@ -196,8 +196,11 @@ impl GitCache {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        self.metrics
-            .observe_serve("info_refs", &repo.name, started.elapsed().as_secs_f64());
+        self.metrics.observe_serve(
+            ServeKind::InfoRefs,
+            &repo.name,
+            started.elapsed().as_secs_f64(),
+        );
         let mut body = pkt_line("# service=git-upload-pack\n");
         body.extend_from_slice(b"0000"); // flush-pkt
         body.extend_from_slice(&out.stdout);
@@ -300,15 +303,18 @@ impl GitCache {
             // `-` not the repo name: a failed clone must not mint a per-repo series
             // for an arbitrary client-supplied path (see `metrics`). The failing
             // repo is still named in the returned error, which the caller logs.
-            self.metrics.record_upstream("clone", "error", "-");
+            self.metrics
+                .record_upstream(UpstreamOp::Clone, Status::Error, "-");
             bail!("git clone --mirror failed for {}", repo.name);
         }
         let elapsed = started.elapsed().as_secs_f64();
         tokio::fs::rename(&tmp, &repo.cache_dir)
             .await
             .context("rename mirror into place")?;
-        self.metrics.record_upstream("clone", "ok", &repo.name);
-        self.metrics.observe_upstream("clone", &repo.name, elapsed);
+        self.metrics
+            .record_upstream(UpstreamOp::Clone, Status::Ok, &repo.name);
+        self.metrics
+            .observe_upstream(UpstreamOp::Clone, &repo.name, elapsed);
         self.mark_changed(repo);
         Ok(())
     }
@@ -331,12 +337,17 @@ impl GitCache {
             .await
             .context("spawn git fetch")?;
         if !status.success() {
-            self.metrics.record_upstream("fetch", "error", "-");
+            self.metrics
+                .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
             bail!("git fetch failed for {}", repo.name);
         }
-        self.metrics.record_upstream("fetch", "ok", &repo.name);
         self.metrics
-            .observe_upstream("fetch", &repo.name, started.elapsed().as_secs_f64());
+            .record_upstream(UpstreamOp::Fetch, Status::Ok, &repo.name);
+        self.metrics.observe_upstream(
+            UpstreamOp::Fetch,
+            &repo.name,
+            started.elapsed().as_secs_f64(),
+        );
         self.mark_changed(repo);
         Ok(())
     }
@@ -379,7 +390,11 @@ pub struct TimedReader<R> {
 impl<R> TimedReader<R> {
     fn record(&mut self) {
         if let Some((metrics, started)) = self.recorder.take() {
-            metrics.observe_serve("upload_pack", &self.repo, started.elapsed().as_secs_f64());
+            metrics.observe_serve(
+                ServeKind::UploadPack,
+                &self.repo,
+                started.elapsed().as_secs_f64(),
+            );
         }
     }
 }
