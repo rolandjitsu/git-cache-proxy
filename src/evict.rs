@@ -610,6 +610,7 @@ mod tests {
         GitConfig {
             git_binary: "git".into(),
             upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
             fetch_ttl: Duration::from_secs(10),
         }
     }

@@ -336,6 +336,7 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
     let cfg = GitConfig {
         git_binary: "git".into(),
         upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
     };
     AppState {
