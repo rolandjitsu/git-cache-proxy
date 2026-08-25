@@ -93,6 +93,14 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_GIT_BINARY", default_value = "git")]
     pub git_binary: String,
 
+    /// Cap the memory an upstream `git clone`/`fetch` uses to mirror a repo: blobs
+    /// larger than this are streamed to disk instead of held in RAM for delta
+    /// resolution, so a single very large repo can't OOM the proxy. Passed to git as
+    /// `core.bigFileThreshold` (git's own default is 512m). Accepts git size units
+    /// (`8m`, `512k`, `1g`).
+    #[arg(long, env = "GITCACHEPROXY_BIG_FILE_THRESHOLD", default_value = "8m")]
+    pub big_file_threshold: String,
+
     /// Log filter directive (e.g. `info`, `git_cache_proxy=debug,tower=warn`).
     /// Overridden by the `RUST_LOG` environment variable when set.
     #[arg(long, env = "GITCACHEPROXY_LOG", default_value = "info")]

@@ -48,6 +48,10 @@ pub struct GitConfig {
     /// Optional header for upstream auth, e.g. `Authorization: Bearer <token>`.
     /// Injected via env (not argv) so it never shows up in `ps`. Never logged.
     pub upstream_auth_header: Option<String>,
+    /// git `core.bigFileThreshold` for upstream clone/fetch: blobs above it are
+    /// streamed to disk rather than held in memory, bounding `index-pack` RSS on
+    /// very large repos. See `Config::big_file_threshold`.
+    pub big_file_threshold: String,
     /// Skip the upstream fetch if the mirror was refreshed within this window.
     pub fetch_ttl: Duration,
 }
@@ -357,10 +361,11 @@ impl GitCache {
     fn fetch_cmd(&self) -> Command {
         let mut c = Command::new(&self.cfg.git_binary);
         c.env("GIT_TERMINAL_PROMPT", "0"); // fail instead of hanging on a prompt
-        if let Some(h) = &self.cfg.upstream_auth_header {
-            c.env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-                .env("GIT_CONFIG_VALUE_0", h);
+        for (k, v) in git_config_env(
+            &self.cfg.big_file_threshold,
+            self.cfg.upstream_auth_header.as_deref(),
+        ) {
+            c.env(k, v);
         }
         c
     }
@@ -425,6 +430,29 @@ impl<R> Drop for TimedReader<R> {
     }
 }
 
+/// Assemble the `GIT_CONFIG_*` environment for an upstream git command: the
+/// memory-bounding options, then the optional auth header, numbered as git's
+/// env-based config protocol requires (`GIT_CONFIG_COUNT` + `KEY_i`/`VALUE_i`).
+/// Everything goes via env, not argv, so the auth header never shows up in `ps`.
+/// `core.bigFileThreshold` streams large blobs to disk instead of holding them in
+/// memory, and `core.deltaBaseCacheLimit` caps index-pack's delta-base cache - so a
+/// single very large repo's clone cannot balloon RSS and OOM the proxy.
+fn git_config_env(big_file_threshold: &str, auth_header: Option<&str>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("core.bigFileThreshold", big_file_threshold),
+        ("core.deltaBaseCacheLimit", "128m"),
+    ];
+    if let Some(h) = auth_header {
+        pairs.push(("http.extraHeader", h));
+    }
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), pairs.len().to_string())];
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), k.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), v.to_string()));
+    }
+    env
+}
+
 /// Encode a string as a single pkt-line (4-hex length prefix + payload).
 fn pkt_line(s: &str) -> Vec<u8> {
     let mut v = format!("{:04x}", s.len() + 4).into_bytes();
@@ -435,6 +463,26 @@ fn pkt_line(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_config_env_numbers_options_and_appends_auth() {
+        // No auth: just the two memory bounds, numbered from 0.
+        let env = git_config_env("8m", None);
+        assert!(env.contains(&("GIT_CONFIG_COUNT".into(), "2".into())));
+        assert!(env.contains(&("GIT_CONFIG_KEY_0".into(), "core.bigFileThreshold".into())));
+        assert!(env.contains(&("GIT_CONFIG_VALUE_0".into(), "8m".into())));
+        assert!(env.contains(&("GIT_CONFIG_KEY_1".into(), "core.deltaBaseCacheLimit".into())));
+
+        // With auth: appended as the last numbered entry, count bumps to 3.
+        let env = git_config_env("16m", Some("Authorization: Basic xyz"));
+        assert!(env.contains(&("GIT_CONFIG_COUNT".into(), "3".into())));
+        assert!(env.contains(&("GIT_CONFIG_VALUE_0".into(), "16m".into())));
+        assert!(env.contains(&("GIT_CONFIG_KEY_2".into(), "http.extraHeader".into())));
+        assert!(env.contains(&(
+            "GIT_CONFIG_VALUE_2".into(),
+            "Authorization: Basic xyz".into()
+        )));
+    }
 
     #[test]
     fn pkt_line_encodes_length() {

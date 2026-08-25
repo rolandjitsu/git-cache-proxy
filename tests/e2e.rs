@@ -86,6 +86,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
     let cfg = GitConfig {
         git_binary: "git".into(),
         upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
     };
     let state = AppState {
@@ -176,6 +177,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
     let cfg = GitConfig {
         git_binary: "git".into(),
         upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0),
     };
     // Eviction enabled with an effectively unbounded cap: no mirror is ever
