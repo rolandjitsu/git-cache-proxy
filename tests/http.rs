@@ -25,6 +25,7 @@ fn state(serve_token: Option<String>) -> AppState {
         git_binary: "git".into(),
         upstream_auth_header: None,
         fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -212,6 +213,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         git_binary: "git".into(),
         upstream_auth_header: None,
         fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

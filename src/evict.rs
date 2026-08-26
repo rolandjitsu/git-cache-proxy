@@ -611,6 +611,7 @@ mod tests {
             git_binary: "git".into(),
             upstream_auth_header: None,
             fetch_ttl: Duration::from_secs(10),
+            max_wants: 100,
         }
     }
 

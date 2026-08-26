@@ -336,7 +336,7 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
     // here we only account for the client request. The `repo` label is emitted only
     // once a request is served; failures use `-` so a flood of distinct but doomed
     // repo paths cannot inflate label cardinality (see `metrics`).
-    if let Err(e) = st.cache.ensure_fresh(&repo, true).await {
+    if let Err(e) = st.cache.ensure_fresh(&repo, true, &[]).await {
         st.metrics
             .record_request(RequestKind::InfoRefs, Status::UpstreamError, "-");
         tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
@@ -386,8 +386,9 @@ async fn upload_pack(
     };
 
     // The preceding info/refs already refreshed; here just ensure the mirror is
-    // present (a client could POST against a not-yet-cloned repo).
-    if let Err(e) = st.cache.ensure_fresh(&repo, false).await {
+    // present (a client could POST against a not-yet-cloned repo) and that any
+    // want-by-SHA the body asks for is fetched and pinned before serving.
+    if let Err(e) = st.cache.ensure_fresh(&repo, false, &body).await {
         st.metrics
             .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
         tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");

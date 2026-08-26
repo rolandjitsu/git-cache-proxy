@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
         git_binary: cfg.git_binary.clone(),
         upstream_auth_header: upstream_auth_header.clone(),
         fetch_ttl: Duration::from_secs(cfg.fetch_ttl_seconds),
+        max_wants: cfg.max_wants,
     };
 
     let metrics = Arc::new(metrics::Metrics::new());
