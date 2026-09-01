@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.11 (2026-09-01)
+
+### Features
+
+- bound upstream git memory to avoid OOM
+
 ## 0.1.10 (2026-08-24)
 
 ### Features
