@@ -24,6 +24,12 @@ env:
 jobs:
   release:
     name: Release
+    # knope re-pushes its own version-bump commit to main, which retriggers this
+    # workflow; that rerun would only find no releasable commits and no-op. Skip it
+    # outright so it does not even spin a runner. Every other push (a merged PR)
+    # still runs and releases if there are releasable commits. The publish-* jobs
+    # need this job, so they cascade-skip on the bump commit too.
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: prepare release') }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write

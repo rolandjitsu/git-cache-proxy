@@ -1,12 +1,11 @@
 name: Package
 
-# On every packaging change, build the image (no push) so breakage is caught before a
-# release. Publishing the versioned image to GHCR happens in the Release workflow, in the
-# same run that cuts the release.
+# On a packaging change in a PR, build both arches (no push) so breakage is caught before
+# merge. Building and pushing the versioned image to GHCR happens in the Release workflow,
+# so there is nothing to build on push to main here (main is protected, so the merged tree
+# is the one already built on the PR).
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
