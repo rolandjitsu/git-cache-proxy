@@ -11,8 +11,14 @@ env:
 
 jobs:
   # Gate the Rust jobs on Rust changes, so docs-only changes skip lint and test.
+  # `main` is protected (PR-only), so validation is the PR's job; on push to main
+  # only `test` re-runs (for the Codecov base, below). Skip the whole workflow on
+  # knope's own release-bump commit - it re-pushes to main and would otherwise
+  # duplicate everything. `head_commit` is null on pull_request events, so this
+  # guard only ever suppresses that one push.
   changes:
     name: Detect changes
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: prepare release') }}"
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
@@ -36,7 +42,8 @@ jobs:
   lint:
     name: Lint
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # PR-only: a merge lands the exact tree already linted on the PR.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -52,6 +59,10 @@ jobs:
   test:
     name: Test and coverage
     needs: changes
+    # The one job that also runs on push to main: it re-uploads coverage so
+    # Codecov's project base (codecov.yml `project: auto`, 0% drop) tracks the
+    # merged main, not a stale ancestor. The knope commit is already excluded via
+    # `changes` above (a version bump does not change coverage anyway).
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -81,7 +92,8 @@ jobs:
   deny:
     name: Dependencies
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # PR-only: the dependency tree that merges is the one already scanned.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -94,7 +106,8 @@ jobs:
   helm:
     name: Lint and validate Helm chart
     needs: changes
-    if: needs.changes.outputs.helm == 'true'
+    # PR-only: a merge lands the exact chart already validated on the PR.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.helm == 'true'
     runs-on: ubuntu-latest
     env:
       # kubeconform release used to validate rendered manifests against the
@@ -129,9 +142,10 @@ jobs:
               | kubeconform -strict -summary -ignore-missing-schemas
           done
 
-  # Spelling runs on everything, including docs.
+  # Spelling runs on every PR, including docs. PR-only: a merge lands the same tree.
   typos:
     name: Typos
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
