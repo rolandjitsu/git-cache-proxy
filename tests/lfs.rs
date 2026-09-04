@@ -338,6 +338,7 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
         upstream_auth_header: None,
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
     };
     AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), Some(idx.clone()))),
