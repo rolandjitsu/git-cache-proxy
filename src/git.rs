@@ -23,13 +23,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
 use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
 use crate::repo::RepoRef;
+
+const UPSTREAM_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+const MAX_UPSTREAM_STDERR_BYTES: usize = 64 * 1024;
 
 /// What `ensure_fresh` did - for metrics.
 #[derive(Debug, Clone, Copy)]
@@ -285,31 +292,25 @@ impl GitCache {
         let mut tmp = repo.cache_dir.clone().into_os_string();
         tmp.push(crate::repo::INCOMING_SUFFIX);
         let tmp = std::path::PathBuf::from(tmp);
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
         tracing::info!(repo = %repo.name, "cloning mirror from upstream");
         // `--mirror` copies *every* ref (all branches, tags, and notes) into a bare
         // repo, not just HEAD, and maps them 1:1 so a later `fetch` keeps them in
         // sync. The client then negotiates whatever ref it wants via upload-pack, so
         // the mirror can serve any branch/tag/sha the origin has - never HEAD-only.
         let started = Instant::now();
-        let status = self
-            .fetch_cmd()
-            .arg("clone")
+        let mut cmd = self.fetch_cmd();
+        cmd.arg("clone")
             .arg("--mirror")
             .arg("--quiet")
             .arg(&repo.upstream_url)
-            .arg(&tmp)
-            .status()
-            .await
-            .context("spawn git clone --mirror")?;
-        if !status.success() {
-            let _ = tokio::fs::remove_dir_all(&tmp).await;
+            .arg(&tmp);
+        if let Err(error) = run_upstream(&mut cmd, "clone", &repo.name, Some(&tmp)).await {
             // `-` not the repo name: a failed clone must not mint a per-repo series
             // for an arbitrary client-supplied path (see `metrics`). The failing
             // repo is still named in the returned error, which the caller logs.
             self.metrics
                 .record_upstream(UpstreamOp::Clone, Status::Error, "-");
-            bail!("git clone --mirror failed for {}", repo.name);
+            return Err(error);
         }
         let elapsed = started.elapsed().as_secs_f64();
         tokio::fs::rename(&tmp, &repo.cache_dir)
@@ -330,20 +331,16 @@ impl GitCache {
         // the upstream URL, with a mirror refspec that updates all refs. So `origin`
         // is not an assumption about the client - it is the remote this proxy created.
         let started = Instant::now();
-        let status = self
-            .fetch_cmd()
-            .current_dir(&repo.cache_dir)
+        let mut cmd = self.fetch_cmd();
+        cmd.current_dir(&repo.cache_dir)
             .arg("fetch")
             .arg("--prune")
             .arg("--quiet")
-            .arg("origin")
-            .status()
-            .await
-            .context("spawn git fetch")?;
-        if !status.success() {
+            .arg("origin");
+        if let Err(error) = run_upstream(&mut cmd, "fetch", &repo.name, None).await {
             self.metrics
                 .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
-            bail!("git fetch failed for {}", repo.name);
+            return Err(error);
         }
         self.metrics
             .record_upstream(UpstreamOp::Fetch, Status::Ok, &repo.name);
@@ -361,6 +358,7 @@ impl GitCache {
     fn fetch_cmd(&self) -> Command {
         let mut c = Command::new(&self.cfg.git_binary);
         c.env("GIT_TERMINAL_PROMPT", "0"); // fail instead of hanging on a prompt
+        c.env("LC_ALL", "C"); // Retry classification relies on Git's English diagnostics.
         for (k, v) in git_config_env(
             &self.cfg.big_file_threshold,
             self.cfg.upstream_auth_header.as_deref(),
@@ -379,6 +377,159 @@ impl GitCache {
         }
         c
     }
+}
+
+// The caller holds the repository lock throughout retries. Never retry local
+// upload-pack: once its response starts streaming it cannot be replayed safely.
+async fn run_upstream(
+    cmd: &mut Command,
+    operation: &str,
+    repo: &str,
+    staging: Option<&Path>,
+) -> Result<()> {
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for attempt in 0..=UPSTREAM_RETRY_DELAYS.len() {
+        if let Some(path) = staging {
+            clean_staging(path).await?;
+        }
+        let mut child = cmd.spawn().context("spawn upstream git")?;
+        let mut stderr = child.stderr.take().context("upstream git: no stderr")?;
+        // Drain even after the cap so a noisy child cannot block on its pipe.
+        // Only retain the tail; credentials and raw remote output are never logged.
+        let mut tail = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stderr
+                .read(&mut chunk)
+                .await
+                .context("read upstream git stderr")?;
+            if count == 0 {
+                break;
+            }
+            tail.extend_from_slice(&chunk[..count]);
+            if tail.len() > MAX_UPSTREAM_STDERR_BYTES {
+                tail.drain(..tail.len() - MAX_UPSTREAM_STDERR_BYTES);
+            }
+        }
+        let status = child.wait().await.context("wait for upstream git")?;
+        if status.success() {
+            return Ok(());
+        }
+        if let Some(path) = staging {
+            clean_staging(path).await?;
+        }
+        let reason = transient_upstream_error(&tail);
+        if let Some(reason) = reason
+            && status.code().is_some()
+            && let Some(delay) = UPSTREAM_RETRY_DELAYS.get(attempt)
+        {
+            tracing::warn!(
+                repo,
+                operation,
+                attempt = attempt + 1,
+                max_attempts = UPSTREAM_RETRY_DELAYS.len() + 1,
+                delay_seconds = delay.as_secs(),
+                reason,
+                "retrying upstream git"
+            );
+            tokio::time::sleep(*delay).await;
+            continue;
+        }
+        bail!(
+            "git {operation} failed for {repo} after {} attempt(s) ({}, status {status})",
+            attempt + 1,
+            reason.unwrap_or("permanent or unrecognized error")
+        );
+    }
+    unreachable!("final attempt returns an error or succeeds")
+}
+
+async fn clean_staging(path: &Path) -> Result<()> {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove upstream clone staging directory"),
+    }
+}
+
+fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    // Permanent errors take precedence if Git reports more than one diagnostic.
+    if [
+        "authentication failed",
+        "repository not found",
+        "could not read username",
+        "certificate problem",
+        "certificate verify failed",
+        "certificate verification failed",
+        "server certificate verification failed",
+        "no space left on device",
+        "permission denied",
+        "read-only file system",
+        ".lock",
+        "returned error: 401",
+        "returned error: 403",
+        "returned error: 404",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
+    {
+        return None;
+    }
+    if [408, 429, 500, 502, 503, 504].iter().any(|code| {
+        text.lines().any(|line| {
+            line.trim_end()
+                .ends_with(&format!("returned error: {code}"))
+        })
+    }) {
+        return Some("transient HTTP status");
+    }
+    if [
+        "unexpected eof while reading",
+        "gnutls_handshake() failed: the tls connection was non-properly terminated",
+        "gnutls recv error (-110)",
+        "ssl_error_syscall",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
+    {
+        return Some("TLS connection interrupted");
+    }
+    if [
+        "connection reset",
+        "connection timed out",
+        "connection refused",
+        "failed to connect to",
+        "operation timed out",
+        "connection timeout",
+        "empty reply from server",
+        "recv failure:",
+        "send failure:",
+        "curl 18 ",
+        "curl 28 ",
+        "curl 52 ",
+        "curl 55 ",
+        "curl 56 ",
+        "curl 92 ",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
+    {
+        return Some("connection interrupted or timed out");
+    }
+    if [
+        "temporary failure in name resolution",
+        "could not resolve host:",
+        "could not resolve proxy:",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
+    {
+        return Some("DNS resolution failed");
+    }
+    None
 }
 
 /// Wraps `upload-pack`'s stdout to record how long the packfile took to serve.
@@ -463,6 +614,68 @@ fn pkt_line(s: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_retry_classifies_transient_diagnostics() {
+        for message in [
+            "TLS connect error: error:0A000126:SSL routines::unexpected eof while reading",
+            "gnutls_handshake() failed: The TLS connection was non-properly terminated.",
+            "GnuTLS recv error (-110): The TLS connection was non-properly terminated.",
+            "OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443",
+            "Recv failure: Connection reset by peer",
+            "Failed to connect to github.com port 443: Connection refused",
+            "Operation timed out after 30000 milliseconds",
+            "Empty reply from server",
+            "Send failure: Broken pipe",
+            "Temporary failure in name resolution",
+            "Could not resolve host: github.com",
+            "Could not resolve proxy: proxy.example",
+            "error: RPC failed; curl 18 transfer closed with outstanding read data remaining",
+            "error: RPC failed; curl 92 HTTP/2 stream was not closed cleanly: CANCEL",
+        ] {
+            assert!(
+                transient_upstream_error(message.as_bytes()).is_some(),
+                "{message}"
+            );
+        }
+        for code in [408, 429, 500, 502, 503, 504] {
+            let message = format!(
+                "fatal: unable to access 'https://github.com/a/b/': The requested URL returned error: {code}\n"
+            );
+            assert_eq!(
+                Some("transient HTTP status"),
+                transient_upstream_error(message.as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_retry_rejects_permanent_and_ambiguous_diagnostics() {
+        for message in [
+            "The requested URL returned error: 501",
+            "The requested URL returned error: 5020",
+            "TLS connect error: certificate verify failed",
+            "TLS connect error: unsupported protocol",
+            "Recv failure: Connection reset by peer\nfatal: No space left on device",
+            "Connection reset\nSSL certificate problem: self-signed certificate",
+            "fatal: Authentication failed\nThe requested URL returned error: 503",
+            "error: cannot lock ref refs/heads/main",
+            "fatal: protocol error: bad line length character",
+            "fatal: early EOF",
+            "fatal: unknown error",
+            "",
+        ] {
+            assert_eq!(
+                None,
+                transient_upstream_error(message.as_bytes()),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            [1, 2, 4],
+            UPSTREAM_RETRY_DELAYS.map(|delay| delay.as_secs())
+        );
+    }
 
     #[test]
     fn git_config_env_numbers_options_and_appends_auth() {
