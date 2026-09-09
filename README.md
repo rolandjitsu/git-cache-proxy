@@ -69,6 +69,23 @@ anything git-receive-pack  -> 403 (read-only)
 Concurrent clients for the same repo are serialized so a burst triggers a single
 upstream fetch; a short TTL coalesces repeated requests.
 
+Upstream clone/fetch retries recognized transient network failures up to three
+times after the first attempt, waiting 1, 2, then 4 seconds. This includes TLS
+EOF, connection resets/timeouts, temporary DNS failures, and HTTP 408, 429,
+500, 502, 503, and 504. Authentication, missing repositories, certificate
+validation, local filesystem errors, and unknown failures are not retried.
+Classification uses Git's English stderr diagnostics; the child locale is fixed
+to `C`. Retry logs contain the operation, attempt, delay, and error category,
+without raw upstream stderr or credentials.
+
+Retries stay inside the existing per-repository lock. Each failed clone's staging
+directory is removed before another attempt; an existing fetch mirror is kept.
+Only success updates the freshness timestamp. After retries are exhausted the
+request still fails with 502; stale refs are not served as a fallback. The retry
+budget limits attempts and adds at most seven seconds of backoff; it does not
+impose a new transfer timeout on large repositories. LFS and local upload-pack
+operations are outside this retry policy.
+
 ### git-LFS
 
 LFS objects use a different HTTP API from the git protocol, so they are cached
