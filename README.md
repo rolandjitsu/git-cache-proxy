@@ -247,9 +247,10 @@ The `Dockerfile` builds a statically linked (musl) binary and drops it onto a
 minimal Alpine base. Because the git wire protocol is delegated to the system `git`
 binary, the runtime image must contain `git` - so it is Alpine-with-git rather than a
 fully distroless/`FROM scratch` image. (The LFS transfer is in-process, so it adds no
-runtime tool - only CA certs.) Removing the git dependency and enabling a git-free
-image means moving the git plumbing in-process to a Rust library - see the roadmap
-below.
+runtime tool - only CA certs.) The `git` binary is a *permanent* runtime dependency,
+not a temporary one: the proxy serves clients by running `git upload-pack`, and no
+production-ready Rust library implements the upload-pack server side - so a fully
+distroless, git-free image is not on the table. See [Status / scope](#status--scope).
 
 On Kubernetes, a Helm chart lives in [`chart/`](./chart) (single-writer
 Deployment, `/healthz`+`/readyz` probes, cache PVC, optional Ingress and
@@ -275,14 +276,19 @@ This is early, single-maintainer software: no independent review or wide
 deployment yet. Pin a version and try it against your own setup before you
 rely on it.
 
-Not yet implemented, in rough priority order:
+Not yet implemented:
 
 - A background/scheduled refresh option (today every `info/refs` triggers an
   on-demand, TTL-coalesced fetch).
-- No external `git` binary: move the plumbing in-process to a Rust library
-  (`gitoxide`/`git2`). More robust (no subprocess/argv surface, structured
-  errors) and unlocks a fully distroless, git-free image - a larger change,
-  tracked as a possible v2.
+
+**Non-goal: a git-free image.** The `git` binary stays a runtime dependency. The
+proxy serves clients by running `git upload-pack`, and as of 2026 no
+production-ready Rust library implements the upload-pack *server* (ref
+advertisement, want/have negotiation, on-the-fly packfile generation): `gitoxide`
+is client-only by design, and `libgit2`/`git2` exposes only pack primitives, no
+serve protocol. Moving the plumbing in-process was investigated and shelved for
+that reason - it would mean hand-rolling the smart wire protocol, exactly the
+reimplementation this proxy avoids by delegating to `git`.
 
 Contributions welcome.
 
