@@ -20,8 +20,8 @@ Other approaches or workarounds you tried.
 **Scope check**
 - [ ] Keeps the proxy strictly read-only and pull-only (it must never push or
       proactively replicate to upstream).
-- [ ] Not already tracked in the README "Status / scope" roadmap (LRU eviction,
-      per-repo histograms, scheduled refresh, in-process git).
+- [ ] Not already tracked in the README "Status / scope" (LRU eviction, per-repo
+      histograms, scheduled refresh) or listed there as a non-goal (git-free image).
 
 **Additional context**
 References, prior art, or links.
