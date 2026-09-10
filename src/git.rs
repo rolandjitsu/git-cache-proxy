@@ -372,8 +372,19 @@ impl GitCache {
 
     /// Command for local operations (upload-pack): no upstream, no auth. Forwards
     /// the client's protocol version so v2 clients get a v2 advertisement.
+    ///
+    /// `uploadpack.allowFilter` is enabled so clients can request *partial*
+    /// (filtered) clones - e.g. `--filter=blob:none`. Without it `git upload-pack`
+    /// silently drops the filter and streams every object (the client warns
+    /// "filtering not recognized by server, ignoring"), so partial clone would not
+    /// actually work through the proxy. We always serve from a full local mirror,
+    /// so honoring the filter - and the promisor back-fill of omitted objects it
+    /// triggers - is always safe. Passed as a `-c` override (before the
+    /// `upload-pack` subcommand) rather than persisted in each mirror's config, so
+    /// it holds regardless of mirror state.
     fn local_cmd(&self, git_protocol: Option<&str>) -> Command {
         let mut c = Command::new(&self.cfg.git_binary);
+        c.arg("-c").arg("uploadpack.allowFilter=true");
         if let Some(p) = git_protocol {
             c.env("GIT_PROTOCOL", p);
         }
