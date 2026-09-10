@@ -48,6 +48,8 @@ pub enum Status {
 pub enum UpstreamOp {
     Clone,
     Fetch,
+    /// On-demand fetch of a bare SHA the mirror lacks (e.g. a PR merge commit).
+    WantFetch,
 }
 
 /// The `kind` label on `serve_duration_seconds`.
@@ -95,6 +97,7 @@ impl UpstreamOp {
         match self {
             Self::Clone => "clone",
             Self::Fetch => "fetch",
+            Self::WantFetch => "want_fetch",
         }
     }
 }
@@ -125,8 +128,8 @@ pub struct Metrics {
     /// upstream_error | unauthorized | rejected; repo = the served repo path when
     /// result = ok, else `-`.
     requests: IntCounterVec,
-    /// `upstream_ops_total{op, result, repo}` - op = clone | fetch; result = ok |
-    /// error; repo = the repo path when result = ok, else `-`.
+    /// `upstream_ops_total{op, result, repo}` - op = clone | fetch | want_fetch;
+    /// result = ok | error; repo = the repo path when result = ok, else `-`.
     upstream: IntCounterVec,
     /// `cache_bytes` - total size of the on-disk mirror cache, maintained
     /// incrementally as mirrors are added, refreshed, and evicted. Populated only

@@ -69,6 +69,19 @@ anything git-receive-pack  -> 403 (read-only)
 Concurrent clients for the same repo are serialized so a burst triggers a single
 upstream fetch; a short TTL coalesces repeated requests.
 
+If a client `want`s a commit by SHA that the mirror never captured - typically a
+GitHub pull-request merge commit, which lives only under the unadvertised
+`refs/pull/<n>/merge` and so is what `actions/checkout` fetches on a PR build - the
+proxy fetches that SHA from upstream on demand and serves it, instead of failing
+with `not our ref`. This relies on the upstream serving arbitrary SHAs (GitHub's
+`uploadpack.allowAnySHA1InWant`, which is on); an upstream that refuses simply
+leaves the request to fail as it would without the proxy. Ordinary branch/tag
+clones are unaffected - they pay only a cheap local object check, never an extra
+upstream call. Each fetched SHA is pinned under a reserved ref so the mirror can
+keep serving it; `--max-wants` bounds how many such pins a mirror retains, pruning
+the oldest so they cannot accumulate without bound (like the mirror-level LRU, but
+scoped to a single mirror's pins).
+
 ### git-LFS
 
 LFS objects use a different HTTP API from the git protocol, so they are cached
@@ -173,6 +186,7 @@ Every flag has an environment-variable equivalent.
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
 | `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |
+| `--max-wants`            | `GITCACHEPROXY_MAX_WANTS`            | `100`                        | Cap on want-by-SHA pins retained per mirror; oldest pruned beyond it (`0` = unlimited) |
 | `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
 | `--big-file-threshold`   | `GITCACHEPROXY_BIG_FILE_THRESHOLD`   | `8m`                         | Stream blobs larger than this to disk during upstream clone/fetch instead of holding them in memory, bounding `index-pack` RSS so one very large repo can't OOM the proxy |
 
