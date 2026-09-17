@@ -2,8 +2,10 @@
 //! Git plumbing: keep a bare mirror fresh and serve `upload-pack` from it.
 //!
 //! All git work is delegated to the system `git` binary, so protocol
-//! correctness - including protocol v2, shallow and partial (filtered) clones -
-//! comes for free. The proxy never reimplements the wire format; it only:
+//! correctness - protocol v2, shallow and partial (filtered) clones - comes from
+//! `git` itself, not a reimplemented wire format. (Partial clone additionally
+//! needs `uploadpack.allowFilter`, which the serve path sets; see `local_cmd`.)
+//! The proxy only:
 //!   1. maps a request to a bare mirror under the cache root,
 //!   2. runs an incremental `git fetch` from upstream (coalesced per repo),
 //!   3. streams `git upload-pack` output from the local mirror to the client.
