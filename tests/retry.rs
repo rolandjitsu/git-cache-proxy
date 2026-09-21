@@ -22,14 +22,14 @@ async fn clone_retries_tls_eof_and_removes_partial_staging() {
     );
     let started = tokio::time::Instant::now();
     assert!(matches!(
-        f.cache.ensure_fresh(&f.repo, true).await.unwrap(),
+        f.cache.ensure_fresh(&f.repo, true, b"").await.unwrap(),
         CacheOutcome::Cloned
     ));
     assert_eq!(2, f.attempts("clone"));
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert!(!f.repo.cache_dir.join("partial").exists());
     assert!(matches!(
-        f.cache.ensure_fresh(&f.repo, true).await.unwrap(),
+        f.cache.ensure_fresh(&f.repo, true, b"").await.unwrap(),
         CacheOutcome::Cached
     ));
     assert_eq!(2, f.attempts("clone"));
@@ -42,7 +42,7 @@ async fn fetch_retries_http_503_and_keeps_the_mirror() {
     f.fail("fetch", 2, "The requested URL returned error: 503");
     let started = tokio::time::Instant::now();
     assert!(matches!(
-        f.cache.ensure_fresh(&f.repo, true).await.unwrap(),
+        f.cache.ensure_fresh(&f.repo, true, b"").await.unwrap(),
         CacheOutcome::Fetched
     ));
     assert_eq!(3, f.attempts("fetch"));
@@ -59,12 +59,12 @@ async fn retries_are_bounded_and_failure_does_not_refresh_ttl() {
         }
         f.fail(op, 10, "Recv failure: Connection reset by peer");
         let started = tokio::time::Instant::now();
-        assert!(f.cache.ensure_fresh(&f.repo, true).await.is_err());
+        assert!(f.cache.ensure_fresh(&f.repo, true, b"").await.is_err());
         assert_eq!(4, f.attempts(op));
         assert!(started.elapsed() >= Duration::from_secs(7));
         assert!(!f.root.path().join("cache/repo.git.__incoming__").exists());
         f.fail(op, 0, "unused");
-        assert!(f.cache.ensure_fresh(&f.repo, true).await.is_ok());
+        assert!(f.cache.ensure_fresh(&f.repo, true, b"").await.is_ok());
         assert_eq!(5, f.attempts(op));
     }
 }
@@ -89,7 +89,7 @@ async fn permanent_errors_are_not_retried() {
             }
             f.fail(op, 10, message);
             assert!(
-                f.cache.ensure_fresh(&f.repo, true).await.is_err(),
+                f.cache.ensure_fresh(&f.repo, true, b"").await.is_err(),
                 "{message}"
             );
             assert_eq!(1, f.attempts(op), "{message}");
@@ -106,8 +106,8 @@ async fn concurrent_clients_share_one_retry_sequence() {
         "Failed to connect to github.com port 443: Connection timed out",
     );
     let (a, b) = tokio::join!(
-        f.cache.ensure_fresh(&f.repo, true),
-        f.cache.ensure_fresh(&f.repo, true)
+        f.cache.ensure_fresh(&f.repo, true, b""),
+        f.cache.ensure_fresh(&f.repo, true, b"")
     );
     let outcomes = [a.unwrap(), b.unwrap()];
     assert_eq!(
@@ -137,7 +137,7 @@ async fn noisy_stderr_is_drained_and_not_exposed_in_errors() {
     f.fail("clone", 10, &message);
     let error = f
         .cache
-        .ensure_fresh(&f.repo, true)
+        .ensure_fresh(&f.repo, true, b"")
         .await
         .unwrap_err()
         .to_string();
@@ -198,6 +198,7 @@ exec git "$@"
                 upstream_auth_header: None,
                 big_file_threshold: "8m".into(),
                 fetch_ttl: Duration::from_secs(60),
+                max_wants: 0,
             },
             Arc::new(Metrics::new()),
             None,

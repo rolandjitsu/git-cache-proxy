@@ -612,6 +612,7 @@ mod tests {
             upstream_auth_header: None,
             big_file_threshold: "8m".into(),
             fetch_ttl: Duration::from_secs(10),
+            max_wants: 100,
         }
     }
 
