@@ -11,7 +11,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin git-cache-proxy
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache git ca-certificates \
  && rm -rf /var/cache/apk/*
 COPY --from=build /src/target/release/git-cache-proxy /usr/local/bin/git-cache-proxy
