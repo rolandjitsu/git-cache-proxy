@@ -24,3 +24,12 @@ updates:
     groups:
       actions-patch:
         update-types: ["patch"]
+
+  # Docker base images, so the pinned Alpine runtime gets bump PRs instead of
+  # drifting past end of support. `fix` so a merged bump cuts a release.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: fix
