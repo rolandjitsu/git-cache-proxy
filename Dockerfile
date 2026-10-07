@@ -12,11 +12,18 @@ COPY . .
 RUN cargo build --release --locked --bin git-cache-proxy
 
 FROM alpine:3.20
+# The cache root is created owned by the runtime user so the image works as
+# non-root on runtimes with no fsGroup equivalent (Docker, ECS).
 RUN apk add --no-cache git ca-certificates \
- && rm -rf /var/cache/apk/*
+ && rm -rf /var/cache/apk/* \
+ && addgroup -S -g 10001 gitcache \
+ && adduser -S -D -u 10001 -G gitcache gitcache \
+ && install -d -o gitcache -g gitcache /var/cache/git-cache-proxy
 COPY --from=build /src/target/release/git-cache-proxy /usr/local/bin/git-cache-proxy
 # Bare mirrors live here; mount a volume for persistence across restarts.
 ENV GITCACHEPROXY_CACHE_ROOT=/var/cache/git-cache-proxy
 VOLUME /var/cache/git-cache-proxy
 EXPOSE 8080
+# Numeric, so Kubernetes `runAsNonRoot` can verify it.
+USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/git-cache-proxy"]

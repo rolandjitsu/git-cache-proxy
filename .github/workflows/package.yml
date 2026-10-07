@@ -55,5 +55,19 @@ jobs:
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: false
+          load: true
+          tags: git-cache-proxy:ci
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      # /readyz probes the cache root for writes, so this fails if the non-root
+      # user cannot write the default cache directory.
+      - name: Check image runs as non-root with a writable cache
+        run: |
+          test "$(docker run --rm --entrypoint id git-cache-proxy:ci -u)" = 10001
+          docker run -d --name smoke -p 8080:8080 git-cache-proxy:ci --upstream https://example.invalid
+          for _ in $(seq 1 30); do
+            curl -fsS localhost:8080/readyz && exit 0
+            sleep 1
+          done
+          docker logs smoke
+          exit 1

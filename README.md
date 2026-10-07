@@ -269,6 +269,11 @@ not a temporary one: the proxy serves clients by running `git upload-pack`, and 
 production-ready Rust library implements the upload-pack server side - so a fully
 distroless, git-free image is not on the table. See [Status / scope](#status--scope).
 
+The image runs as UID/GID 10001, which owns the default cache root. A volume or bind
+mount there must be writable by that UID: `chown -R 10001:10001` a cache written by
+an older, root-running release, or set `fsGroup: 10001` on Kubernetes (the chart's
+default).
+
 On Kubernetes, a Helm chart lives in [`chart/`](./chart) (single-writer
 Deployment, `/healthz`+`/readyz` probes, cache PVC, optional Ingress and
 Prometheus `ServiceMonitor`):
