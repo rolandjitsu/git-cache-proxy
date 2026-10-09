@@ -96,10 +96,11 @@ terminationGracePeriodSeconds: 60
 # /metrics on the service port. (For the Prometheus Operator use serviceMonitor.)
 podAnnotations: {}
 
-# Pod- and container-level security contexts. Empty uses the image defaults (it
-# runs as root and owns the cache dir). To harden, set a non-root runAsUser and a
-# matching podSecurityContext.fsGroup so the cache volume stays writable.
-podSecurityContext: {}
+# Pod- and container-level security contexts. The image runs as UID/GID 10001;
+# fsGroup makes the cache PVC writable for it, including a volume an older
+# root-running release wrote.
+podSecurityContext:
+  fsGroup: 10001
 securityContext: {}
 
 nodeSelector: {}
