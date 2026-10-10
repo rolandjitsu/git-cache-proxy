@@ -26,6 +26,7 @@ fn state(serve_token: Option<String>) -> AppState {
         upstream_auth_header: None,
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -214,6 +215,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         upstream_auth_header: None,
         big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
