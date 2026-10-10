@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.14 (2026-10-10)
+
+### Fixes
+
+- move the runtime base to alpine 3.24
+
 ## 0.1.13 (2026-09-16)
 
 ### Fixes
