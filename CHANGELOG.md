@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.1.15 (2026-10-10)
+
+### Features
+
+- serve want-by-sha for unadvertised refs
+
 ## 0.1.14 (2026-10-10)
 
 ### Fixes
