@@ -89,6 +89,14 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_CACHE_MAX_MB", default_value_t = 0)]
     pub cache_max_mb: u64,
 
+    /// Maximum number of want-by-SHA pins a mirror retains. A client may `want` a
+    /// commit that lives only under an unadvertised upstream ref (e.g. a GitHub PR
+    /// merge commit); the proxy fetches it on demand and pins it so it can keep
+    /// serving it. Beyond this cap the oldest pins are pruned so they cannot
+    /// accumulate without bound. `0` = unlimited.
+    #[arg(long, env = "GITCACHEPROXY_MAX_WANTS", default_value_t = 100)]
+    pub max_wants: usize,
+
     /// Path to the git binary.
     #[arg(long, env = "GITCACHEPROXY_GIT_BINARY", default_value = "git")]
     pub git_binary: String,
