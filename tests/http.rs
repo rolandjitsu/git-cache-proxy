@@ -45,7 +45,6 @@ fn state(auth: Arc<Auth>) -> AppState {
             upstream_base: "https://upstream.invalid".into(),
             cache_root: cache_root.clone(),
             upstream_auth_header: None,
-            serve_token: None,
         },
         None,
     ));
@@ -256,7 +255,6 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
             upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
             cache_root: cache.path().to_path_buf(),
             upstream_auth_header: None,
-            serve_token: None,
         },
         None,
     ));

@@ -17,6 +17,9 @@ use git_cache_proxy::auth::AuthConfig;
 use git_cache_proxy::config::AuthProvider;
 use tokio::sync::{Mutex, Notify};
 
+/// The signing key the test replicas share, long enough for HMAC-SHA256.
+pub const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
+
 /// What the mock answers, so each classification branch is testable.
 // Each suite builds its own copy of this module and uses a different subset
 // of variants; the sharing, not a real gap, is what dead-code analysis sees.
@@ -154,6 +157,7 @@ pub fn github_auth_config(base: &str, ttl_secs: u64) -> AuthConfig {
     AuthConfig {
         provider: AuthProvider::Github,
         serve_token: None,
+        signing_key: Some(SIGNING_KEY.into()),
         timeout: Duration::from_secs(5),
         ttl: Duration::from_secs(ttl_secs),
         max_concurrent: 32,

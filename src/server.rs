@@ -138,7 +138,11 @@ impl Route {
             Route::InfoRefs { repo, .. }
             | Route::UploadPack { repo }
             | Route::LfsBatch { repo } => auth::Target::Repo(repo),
-            Route::LfsObject { .. } => auth::Target::LfsObject,
+            Route::LfsObject { repo, oid, size } => auth::Target::LfsObject {
+                repo,
+                oid,
+                size: *size,
+            },
             Route::NotFound => auth::Target::Unknown,
         })
     }
@@ -304,7 +308,8 @@ async fn lfs_batch(st: AppState, name: &str, headers: &HeaderMap, body: Bytes) -
         );
     }
     let advertise = advertise_base(headers);
-    match st.lfs.batch(name, &body, &advertise).await {
+    let grant = |oid: &str, size| st.auth.lfs_grant(name, oid, size);
+    match st.lfs.batch(name, &body, &advertise, grant).await {
         Ok(json) => {
             st.metrics
                 .record_request(RequestKind::LfsBatch, Status::Ok, name);

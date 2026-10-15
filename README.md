@@ -218,6 +218,7 @@ Every flag has an environment-variable equivalent.
 | `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
 | `--auth-provider`        | `GITCACHEPROXY_AUTH_PROVIDER`        | `none`                       | Client-auth mode: `none`, `shared`, `github`, `gitlab` (see Auth model). Passing only `--serve-token` keeps the legacy shared-secret behavior |
+| `--auth-signing-key`     | `GITCACHEPROXY_AUTH_SIGNING_KEY`     | random per process           | Provider modes: HMAC key (at least 32 bytes) signing LFS download grants; every replica behind one address needs the same key |
 | `--auth-timeout-seconds` | `GITCACHEPROXY_AUTH_TIMEOUT_SECONDS` | `10`                         | Budget for one token-validation request, shared by the `--auth-max-concurrent` slot wait and the HTTP call |
 | `--auth-ttl-seconds`     | `GITCACHEPROXY_AUTH_TTL_SECONDS`     | `0`                          | Reuse a validation verdict per `(credential, repo)` for this many seconds, so the requests of one clone, or repeated submodule fetches, validate once (`0` = validate every request) |
 | `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
@@ -360,8 +361,13 @@ The per-run `GITHUB_TOKEN` is scoped to its repository and expires with the
 job, so a compromised runner can only clone its own repo and cannot persist
 access.
 
-git-LFS object downloads are refused in these modes: an object GET carries no
-credential the proxy could check for its repo.
+git-LFS does not need a TTL. The batch request is checked like any other, and
+each rewritten download action carries a grant the proxy signs for exactly
+that repo, object, and size, valid for 15 minutes. Object GETs verify the
+grant locally instead of rechecking the credential, and a grant for one repo
+cannot fetch another repo's object from the shared object cache. Every replica
+behind one address must share `--auth-signing-key`, or a grant issued by one
+is refused by the others; the caches themselves stay independent.
 
 ### GitLab with a personal access token
 

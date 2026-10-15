@@ -9,11 +9,14 @@
 //! - `github` and `gitlab` check the client's own credential for the repo a
 //!   request names, before any upstream or mirror work, so a client only
 //!   reaches what that credential could clone directly. They ask upstream
-//!   itself with a protocol v2 `info/refs` probe.
+//!   itself with a protocol v2 `info/refs` probe. LFS object GETs present a
+//!   signed grant instead (see `grant`).
 //!
 //! Provider mode fails closed: unless the check gives a definitive verdict
 //! (2xx allows, 401/403/404 rejects), the request is refused with 503 rather
 //! than served unvalidated.
+
+mod grant;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -32,6 +35,7 @@ use tokio::sync::{OnceCell, Semaphore};
 use tokio::time::Instant;
 
 use crate::config::AuthProvider;
+use crate::lfs::DownloadGrant;
 use crate::repo;
 
 /// Distinct `(credential, repo)` verdicts kept for `--auth-ttl-seconds`; least
@@ -61,9 +65,12 @@ pub enum Verdict {
 pub enum Target<'a> {
     /// A git or LFS batch request for this repo.
     Repo(&'a str),
-    /// An LFS object GET. It names no credential of its own a provider could
-    /// check, so provider mode refuses it.
-    LfsObject,
+    /// An LFS object GET, authorized by the grant its batch response issued.
+    LfsObject {
+        repo: &'a str,
+        oid: &'a str,
+        size: Option<u64>,
+    },
     /// Not a git or LFS endpoint.
     Unknown,
 }
@@ -74,6 +81,9 @@ pub struct AuthConfig {
     /// `--serve-token`. Whitespace-only values collapse to `None`, like the
     /// upstream auth header.
     pub serve_token: Option<String>,
+    /// Provider modes: HMAC key of LFS download grants, shared by every replica.
+    /// `None` generates a per-process key.
+    pub signing_key: Option<String>,
     /// Total budget for one validation request.
     pub timeout: Duration,
     /// How long a validation verdict may be reused per `(credential, repo)`.
@@ -143,21 +153,26 @@ impl Auth {
         }
         // An env var set to a blank string parses as Some(""); a missing flag must
         // not silently become an empty one.
-        let serve_token = cfg
-            .serve_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let trim = |v: &Option<String>| -> Option<String> {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let serve_token = trim(&cfg.serve_token);
+        let signing_key = trim(&cfg.signing_key);
         let provider = cfg.provider;
 
         let mode = match provider {
-            AuthProvider::None | AuthProvider::Shared => match (serve_token, provider) {
-                // Legacy shape: only `--serve-token` given, no explicit mode.
-                (Some(token), _) => Mode::Shared { token },
-                (None, AuthProvider::None) => Mode::Anonymous,
-                (None, _) => bail!("--auth-provider shared requires --serve-token"),
-            },
+            AuthProvider::None | AuthProvider::Shared => {
+                forbid(&signing_key, "--auth-signing-key", provider)?;
+                match (serve_token, provider) {
+                    // Legacy shape: only `--serve-token` given, no explicit mode.
+                    (Some(token), _) => Mode::Shared { token },
+                    (None, AuthProvider::None) => Mode::Anonymous,
+                    (None, _) => bail!("--auth-provider shared requires --serve-token"),
+                }
+            }
             AuthProvider::Github | AuthProvider::Gitlab => {
                 forbid(&serve_token, "--serve-token", provider)?;
                 let base = probe_base(&cfg.upstream_base, cfg.allow_http)?;
@@ -168,7 +183,7 @@ impl Auth {
                 } else {
                     BearerUser::Gitlab
                 };
-                provider_mode(&cfg, base, bearer_user)?
+                provider_mode(&cfg, base, bearer_user, signing_key.as_deref())?
             }
         };
         Ok(Self { mode })
@@ -188,7 +203,32 @@ impl Auth {
         };
         match target {
             Target::Repo(repo) => provider.check(headers, repo).await,
-            Target::LfsObject | Target::Unknown => Verdict::Deny,
+            Target::LfsObject {
+                repo,
+                oid,
+                size: Some(size),
+            } => match bearer_token(headers) {
+                Some(g) if provider.grants.verify(g, repo, oid, size) => Verdict::Allow,
+                _ => Verdict::Deny,
+            },
+            Target::LfsObject { size: None, .. } | Target::Unknown => Verdict::Deny,
+        }
+    }
+
+    /// The credential a rewritten LFS download action carries for one object:
+    /// the shared secret in shared mode, a signed grant in provider mode, `None`
+    /// when anonymous.
+    pub fn lfs_grant(&self, repo: &str, oid: &str, size: u64) -> Option<DownloadGrant> {
+        match &self.mode {
+            Mode::Anonymous => None,
+            Mode::Shared { token } => Some(DownloadGrant {
+                authorization: format!("Bearer {token}"),
+                expires_in: None,
+            }),
+            Mode::Provider(p) => Some(DownloadGrant {
+                authorization: format!("Bearer {}", p.grants.sign(repo, oid, size)),
+                expires_in: Some(grant::LIFETIME),
+            }),
         }
     }
 
@@ -247,6 +287,7 @@ struct Provider {
     verdicts: Mutex<LruCache<CacheKey, (Verdict, Instant)>>,
     /// Concurrent checks of one `(credential, repo)` share a single call.
     inflight: Mutex<HashMap<CacheKey, Arc<OnceCell<Verdict>>>>,
+    grants: grant::Signer,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -499,7 +540,18 @@ fn probe_base(upstream: &str, allow_http: bool) -> Result<String> {
 
 /// Build the provider mode: the reqwest client is built once, at startup, so
 /// the per-request path stays infallible.
-fn provider_mode(cfg: &AuthConfig, base: String, bearer_user: BearerUser) -> Result<Mode> {
+fn provider_mode(
+    cfg: &AuthConfig,
+    base: String,
+    bearer_user: BearerUser,
+    signing_key: Option<&str>,
+) -> Result<Mode> {
+    let grants = grant::Signer::new(signing_key)?;
+    if signing_key.is_none() {
+        tracing::warn!(
+            "no --auth-signing-key set; LFS download grants only verify on this replica"
+        );
+    }
     let client = reqwest::Client::builder()
         .user_agent(concat!("git-cache-proxy/", env!("CARGO_PKG_VERSION")))
         .timeout(cfg.timeout)
@@ -519,6 +571,7 @@ fn provider_mode(cfg: &AuthConfig, base: String, bearer_user: BearerUser) -> Res
         ttl: (!cfg.ttl.is_zero()).then_some(cfg.ttl),
         verdicts: Mutex::new(LruCache::new(VERDICT_CAPACITY)),
         inflight: Mutex::new(HashMap::new()),
+        grants,
     })))
 }
 
@@ -531,8 +584,9 @@ fn url_safe(name: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/'))
 }
 
-/// The credential of `Authorization: Bearer <token>`: what shared mode accepts.
-/// No trimming: the token begins right after the scheme's single space.
+/// The credential of `Authorization: Bearer <token>`: what shared mode accepts
+/// and what an LFS grant rides in. No trimming: the token begins right after
+/// the scheme's single space.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -754,11 +808,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_mode_refuses_lfs_objects() {
+    async fn lfs_objects_need_a_grant_for_exactly_that_object() {
         let auth = Auth::build(config(AuthProvider::Github)).unwrap();
-        let h = headers("Bearer tok");
-        assert_eq!(auth.check(&h, Target::LfsObject).await, Verdict::Deny);
-        assert_eq!(auth.check(&h, Target::Unknown).await, Verdict::Deny);
+        let grant = auth.lfs_grant("r.git", "oid", 7).unwrap();
+        let h = headers(&grant.authorization);
+        let object = |repo, size| Target::LfsObject {
+            repo,
+            oid: "oid",
+            size,
+        };
+        assert_eq!(
+            auth.check(&h, object("r.git", Some(7))).await,
+            Verdict::Allow
+        );
+        assert_eq!(
+            auth.check(&h, object("o.git", Some(7))).await,
+            Verdict::Deny
+        );
+        assert_eq!(auth.check(&h, object("r.git", None)).await, Verdict::Deny);
+        let client = headers("Bearer tok");
+        assert_eq!(
+            auth.check(&client, object("r.git", Some(7))).await,
+            Verdict::Deny
+        );
+        assert_eq!(auth.check(&client, Target::Unknown).await, Verdict::Deny);
+    }
+
+    #[test]
+    fn grants_are_issued_per_mode() {
+        assert_eq!(Auth::anonymous().lfs_grant("r", "oid", 1), None);
+        let shared = Auth::shared("s3cret").lfs_grant("r", "oid", 1).unwrap();
+        assert_eq!(shared.authorization, "Bearer s3cret");
+        assert_eq!(shared.expires_in, None);
+        let auth = Auth::build(config(AuthProvider::Github)).unwrap();
+        let grant = auth.lfs_grant("r", "oid", 1).unwrap();
+        assert!(grant.authorization.starts_with("Bearer gcp1."));
+        assert_eq!(grant.expires_in, Some(grant::LIFETIME));
+    }
+
+    #[test]
+    fn a_signing_key_without_a_provider_is_rejected() {
+        for provider in [AuthProvider::None, AuthProvider::Shared] {
+            let err = Auth::build(AuthConfig {
+                serve_token: Some("s3cret".into()),
+                signing_key: Some(KEY.into()),
+                ..config(provider)
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("--auth-signing-key"));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -844,10 +942,16 @@ mod tests {
         assert!(p.inflight.lock().unwrap().is_empty());
     }
 
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Every provider mode gets a shared signing key; `none` and `shared`
+    /// reject one, so they get none.
     fn config(provider: AuthProvider) -> AuthConfig {
         AuthConfig {
             provider,
             serve_token: None,
+            signing_key: matches!(provider, AuthProvider::Github | AuthProvider::Gitlab)
+                .then(|| KEY.into()),
             timeout: Duration::from_secs(10),
             ttl: Duration::from_secs(0),
             max_concurrent: 32,

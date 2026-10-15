@@ -254,7 +254,6 @@ fn state(auth: Arc<Auth>) -> AppState {
             upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
             cache_root: cache_root.clone(),
             upstream_auth_header: None,
-            serve_token: None,
         },
         None,
     ));

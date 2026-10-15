@@ -41,6 +41,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "http2",
     "rustls-tls-native-roots",
 ] }
+# Already in the tree through rustls; used directly for the HMAC that signs LFS
+# download grants and for the random fallback signing key.
+ring = "0.17"
 serde_json = "1"
 sha2 = "0.11"
 subtle = "2"
