@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -66,8 +66,9 @@ pub fn router(state: AppState) -> Router {
     // clone of the service (axum clones it per connection) makes the cap
     // process-wide rather than per-connection. `merge` keeps the (limited)
     // fallback as the merged fallback, while the observability routes above are
-    // matched first and bypass it. The gate runs outside the limit, so refused
-    // requests never hold the permits serving needs.
+    // matched first and bypass it. The gate runs outside the limit, so a slow or
+    // flooded token-validation endpoint cannot hold the permits serving needs;
+    // validation is bounded by its own `--auth-max-concurrent` instead.
     let mut git = Router::new().fallback(handle_git);
     if max_concurrent != 0 {
         git = git.layer(GlobalConcurrencyLimitLayer::new(max_concurrent));
@@ -79,8 +80,8 @@ pub fn router(state: AppState) -> Router {
     observability.merge(git)
 }
 
-/// A git or LFS request, classified once so that the gate and the handler agree
-/// on what is served.
+/// A git or LFS request, classified once so that auth checks exactly the repo
+/// that is then served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Route {
     InfoRefs {
@@ -129,9 +130,17 @@ impl Route {
         Route::NotFound
     }
 
-    /// Whether auth runs: not for a route refused for everyone.
-    fn needs_auth(&self) -> bool {
-        !matches!(self, Route::InfoRefs { smart: false, .. })
+    /// What auth checks, or `None` for a route refused for everyone, where a
+    /// validation call would be wasted.
+    fn target(&self) -> Option<auth::Target<'_>> {
+        Some(match self {
+            Route::InfoRefs { smart: false, .. } => return None,
+            Route::InfoRefs { repo, .. }
+            | Route::UploadPack { repo }
+            | Route::LfsBatch { repo } => auth::Target::Repo(repo),
+            Route::LfsObject { .. } => auth::Target::LfsObject,
+            Route::NotFound => auth::Target::Unknown,
+        })
     }
 }
 
@@ -142,7 +151,7 @@ fn is_push(path: &str, query: &str) -> bool {
 
 /// Refuse pushes, then authenticate the classified route and hand it to
 /// `handle_git`. A push, like a dumb-http `info/refs`, is refused for everyone,
-/// so there is nothing to authenticate.
+/// so validating its credential would only spend a call.
 async fn gate(State(st): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path();
     let query = req.uri().query().unwrap_or("");
@@ -155,10 +164,32 @@ async fn gate(State(st): State<AppState>, mut req: Request<Body>, next: Next) ->
         );
     }
     let route = Route::parse(req.method(), path, query);
-    if route.needs_auth() && st.auth.check(req.headers()) == auth::Verdict::Deny {
-        st.metrics
-            .record_request(RequestKind::Auth, Status::Unauthorized, "-");
-        return err(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    let verdict = match route.target() {
+        Some(target) => st.auth.check(req.headers(), target).await,
+        None => auth::Verdict::Allow,
+    };
+    match verdict {
+        auth::Verdict::Allow => {}
+        auth::Verdict::Deny => {
+            st.metrics
+                .record_request(RequestKind::Auth, Status::Unauthorized, "-");
+            let mut resp = err(StatusCode::UNAUTHORIZED, "missing or invalid credentials");
+            if let Some(challenge) = st.auth.challenge() {
+                resp.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static(challenge),
+                );
+            }
+            return resp;
+        }
+        auth::Verdict::Unavailable => {
+            st.metrics
+                .record_request(RequestKind::Auth, Status::UpstreamError, "-");
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "token validation unavailable",
+            );
+        }
     }
     req.extensions_mut().insert(route);
     next.run(req).await
@@ -361,7 +392,7 @@ fn size_from_query(query: &str) -> Option<u64> {
 /// `X-Forwarded-Host` from a TLS-terminating ingress and otherwise falls back to the
 /// request `Host` over plain http, which is what the proxy itself speaks.
 fn advertise_base(headers: &HeaderMap) -> String {
-    let first = |v: &axum::http::HeaderValue| {
+    let first = |v: &HeaderValue| {
         v.to_str()
             .ok()
             .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
@@ -593,8 +624,6 @@ mod tests {
 
     #[test]
     fn advertise_base_uses_forwarded_headers_then_host() {
-        use axum::http::HeaderValue;
-
         let mut h = HeaderMap::new();
         h.insert(header::HOST, HeaderValue::from_static("svc.local:8080"));
         assert_eq!(advertise_base(&h), "http://svc.local:8080");

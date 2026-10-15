@@ -89,9 +89,10 @@ pub fn lfs_object_path(cache_root: &Path, oid: &str) -> PathBuf {
     cache_root.join(lfs_object_key(oid))
 }
 
-/// Validate a repo path (no traversal / absolute / NUL) and resolve it against
-/// the upstream base and cache root.
-pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<RepoRef> {
+/// Validate a repo path: non-empty, no NUL / absolute / traversal components,
+/// none of the reserved suffixes. Split out from `resolve` so the auth layer
+/// can reject the exact names serving would reject, without resolving them.
+pub fn validate(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('\0') || name.starts_with('/') {
         bail!("invalid repo path: {name:?}");
     }
@@ -110,6 +111,13 @@ pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<Rep
     {
         bail!("invalid repo path (reserved suffix) in {name:?}");
     }
+    Ok(())
+}
+
+/// Validate a repo path (no traversal / absolute / NUL) and resolve it against
+/// the upstream base and cache root.
+pub fn resolve(name: &str, upstream_base: &str, cache_root: &Path) -> Result<RepoRef> {
+    validate(name)?;
     let cache_dir = cache_root.join(name);
     // Defence in depth against traversal that slipped past the component checks.
     if !cache_dir.starts_with(cache_root) {

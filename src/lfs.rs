@@ -84,6 +84,9 @@ impl Lfs {
     pub fn new(cfg: LfsConfig, index: Option<Arc<CacheIndex>>) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            // Bulk object streams each get their own connection rather than
+            // sharing one HTTP/2 connection's flow-control window.
+            .http1_only()
             .build()
             .expect("build reqwest client");
         Self {

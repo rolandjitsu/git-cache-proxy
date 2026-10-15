@@ -80,10 +80,17 @@ async fn main() -> Result<()> {
 
     let upstream_base = cfg.upstream.trim_end_matches('/').to_string();
 
-    let auth = Arc::new(match cfg.serve_token.as_deref() {
-        Some(token) => auth::Auth::shared(token),
-        None => auth::Auth::anonymous(),
-    });
+    // Resolved at startup so a misconfigured mode fails fast instead of on the
+    // first request.
+    let auth = Arc::new(auth::Auth::build(auth::AuthConfig {
+        provider: cfg.auth_provider,
+        serve_token: cfg.serve_token.clone(),
+        timeout: Duration::from_secs(cfg.auth_timeout_seconds),
+        ttl: Duration::from_secs(cfg.auth_ttl_seconds),
+        max_concurrent: cfg.auth_max_concurrent,
+        allow_http: cfg.auth_allow_http,
+        upstream_base: upstream_base.clone(),
+    })?);
     tracing::info!("client auth: {}", auth.describe());
 
     // Clear any in-flight LFS downloads left by a crash so they never linger; the
