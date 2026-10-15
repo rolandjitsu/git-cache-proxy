@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
+use git_cache_proxy::auth::Auth;
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
@@ -80,7 +81,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,
@@ -209,7 +210,7 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -346,7 +347,7 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -479,7 +480,7 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -860,7 +861,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -1515,7 +1516,7 @@ async fn start_proxy_with_git(up: &Path, big_file_threshold: &str, git_binary: &
         )),
         upstream_base: format!("file://{}", up.display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,

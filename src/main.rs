@@ -15,7 +15,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use git_cache_proxy::config::{Config, LogFormat};
-use git_cache_proxy::{evict, git, lfs, metrics, repo, server};
+use git_cache_proxy::{auth, evict, git, lfs, metrics, repo, server};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -80,6 +80,12 @@ async fn main() -> Result<()> {
 
     let upstream_base = cfg.upstream.trim_end_matches('/').to_string();
 
+    let auth = Arc::new(match cfg.serve_token.as_deref() {
+        Some(token) => auth::Auth::shared(token),
+        None => auth::Auth::anonymous(),
+    });
+    tracing::info!("client auth: {}", auth.describe());
+
     // Clear any in-flight LFS downloads left by a crash so they never linger; the
     // objects themselves are content-addressed and re-fetched on demand.
     let _ = tokio::fs::remove_dir_all(
@@ -104,7 +110,7 @@ async fn main() -> Result<()> {
         lfs,
         upstream_base,
         cache_root: cfg.cache_root.clone(),
-        serve_token: cfg.serve_token.clone(),
+        auth,
         max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),
         max_concurrent: cfg.max_concurrent_requests,
         metrics: metrics.clone(),
