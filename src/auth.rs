@@ -6,11 +6,12 @@
 //! - `none` serves anonymously, for a network-restricted deployment.
 //! - `shared` requires one shared bearer secret (`--serve-token`; also the
 //!   legacy shape of passing only `--serve-token` with no explicit mode).
-//! - `github` and `gitlab` check the client's own credential for the repo a
-//!   request names, before any upstream or mirror work, so a client only
-//!   reaches what that credential could clone directly. They ask upstream
-//!   itself with a protocol v2 `info/refs` probe. LFS object GETs present a
-//!   signed grant instead (see `grant`).
+//! - `github`, `gitlab`, and `custom` check the client's own credential for the
+//!   repo a request names, before any upstream or mirror work, so a client only
+//!   reaches what that credential could clone directly. `github` and `gitlab`
+//!   ask upstream itself with a protocol v2 `info/refs` probe; `custom` asks
+//!   any HTTP endpoint. LFS object GETs present a signed grant instead (see
+//!   `grant`).
 //!
 //! Provider mode fails closed: unless the check gives a definitive verdict
 //! (2xx allows, 401/403/404 rejects), the request is refused with 503 rather
@@ -25,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use axum::http::header::{self, HeaderMap, HeaderValue};
+use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use lru::LruCache;
@@ -34,7 +35,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{OnceCell, Semaphore};
 use tokio::time::Instant;
 
-use crate::config::AuthProvider;
+use crate::config::{AuthProvider, RepoForm};
 use crate::lfs::DownloadGrant;
 use crate::repo;
 
@@ -81,6 +82,12 @@ pub struct AuthConfig {
     /// `--serve-token`. Whitespace-only values collapse to `None`, like the
     /// upstream auth header.
     pub serve_token: Option<String>,
+    /// `custom` only: URL template containing `{repo}`.
+    pub validate_url: Option<String>,
+    /// `custom` only: header line template containing `{token}`.
+    pub token_header: Option<String>,
+    /// `custom` only: repo encoding. `None` means `path`.
+    pub repo_form: Option<RepoForm>,
     /// Provider modes: HMAC key of LFS download grants, shared by every replica.
     /// `None` generates a per-process key.
     pub signing_key: Option<String>,
@@ -133,8 +140,8 @@ impl Auth {
         }
     }
 
-    /// Resolve flags into an `Auth`, failing on any conflicting combination so
-    /// misconfiguration surfaces at startup, not on first request.
+    /// Resolve flags and profiles into an `Auth`, failing on any conflicting
+    /// combination so misconfiguration surfaces at startup, not on first request.
     pub fn build(cfg: AuthConfig) -> Result<Self> {
         if cfg.timeout.is_zero() {
             bail!("--auth-timeout-seconds must be greater than zero");
@@ -160,11 +167,19 @@ impl Auth {
                 .map(str::to_string)
         };
         let serve_token = trim(&cfg.serve_token);
+        let validate_url = trim(&cfg.validate_url);
+        let token_header = trim(&cfg.token_header);
         let signing_key = trim(&cfg.signing_key);
         let provider = cfg.provider;
+        let forbid_custom_flags = || -> Result<()> {
+            forbid(&validate_url, "--auth-validate-url", provider)?;
+            forbid(&token_header, "--auth-token-header", provider)?;
+            forbid(&cfg.repo_form, "--auth-repo-form", provider)
+        };
 
         let mode = match provider {
             AuthProvider::None | AuthProvider::Shared => {
+                forbid_custom_flags()?;
                 forbid(&signing_key, "--auth-signing-key", provider)?;
                 match (serve_token, provider) {
                     // Legacy shape: only `--serve-token` given, no explicit mode.
@@ -175,15 +190,49 @@ impl Auth {
             }
             AuthProvider::Github | AuthProvider::Gitlab => {
                 forbid(&serve_token, "--serve-token", provider)?;
-                let base = probe_base(&cfg.upstream_base, cfg.allow_http)?;
-                // Git hosts take a token as the Basic password; the username
-                // is what each host documents for a bare token.
-                let bearer_user = if provider == AuthProvider::Github {
-                    BearerUser::Github
-                } else {
-                    BearerUser::Gitlab
+                forbid_custom_flags()?;
+                let check = Check::Upstream {
+                    base: probe_base(&cfg.upstream_base, cfg.allow_http)?,
+                    // Git hosts take a token as the Basic password; the username
+                    // is what each host documents for a bare token.
+                    bearer_user: if provider == AuthProvider::Github {
+                        BearerUser::Github
+                    } else {
+                        BearerUser::Gitlab
+                    },
                 };
-                provider_mode(&cfg, base, bearer_user, signing_key.as_deref())?
+                provider_mode(&cfg, check, signing_key.as_deref())?
+            }
+            AuthProvider::Custom => {
+                forbid(&serve_token, "--serve-token", provider)?;
+                let url =
+                    validate_url.context("--auth-provider custom requires --auth-validate-url")?;
+                if !url.contains("{repo}") {
+                    bail!("--auth-validate-url must contain {{repo}}");
+                }
+                if url.contains("{token}") {
+                    // Transport error messages echo the URL, so the token must
+                    // never ride in it.
+                    bail!(
+                        "--auth-validate-url must not contain {{token}}; \
+                         use --auth-token-header"
+                    );
+                }
+                let parsed = reqwest::Url::parse(&url.replace("{repo}", "repo"))
+                    .context("parse --auth-validate-url")?;
+                require_tls(&parsed, "--auth-validate-url", cfg.allow_http)?;
+                let (header_name, header_value) = parse_token_header(
+                    token_header
+                        .as_deref()
+                        .unwrap_or("Authorization: Bearer {token}"),
+                )?;
+                let check = Check::Endpoint {
+                    url,
+                    header_name,
+                    header_value,
+                    repo_form: cfg.repo_form.unwrap_or(RepoForm::Path),
+                };
+                provider_mode(&cfg, check, signing_key.as_deref())?
             }
         };
         Ok(Self { mode })
@@ -269,15 +318,9 @@ impl BearerUser {
     }
 }
 
-/// Checks a client credential against upstream's own `info/refs`, which only
-/// advertises to a credential that can clone - unlike a metadata API, which
-/// also answers Guest members and tokens without read access to the code.
 struct Provider {
     client: reqwest::Client,
-    /// `--upstream`, without its credentials.
-    base: String,
-    /// Username paired with a Bearer token when it is forwarded as Basic.
-    bearer_user: BearerUser,
+    check: Check,
     /// `None` leaves validation requests unbounded.
     permits: Option<Semaphore>,
     /// Longest a check waits for one of `permits`.
@@ -288,6 +331,26 @@ struct Provider {
     /// Concurrent checks of one `(credential, repo)` share a single call.
     inflight: Mutex<HashMap<CacheKey, Arc<OnceCell<Verdict>>>>,
     grants: grant::Signer,
+}
+
+/// Where a client credential is checked.
+enum Check {
+    /// `github`/`gitlab`: upstream's own `info/refs`, which only advertises to a
+    /// credential that can clone - unlike a metadata API, which also answers
+    /// Guest members and tokens without read access to the code.
+    Upstream {
+        base: String,
+        /// Username paired with a Bearer token when it is forwarded as Basic.
+        bearer_user: BearerUser,
+    },
+    /// `custom`: any endpoint, with the token interpolated into one header.
+    Endpoint {
+        url: String,
+        header_name: HeaderName,
+        /// Header value template containing `{token}`.
+        header_value: String,
+        repo_form: RepoForm,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -334,7 +397,11 @@ impl Provider {
         *inflight
             .cell
             .get_or_init(|| async {
-                let verdict = self.send(self.request(&cred, repo), repo).await;
+                let verdict = match self.request(&cred, repo) {
+                    Some(req) => self.send(req, repo).await,
+                    // Not representable as a header: no endpoint could accept it.
+                    None => Verdict::Deny,
+                };
                 // Unavailable is never cached: the next request should retry.
                 if verdict != Verdict::Unavailable {
                     self.remember(&key, verdict);
@@ -344,25 +411,43 @@ impl Provider {
             .await
     }
 
-    fn request(&self, cred: &Credential<'_>, repo: &str) -> reqwest::RequestBuilder {
-        // Basic goes upstream verbatim: the username can matter (GitLab job
-        // tokens need `gitlab-ci-token`).
-        let auth = match cred.scheme {
-            Scheme::Basic => cred.raw.clone(),
-            Scheme::Bearer => {
-                let basic =
-                    STANDARD.encode(format!("{}:{}", self.bearer_user.as_str(), cred.token));
-                HeaderValue::from_str(&format!("Basic {basic}"))
-                    .expect("base64 is a valid header value")
+    fn request(&self, cred: &Credential<'_>, repo: &str) -> Option<reqwest::RequestBuilder> {
+        match &self.check {
+            Check::Upstream { base, bearer_user } => {
+                // Basic goes upstream verbatim: the username can matter (GitLab
+                // job tokens need `gitlab-ci-token`).
+                let auth = match cred.scheme {
+                    Scheme::Basic => cred.raw.clone(),
+                    Scheme::Bearer => HeaderValue::from_str(&format!(
+                        "Basic {}",
+                        STANDARD.encode(format!("{}:{}", bearer_user.as_str(), cred.token))
+                    ))
+                    .ok()?,
+                };
+                let url = format!("{base}/{repo}/info/refs?service=git-upload-pack");
+                Some(
+                    self.client
+                        .get(url)
+                        .header(header::AUTHORIZATION, sensitive(auth))
+                        .header("git-protocol", "version=2"),
+                )
             }
-        };
-        self.client
-            .get(format!(
-                "{}/{repo}/info/refs?service=git-upload-pack",
-                self.base
-            ))
-            .header(header::AUTHORIZATION, sensitive(auth))
-            .header("git-protocol", "version=2")
+            Check::Endpoint {
+                url,
+                header_name,
+                header_value,
+                repo_form,
+            } => {
+                let value =
+                    HeaderValue::from_str(&header_value.replace("{token}", &cred.token)).ok()?;
+                let url = url.replace("{repo}", &repo_name(repo, *repo_form));
+                Some(
+                    self.client
+                        .get(url)
+                        .header(header_name.clone(), sensitive(value)),
+                )
+            }
+        }
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, repo: &str) -> Verdict {
@@ -410,7 +495,8 @@ impl Provider {
             read += chunk.len();
         }
         let mut verdict = classify(status, throttled);
-        if verdict == Verdict::Allow && !advertises {
+        if verdict == Verdict::Allow && matches!(self.check, Check::Upstream { .. }) && !advertises
+        {
             verdict = Verdict::Unavailable;
         }
         match verdict {
@@ -538,14 +624,23 @@ fn probe_base(upstream: &str, allow_http: bool) -> Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
+/// Split `--auth-token-header` into its header name and value template.
+fn parse_token_header(line: &str) -> Result<(HeaderName, String)> {
+    if !line.contains("{token}") {
+        bail!("--auth-token-header must contain {{token}}");
+    }
+    let Some((name, value)) = line.split_once(':') else {
+        bail!("--auth-token-header must be a `Name: value` header line");
+    };
+    let name = name.trim();
+    let name = HeaderName::from_bytes(name.as_bytes())
+        .with_context(|| format!("--auth-token-header: invalid header name {name:?}"))?;
+    Ok((name, value.trim().to_string()))
+}
+
 /// Build the provider mode: the reqwest client is built once, at startup, so
 /// the per-request path stays infallible.
-fn provider_mode(
-    cfg: &AuthConfig,
-    base: String,
-    bearer_user: BearerUser,
-    signing_key: Option<&str>,
-) -> Result<Mode> {
+fn provider_mode(cfg: &AuthConfig, check: Check, signing_key: Option<&str>) -> Result<Mode> {
     let grants = grant::Signer::new(signing_key)?;
     if signing_key.is_none() {
         tracing::warn!(
@@ -564,8 +659,7 @@ fn provider_mode(
         .context("build token validation client")?;
     Ok(Mode::Provider(Box::new(Provider {
         client,
-        base,
-        bearer_user,
+        check,
         permits: (cfg.max_concurrent != 0).then(|| Semaphore::new(cfg.max_concurrent)),
         timeout: cfg.timeout,
         ttl: (!cfg.ttl.is_zero()).then_some(cfg.ttl),
@@ -573,6 +667,16 @@ fn provider_mode(
         inflight: Mutex::new(HashMap::new()),
         grants,
     })))
+}
+
+/// The repo name for a custom endpoint's `{repo}`: `.git` stripped, then
+/// encoded per the configured form. `url_safe` names need nothing else.
+fn repo_name(repo: &str, form: RepoForm) -> String {
+    let name = repo.strip_suffix(".git").unwrap_or(repo);
+    match form {
+        RepoForm::Path => name.to_string(),
+        RepoForm::EncodedPath => name.replace('/', "%2F"),
+    }
 }
 
 /// Only RFC 3986 unreserved characters and `/`. Such a name reaches the
@@ -661,11 +765,37 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_flag_combinations_are_rejected() {
-        for provider in [AuthProvider::Github, AuthProvider::Gitlab] {
+    fn provider_flags_without_a_provider_are_rejected() {
+        // A validate URL with the default `none` mode would otherwise serve
+        // anonymously while looking configured.
+        for provider in [AuthProvider::None, AuthProvider::Shared] {
             let err = Auth::build(AuthConfig {
                 serve_token: Some("s3cret".into()),
+                validate_url: Some("http://127.0.0.1:1/v/{repo}".into()),
                 ..config(provider)
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("--auth-validate-url"));
+            let err = Auth::build(AuthConfig {
+                serve_token: Some("s3cret".into()),
+                signing_key: Some(KEY.into()),
+                ..config(provider)
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("--auth-signing-key"));
+        }
+    }
+
+    #[test]
+    fn conflicting_flag_combinations_are_rejected() {
+        for provider in [
+            AuthProvider::Github,
+            AuthProvider::Gitlab,
+            AuthProvider::Custom,
+        ] {
+            let err = Auth::build(AuthConfig {
+                serve_token: Some("s3cret".into()),
+                ..provider_config(provider)
             })
             .unwrap_err();
             assert!(err.to_string().contains("--serve-token"));
@@ -673,16 +803,80 @@ mod tests {
     }
 
     #[test]
+    fn custom_requires_a_repo_template() {
+        let err = Auth::build(AuthConfig {
+            validate_url: Some("http://127.0.0.1:1/validate".into()),
+            ..provider_config(AuthProvider::Custom)
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("{repo}"));
+
+        let no_url = Auth::build(AuthConfig {
+            validate_url: None,
+            ..provider_config(AuthProvider::Custom)
+        })
+        .unwrap_err();
+        assert!(no_url.to_string().contains("--auth-validate-url"));
+
+        // The token must never ride in the URL: transport errors echo it.
+        let leaked = Auth::build(AuthConfig {
+            validate_url: Some("http://127.0.0.1:1/validate/{repo}?t={token}".into()),
+            ..provider_config(AuthProvider::Custom)
+        })
+        .unwrap_err();
+        assert!(leaked.to_string().contains("--auth-token-header"));
+
+        // A header without `{token}` would send nothing, validating everyone.
+        let headerless = Auth::build(AuthConfig {
+            token_header: Some("Authorization: Bearer".into()),
+            ..provider_config(AuthProvider::Custom)
+        })
+        .unwrap_err();
+        assert!(headerless.to_string().contains("{token}"));
+    }
+
+    #[test]
+    fn custom_only_flags_are_rejected_for_profiles() {
+        for provider in [AuthProvider::Github, AuthProvider::Gitlab] {
+            let err = Auth::build(AuthConfig {
+                validate_url: Some("http://127.0.0.1:1/v/{repo}".into()),
+                ..provider_config(provider)
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("--auth-validate-url"));
+
+            let err = Auth::build(AuthConfig {
+                token_header: Some("Authorization: Bearer {token}".into()),
+                ..provider_config(provider)
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("--auth-token-header"));
+
+            let err = Auth::build(AuthConfig {
+                repo_form: Some(RepoForm::EncodedPath),
+                ..provider_config(provider)
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("--auth-repo-form"));
+        }
+    }
+
+    #[test]
     fn profiles_probe_an_http_upstream_without_its_credentials() {
         let p = provider(AuthConfig {
             upstream_base: "https://proxy:secret@git.example.com/prefix/".into(),
-            ..config(AuthProvider::Gitlab)
+            ..provider_config(AuthProvider::Gitlab)
         });
-        assert_eq!(p.base, "https://git.example.com/prefix");
-        assert_eq!(p.bearer_user.as_str(), "oauth2");
+        match &p.check {
+            Check::Upstream { base, bearer_user } => {
+                assert_eq!(base, "https://git.example.com/prefix");
+                assert_eq!(bearer_user.as_str(), "oauth2");
+            }
+            Check::Endpoint { .. } => panic!("gitlab probes upstream"),
+        }
         let err = Auth::build(AuthConfig {
             upstream_base: "file:///srv/git".into(),
-            ..config(AuthProvider::Github)
+            ..provider_config(AuthProvider::Github)
         })
         .unwrap_err();
         assert!(err.to_string().contains("http(s)"));
@@ -690,21 +884,30 @@ mod tests {
 
     #[test]
     fn plain_http_endpoints_need_an_opt_in() {
-        let github = |allow_http| AuthConfig {
-            upstream_base: "http://git.example.com".into(),
-            allow_http,
-            ..config(AuthProvider::Github)
-        };
-        let err = Auth::build(github(false)).unwrap_err();
-        assert!(err.to_string().contains("--auth-allow-http"), "{err}");
-        assert!(Auth::build(github(true)).is_ok());
+        let cases: [fn(bool) -> AuthConfig; 2] = [
+            |allow_http| AuthConfig {
+                upstream_base: "http://git.example.com".into(),
+                allow_http,
+                ..provider_config(AuthProvider::Github)
+            },
+            |allow_http| AuthConfig {
+                validate_url: Some("http://auth.example.com/v/{repo}".into()),
+                allow_http,
+                ..provider_config(AuthProvider::Custom)
+            },
+        ];
+        for case in cases {
+            let err = Auth::build(case(false)).unwrap_err();
+            assert!(err.to_string().contains("--auth-allow-http"), "{err}");
+            assert!(Auth::build(case(true)).is_ok());
+        }
     }
 
     #[test]
     fn timeout_must_be_positive() {
         let err = Auth::build(AuthConfig {
             timeout: Duration::from_secs(0),
-            ..config(AuthProvider::Github)
+            ..provider_config(AuthProvider::Custom)
         })
         .unwrap_err();
         assert!(err.to_string().contains("--auth-timeout-seconds"));
@@ -718,6 +921,21 @@ mod tests {
         assert!(!token_matches("s3cret-extra", "s3cret")); // longer
         assert!(!token_matches("", "s3cret"));
         assert!(token_matches("", "")); // degenerate empty token
+    }
+
+    #[test]
+    fn repo_names_are_encoded_per_form() {
+        assert_eq!(repo_name("owner/repo.git", RepoForm::Path), "owner/repo");
+        assert_eq!(
+            repo_name("owner/repo.git", RepoForm::EncodedPath),
+            "owner%2Frepo"
+        );
+        assert_eq!(
+            repo_name("g/team/p.git", RepoForm::EncodedPath),
+            "g%2Fteam%2Fp"
+        );
+        assert_eq!(repo_name("foo.bar.git", RepoForm::Path), "foo.bar");
+        assert_eq!(repo_name("proj", RepoForm::Path), "proj");
     }
 
     #[test]
@@ -782,6 +1000,15 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_tokens_are_denied_without_a_call() {
+        // A Basic password may decode to bytes no header can carry.
+        let p = provider(provider_config(AuthProvider::Custom));
+        let basic = STANDARD.encode(b"user:bad\r\nInjected: 1");
+        let h = headers(&format!("Basic {basic}"));
+        assert!(p.request(&credential(&h).unwrap(), "r.git").is_none());
+    }
+
+    #[test]
     fn classification_maps_statuses_to_verdicts() {
         assert_eq!(classify(200, false), Verdict::Allow);
         assert_eq!(classify(204, false), Verdict::Allow);
@@ -807,9 +1034,92 @@ mod tests {
         assert!(throttled(&h));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ttl_verdicts_expire() {
+        let p = provider(AuthConfig {
+            ttl: Duration::from_secs(1),
+            ..provider_config(AuthProvider::Custom)
+        });
+        let key = key();
+        assert_eq!(p.cached(&key), None);
+        p.remember(&key, Verdict::Allow);
+        assert_eq!(p.cached(&key), Some(Verdict::Allow));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(p.cached(&key), None);
+        // The expired entry is dropped, not merely ignored.
+        assert!(p.verdicts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ttl_zero_disables_reuse() {
+        let p = provider(provider_config(AuthProvider::Custom));
+        let key = key();
+        p.remember(&key, Verdict::Allow);
+        assert_eq!(p.cached(&key), None);
+        assert!(p.verdicts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_verdict_cache_is_bounded() {
+        let p = provider(AuthConfig {
+            ttl: Duration::from_secs(60),
+            ..provider_config(AuthProvider::Custom)
+        });
+        for i in 0..VERDICT_CAPACITY.get() + 10 {
+            let key = CacheKey {
+                credential: [0; 32],
+                repo: format!("r{i}.git"),
+            };
+            p.remember(&key, Verdict::Deny);
+        }
+        assert_eq!(p.verdicts.lock().unwrap().len(), VERDICT_CAPACITY.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_limit_fails_closed() {
+        let p = provider(AuthConfig {
+            max_concurrent: 1,
+            ..provider_config(AuthProvider::Custom)
+        });
+        let _held = p.permits.as_ref().unwrap().acquire().await.unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            p.check(&headers("Bearer tok"), "r.git").await,
+            Verdict::Unavailable
+        );
+        // Waited out the timeout for a slot, rather than failing on the
+        // unreachable endpoint.
+        assert_eq!(start.elapsed(), p.timeout);
+    }
+
+    #[test]
+    fn a_zero_limit_is_unbounded() {
+        let p = provider(AuthConfig {
+            max_concurrent: 0,
+            ..provider_config(AuthProvider::Custom)
+        });
+        assert!(p.permits.is_none());
+    }
+
+    #[test]
+    fn the_last_inflight_caller_removes_the_entry() {
+        let p = provider(provider_config(AuthProvider::Custom));
+        let key = key();
+        let first = p.join(&key);
+        let second = p.join(&key);
+        assert!(
+            Arc::ptr_eq(&first.cell, &second.cell),
+            "callers share a call"
+        );
+        drop(first);
+        assert_eq!(p.inflight.lock().unwrap().len(), 1);
+        drop(second);
+        assert!(p.inflight.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn lfs_objects_need_a_grant_for_exactly_that_object() {
-        let auth = Auth::build(config(AuthProvider::Github)).unwrap();
+        let auth = Auth::build(provider_config(AuthProvider::Github)).unwrap();
         let grant = auth.lfs_grant("r.git", "oid", 7).unwrap();
         let h = headers(&grant.authorization);
         let object = |repo, size| Target::LfsObject {
@@ -840,123 +1150,38 @@ mod tests {
         let shared = Auth::shared("s3cret").lfs_grant("r", "oid", 1).unwrap();
         assert_eq!(shared.authorization, "Bearer s3cret");
         assert_eq!(shared.expires_in, None);
-        let auth = Auth::build(config(AuthProvider::Github)).unwrap();
+        let auth = Auth::build(provider_config(AuthProvider::Custom)).unwrap();
         let grant = auth.lfs_grant("r", "oid", 1).unwrap();
         assert!(grant.authorization.starts_with("Bearer gcp1."));
         assert_eq!(grant.expires_in, Some(grant::LIFETIME));
     }
 
-    #[test]
-    fn a_signing_key_without_a_provider_is_rejected() {
-        for provider in [AuthProvider::None, AuthProvider::Shared] {
-            let err = Auth::build(AuthConfig {
-                serve_token: Some("s3cret".into()),
-                signing_key: Some(KEY.into()),
-                ..config(provider)
-            })
-            .unwrap_err();
-            assert!(err.to_string().contains("--auth-signing-key"));
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ttl_verdicts_expire() {
-        let p = provider(AuthConfig {
-            ttl: Duration::from_secs(1),
-            ..config(AuthProvider::Github)
-        });
-        let key = key();
-        assert_eq!(p.cached(&key), None);
-        p.remember(&key, Verdict::Allow);
-        assert_eq!(p.cached(&key), Some(Verdict::Allow));
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert_eq!(p.cached(&key), None);
-        // The expired entry is dropped, not merely ignored.
-        assert!(p.verdicts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ttl_zero_disables_reuse() {
-        let p = provider(config(AuthProvider::Github));
-        let key = key();
-        p.remember(&key, Verdict::Allow);
-        assert_eq!(p.cached(&key), None);
-        assert!(p.verdicts.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn the_verdict_cache_is_bounded() {
-        let p = provider(AuthConfig {
-            ttl: Duration::from_secs(60),
-            ..config(AuthProvider::Github)
-        });
-        for i in 0..VERDICT_CAPACITY.get() + 10 {
-            let key = CacheKey {
-                credential: [0; 32],
-                repo: format!("r{i}.git"),
-            };
-            p.remember(&key, Verdict::Deny);
-        }
-        assert_eq!(p.verdicts.lock().unwrap().len(), VERDICT_CAPACITY.get());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_saturated_limit_fails_closed() {
-        let p = provider(AuthConfig {
-            max_concurrent: 1,
-            ..config(AuthProvider::Github)
-        });
-        let _held = p.permits.as_ref().unwrap().acquire().await.unwrap();
-        let start = Instant::now();
-        assert_eq!(
-            p.check(&headers("Bearer tok"), "r.git").await,
-            Verdict::Unavailable
-        );
-        // Waited out the timeout for a slot, rather than failing on the
-        // unreachable endpoint.
-        assert_eq!(start.elapsed(), p.timeout);
-    }
-
-    #[test]
-    fn a_zero_limit_is_unbounded() {
-        let p = provider(AuthConfig {
-            max_concurrent: 0,
-            ..config(AuthProvider::Github)
-        });
-        assert!(p.permits.is_none());
-    }
-
-    #[test]
-    fn the_last_inflight_caller_removes_the_entry() {
-        let p = provider(config(AuthProvider::Github));
-        let key = key();
-        let first = p.join(&key);
-        let second = p.join(&key);
-        assert!(
-            Arc::ptr_eq(&first.cell, &second.cell),
-            "callers share a call"
-        );
-        drop(first);
-        assert_eq!(p.inflight.lock().unwrap().len(), 1);
-        drop(second);
-        assert!(p.inflight.lock().unwrap().is_empty());
-    }
-
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
-    /// Every provider mode gets a shared signing key; `none` and `shared`
-    /// reject one, so they get none.
     fn config(provider: AuthProvider) -> AuthConfig {
         AuthConfig {
             provider,
             serve_token: None,
-            signing_key: matches!(provider, AuthProvider::Github | AuthProvider::Gitlab)
-                .then(|| KEY.into()),
+            validate_url: None,
+            token_header: None,
+            repo_form: None,
+            signing_key: None,
             timeout: Duration::from_secs(10),
             ttl: Duration::from_secs(0),
             max_concurrent: 32,
             allow_http: false,
             upstream_base: "https://upstream.invalid".into(),
+        }
+    }
+
+    /// A valid config for a provider mode: custom gets its endpoint, every
+    /// provider a shared signing key.
+    fn provider_config(provider: AuthProvider) -> AuthConfig {
+        AuthConfig {
+            validate_url: (provider == AuthProvider::Custom)
+                .then(|| "https://127.0.0.1:1/validate/{repo}".into()),
+            signing_key: Some(KEY.into()),
+            ..config(provider)
         }
     }
 

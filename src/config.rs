@@ -28,6 +28,9 @@ pub enum AuthProvider {
     Github,
     /// Like `github`; a bare token is sent as Basic `oauth2:<token>`.
     Gitlab,
+    /// Validate each request's token against any HTTP endpoint given
+    /// by `--auth-validate-url`.
+    Custom,
 }
 
 impl fmt::Display for AuthProvider {
@@ -38,6 +41,19 @@ impl fmt::Display for AuthProvider {
             .get_name()
             .fmt(f)
     }
+}
+
+/// How the repo path of a request is presented to the validation endpoint.
+/// Provider modes only admit names of RFC 3986 unreserved characters and `/`,
+/// so no other byte ever needs encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RepoForm {
+    /// `owner/repo`: strip a `.git` suffix (REST-style: one path component per
+    /// segment).
+    Path,
+    /// `owner%2Frepo`: strip `.git`, then percent-encode each `/` (single-parameter
+    /// style, as GitLab's `/projects/{id}` wants).
+    EncodedPath,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -80,7 +96,7 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_SERVE_TOKEN", hide_env_values = true)]
     pub serve_token: Option<String>,
 
-    /// Client-auth mode. `github`/`gitlab` validate each request's
+    /// Client-auth mode. `github`/`gitlab`/`custom` validate each request's
     /// credential for the repo it names before any serving, so a client only
     /// reaches what its own credential could clone directly - the blast radius
     /// of one leaked runner token is that runner's repos, not the fleet's. The
@@ -100,6 +116,23 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_AUTH_SIGNING_KEY", hide_env_values = true)]
     pub auth_signing_key: Option<String>,
 
+    /// `custom` only: URL template of the validation endpoint, with `{repo}`
+    /// interpolated (already encoded per `--auth-repo-form`). The token must go
+    /// in `--auth-token-header`, not this URL.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_VALIDATE_URL")]
+    pub auth_validate_url: Option<String>,
+
+    /// `custom` only: header line template presenting the client token, with
+    /// `{token}` interpolated - any scheme the endpoint wants, e.g.
+    /// `PRIVATE-TOKEN: {token}`.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_TOKEN_HEADER")]
+    pub auth_token_header: Option<String>,
+
+    /// `custom` only: how the repo name is encoded into `--auth-validate-url`'s
+    /// `{repo}` placeholder.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_REPO_FORM", value_enum)]
+    pub auth_repo_form: Option<RepoForm>,
+
     /// Total budget for one token-validation request. A hung API must not pin
     /// a clone request on its own.
     #[arg(long, env = "GITCACHEPROXY_AUTH_TIMEOUT_SECONDS", default_value_t = 10)]
@@ -113,9 +146,9 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_AUTH_MAX_CONCURRENT", default_value_t = 32)]
     pub auth_max_concurrent: usize,
 
-    /// Provider modes: allow an `http://` `--upstream` to validate against. Off
-    /// by default: every client credential would cross the network in
-    /// cleartext.
+    /// Provider modes: allow an `http://` validation endpoint (`--upstream` for
+    /// `github`/`gitlab`, `--auth-validate-url` for `custom`). Off by default:
+    /// every client credential would cross the network in cleartext.
     #[arg(long, env = "GITCACHEPROXY_AUTH_ALLOW_HTTP")]
     pub auth_allow_http: bool,
 

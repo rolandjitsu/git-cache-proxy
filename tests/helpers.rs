@@ -157,6 +157,9 @@ pub fn github_auth_config(base: &str, ttl_secs: u64) -> AuthConfig {
     AuthConfig {
         provider: AuthProvider::Github,
         serve_token: None,
+        validate_url: None,
+        token_header: None,
+        repo_form: None,
         signing_key: Some(SIGNING_KEY.into()),
         timeout: Duration::from_secs(5),
         ttl: Duration::from_secs(ttl_secs),
