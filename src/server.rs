@@ -11,12 +11,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::auth;
@@ -29,7 +30,6 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 const UPLOAD_PACK: &str = "git-upload-pack";
 const RECEIVE_PACK: &str = "git-receive-pack";
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
-const LFS_BATCH_SUFFIX: &str = "/info/lfs/objects/batch";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -66,13 +66,102 @@ pub fn router(state: AppState) -> Router {
     // clone of the service (axum clones it per connection) makes the cap
     // process-wide rather than per-connection. `merge` keeps the (limited)
     // fallback as the merged fallback, while the observability routes above are
-    // matched first and bypass it.
-    let mut git = Router::new().fallback(handle_git).with_state(state);
+    // matched first and bypass it. The gate runs outside the limit, so refused
+    // requests never hold the permits serving needs.
+    let mut git = Router::new().fallback(handle_git);
     if max_concurrent != 0 {
         git = git.layer(GlobalConcurrencyLimitLayer::new(max_concurrent));
     }
+    let git = git
+        .layer(middleware::from_fn_with_state(state.clone(), gate))
+        .with_state(state);
 
     observability.merge(git)
+}
+
+/// A git or LFS request, classified once so that the gate and the handler agree
+/// on what is served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route {
+    InfoRefs {
+        repo: String,
+        smart: bool,
+    },
+    UploadPack {
+        repo: String,
+    },
+    LfsBatch {
+        repo: String,
+    },
+    LfsObject {
+        repo: String,
+        oid: String,
+        size: Option<u64>,
+    },
+    NotFound,
+}
+
+impl Route {
+    /// Callers refuse pushes first (`is_push`); a push path is not a route.
+    fn parse(method: &Method, path: &str, query: &str) -> Self {
+        if *method == Method::GET
+            && let Some(repo) = repo::repo_name_from_path(path, "/info/refs")
+        {
+            let smart = query.contains(&format!("service={UPLOAD_PACK}"));
+            return Route::InfoRefs { repo, smart };
+        }
+        if *method == Method::POST
+            && let Some(repo) = repo::repo_name_from_path(path, &format!("/{UPLOAD_PACK}"))
+        {
+            return Route::UploadPack { repo };
+        }
+        if *method == Method::POST
+            && let Some(repo) = repo::lfs_batch_repo(path)
+        {
+            return Route::LfsBatch { repo };
+        }
+        if *method == Method::GET
+            && let Some((repo, oid)) = repo::lfs_object_from_path(path)
+        {
+            let size = size_from_query(query);
+            return Route::LfsObject { repo, oid, size };
+        }
+        Route::NotFound
+    }
+
+    /// Whether auth runs: not for a route refused for everyone.
+    fn needs_auth(&self) -> bool {
+        !matches!(self, Route::InfoRefs { smart: false, .. })
+    }
+}
+
+fn is_push(path: &str, query: &str) -> bool {
+    path.ends_with(&format!("/{RECEIVE_PACK}"))
+        || query.contains(&format!("service={RECEIVE_PACK}"))
+}
+
+/// Refuse pushes, then authenticate the classified route and hand it to
+/// `handle_git`. A push, like a dumb-http `info/refs`, is refused for everyone,
+/// so there is nothing to authenticate.
+async fn gate(State(st): State<AppState>, mut req: Request<Body>, next: Next) -> Response {
+    let path = req.uri().path();
+    let query = req.uri().query().unwrap_or("");
+    if is_push(path, query) {
+        st.metrics
+            .record_request(RequestKind::ReceivePack, Status::Rejected, "-");
+        return err(
+            StatusCode::FORBIDDEN,
+            "read-only proxy: pushes are not allowed",
+        );
+    }
+    let route = Route::parse(req.method(), path, query);
+    if route.needs_auth() && st.auth.check(req.headers()) == auth::Verdict::Deny {
+        st.metrics
+            .record_request(RequestKind::Auth, Status::Unauthorized, "-");
+        return err(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    }
+    req.extensions_mut().insert(route);
+    next.run(req).await
 }
 
 async fn metrics_handler(State(st): State<AppState>) -> Response {
@@ -114,93 +203,67 @@ async fn cache_writable(cache_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response {
+async fn handle_git(
+    State(st): State<AppState>,
+    Extension(route): Extension<Route>,
+    req: Request<Body>,
+) -> Response {
     let (parts, body) = req.into_parts();
-    let path = parts.uri.path().to_string();
-    let query = parts.uri.query().unwrap_or("").to_string();
     let git_protocol = parts
         .headers
         .get("git-protocol")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    if st.auth.check(&parts.headers) == auth::Verdict::Deny {
-        st.metrics
-            .record_request(RequestKind::Auth, Status::Unauthorized, "-");
-        return err(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
-    }
-
-    // Read-only: refuse anything that would write upstream.
-    if path.ends_with(&format!("/{RECEIVE_PACK}"))
-        || query.contains(&format!("service={RECEIVE_PACK}"))
-    {
-        st.metrics
-            .record_request(RequestKind::ReceivePack, Status::Rejected, "-");
-        return err(
-            StatusCode::FORBIDDEN,
-            "read-only proxy: pushes are not allowed",
-        );
-    }
-
-    if parts.method == Method::GET && path.ends_with("/info/refs") {
-        if !query.contains(&format!("service={UPLOAD_PACK}")) {
+    match route {
+        Route::InfoRefs { smart: false, .. } => {
             st.metrics
                 .record_request(RequestKind::InfoRefs, Status::Error, "-");
-            return err(
+            err(
                 StatusCode::BAD_REQUEST,
                 "only smart-http git-upload-pack is supported",
-            );
+            )
         }
-        return info_refs(st, &path, git_protocol.as_deref()).await;
+        Route::InfoRefs { repo, smart: true } => {
+            info_refs(st, &repo, git_protocol.as_deref()).await
+        }
+        Route::UploadPack { repo } => {
+            let body = match axum::body::to_bytes(body, MAX_BODY).await {
+                Ok(b) => b,
+                Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
+            };
+            // Git's smart-HTTP client gzips the upload-pack request body (any
+            // normally-sized want/have negotiation) and sends `Content-Encoding:
+            // gzip`. `git upload-pack` reads its stdin as raw pkt-lines, so we must
+            // undo the transport encoding before handing the body over - otherwise
+            // it chokes on the gzip magic with "bad line length character".
+            let content_encoding = parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok());
+            let body = match decode_body(content_encoding, body, st.max_decoded_body) {
+                Ok(b) => b,
+                Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
+            };
+            upload_pack(st, &repo, git_protocol.as_deref(), body).await
+        }
+        // git-LFS uses a different HTTP API alongside the git endpoints.
+        Route::LfsBatch { repo } => {
+            let body = match axum::body::to_bytes(body, MAX_BODY).await {
+                Ok(b) => b,
+                Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
+            };
+            lfs_batch(st, &repo, &parts.headers, body).await
+        }
+        Route::LfsObject { repo, oid, size } => lfs_object(st, repo, oid, size).await,
+        Route::NotFound => err(StatusCode::NOT_FOUND, "not a git smart-http endpoint"),
     }
-
-    if parts.method == Method::POST && path.ends_with(&format!("/{UPLOAD_PACK}")) {
-        let body = match axum::body::to_bytes(body, MAX_BODY).await {
-            Ok(b) => b,
-            Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
-        };
-        // Git's smart-HTTP client gzips the upload-pack request body (any
-        // normally-sized want/have negotiation) and sends `Content-Encoding:
-        // gzip`. `git upload-pack` reads its stdin as raw pkt-lines, so we must
-        // undo the transport encoding before handing the body over - otherwise
-        // it chokes on the gzip magic with "bad line length character".
-        let content_encoding = parts
-            .headers
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok());
-        let body = match decode_body(content_encoding, body, st.max_decoded_body) {
-            Ok(b) => b,
-            Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
-        };
-        return upload_pack(st, &path, git_protocol.as_deref(), body).await;
-    }
-
-    // git-LFS uses a different HTTP API alongside the git endpoints.
-    if parts.method == Method::POST && path.ends_with(LFS_BATCH_SUFFIX) {
-        let body = match axum::body::to_bytes(body, MAX_BODY).await {
-            Ok(b) => b,
-            Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
-        };
-        return lfs_batch(st, &path, &parts.headers, body).await;
-    }
-    if parts.method == Method::GET
-        && let Some((repo_name, oid)) = repo::lfs_object_from_path(&path)
-    {
-        return lfs_object(st, repo_name, oid, &query).await;
-    }
-
-    err(StatusCode::NOT_FOUND, "not a git smart-http endpoint")
 }
 
 /// Proxy an LFS batch request to upstream, rewriting each object's download URL back
 /// to this proxy so the object fetch is cached here. An `upload` batch is refused:
 /// the proxy is read-only, like `git-receive-pack`.
-async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -> Response {
-    let Some(name) = repo::lfs_batch_repo(path) else {
-        st.metrics
-            .record_request(RequestKind::LfsBatch, Status::Error, "-");
-        return err(StatusCode::NOT_FOUND, "bad lfs batch path");
-    };
+async fn lfs_batch(st: AppState, name: &str, headers: &HeaderMap, body: Bytes) -> Response {
     if is_lfs_upload(&body) {
         st.metrics
             .record_request(RequestKind::LfsBatch, Status::Rejected, "-");
@@ -210,10 +273,10 @@ async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -
         );
     }
     let advertise = advertise_base(headers);
-    match st.lfs.batch(&name, &body, &advertise).await {
+    match st.lfs.batch(name, &body, &advertise).await {
         Ok(json) => {
             st.metrics
-                .record_request(RequestKind::LfsBatch, Status::Ok, &name);
+                .record_request(RequestKind::LfsBatch, Status::Ok, name);
             Response::builder()
                 .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
                 .header(header::CACHE_CONTROL, "no-cache")
@@ -232,8 +295,7 @@ async fn lfs_batch(st: AppState, path: &str, headers: &HeaderMap, body: Bytes) -
 /// Serve a cached LFS object, fetching and caching it from upstream on a miss. The
 /// `repo` label is `-` because objects are content-addressed and shared across repos
 /// (the cache hit/miss is tracked separately in `lfs_objects_total`).
-async fn lfs_object(st: AppState, repo_name: String, oid: String, query: &str) -> Response {
-    let size = size_from_query(query);
+async fn lfs_object(st: AppState, repo_name: String, oid: String, size: Option<u64>) -> Response {
     match st.lfs.ensure_object(&repo_name, &oid, size).await {
         Ok((path, outcome)) => {
             st.metrics.record_lfs(match outcome {
@@ -317,13 +379,8 @@ fn advertise_base(headers: &HeaderMap) -> String {
     format!("{scheme}://{host}")
 }
 
-async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Response {
-    let Some(name) = repo::repo_name_from_path(path, "/info/refs") else {
-        st.metrics
-            .record_request(RequestKind::InfoRefs, Status::Error, "-");
-        return err(StatusCode::NOT_FOUND, "bad path");
-    };
-    let repo = match repo::resolve(&name, &st.upstream_base, &st.cache_root) {
+async fn info_refs(st: AppState, name: &str, git_protocol: Option<&str>) -> Response {
+    let repo = match repo::resolve(name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
             st.metrics
@@ -353,7 +410,7 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
     match st.cache.advertise_refs(&repo, git_protocol).await {
         Ok(body) => {
             st.metrics
-                .record_request(RequestKind::InfoRefs, Status::Ok, &name);
+                .record_request(RequestKind::InfoRefs, Status::Ok, name);
             Response::builder()
                 .header(
                     header::CONTENT_TYPE,
@@ -374,16 +431,11 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
 
 async fn upload_pack(
     st: AppState,
-    path: &str,
+    name: &str,
     git_protocol: Option<&str>,
     body: Bytes,
 ) -> Response {
-    let Some(name) = repo::repo_name_from_path(path, &format!("/{UPLOAD_PACK}")) else {
-        st.metrics
-            .record_request(RequestKind::UploadPack, Status::Error, "-");
-        return err(StatusCode::NOT_FOUND, "bad path");
-    };
-    let repo = match repo::resolve(&name, &st.upstream_base, &st.cache_root) {
+    let repo = match repo::resolve(name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
             st.metrics
@@ -405,7 +457,7 @@ async fn upload_pack(
     match st.cache.upload_pack_rpc(&repo, git_protocol, body).await {
         Ok(stream) => {
             st.metrics
-                .record_request(RequestKind::UploadPack, Status::Ok, &name);
+                .record_request(RequestKind::UploadPack, Status::Ok, name);
             Response::builder()
                 .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
                 .header(header::CACHE_CONTROL, "no-cache")

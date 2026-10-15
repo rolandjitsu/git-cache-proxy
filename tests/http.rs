@@ -162,19 +162,31 @@ async fn serve_token_required_when_configured() {
 
 #[tokio::test]
 async fn valid_token_passes_auth() {
-    // The correct bearer takes the shared check's success path; the request is
-    // then refused as a push (read-only). Reaching that 403 proves auth was
-    // accepted, not short-circuited with a 401.
+    // The correct bearer clears auth; the path is then not a git endpoint.
+    // Reaching that 404 proves auth was accepted, not short-circuited with a 401.
     let resp = router(state(shared("s3cret")))
         .oneshot(
-            Request::get("/repo.git/info/refs?service=git-receive-pack")
+            Request::get("/not/a/git/endpoint")
                 .header(header::AUTHORIZATION, "Bearer s3cret")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pushes_and_dumb_http_are_refused_before_auth() {
+    // Refused for everyone, so there is nothing to authenticate.
+    let resp = get(
+        state(shared("s3cret")),
+        "/repo.git/info/refs?service=git-receive-pack",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = get(state(shared("s3cret")), "/repo.git/info/refs").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -284,21 +296,21 @@ async fn concurrency_limit_serializes_without_deadlock() {
     // The limit wraps the git-serving fallback (health/readiness/metrics are
     // exempt), and is shared across per-connection service clones. Three
     // concurrent requests through a limit of 1 must serialize and all still
-    // complete - proving permits are released and reused, not leaked. The
-    // push-rejection path is a limited route that returns without upstream work.
+    // complete - proving permits are released and reused, not leaked. A
+    // dumb-http info/refs is a limited route that returns without upstream work.
     let mut st = state(anon());
     st.max_concurrent = 1;
     let app = router(st);
     let hit = || {
         app.clone().oneshot(
-            Request::get("/repo.git/info/refs?service=git-receive-pack")
+            Request::get("/repo.git/info/refs")
                 .body(Body::empty())
                 .unwrap(),
         )
     };
     let (a, b, c) = tokio::join!(hit(), hit(), hit());
     for r in [a, b, c] {
-        assert_eq!(r.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(r.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 }
 
