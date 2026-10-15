@@ -85,6 +85,9 @@ async fn main() -> Result<()> {
     let auth = Arc::new(auth::Auth::build(auth::AuthConfig {
         provider: cfg.auth_provider,
         serve_token: cfg.serve_token,
+        validate_url: cfg.auth_validate_url,
+        token_header: cfg.auth_token_header,
+        repo_form: cfg.auth_repo_form,
         signing_key: cfg.auth_signing_key,
         timeout: Duration::from_secs(cfg.auth_timeout_seconds),
         ttl: Duration::from_secs(cfg.auth_ttl_seconds),

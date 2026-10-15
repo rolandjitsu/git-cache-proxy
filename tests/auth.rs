@@ -14,7 +14,7 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use git_cache_proxy::auth::{Auth, AuthConfig};
-use git_cache_proxy::config::AuthProvider;
+use git_cache_proxy::config::{AuthProvider, RepoForm};
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
@@ -228,10 +228,86 @@ async fn invalid_repo_names_are_denied_without_validation() {
     );
 }
 
+#[tokio::test]
+async fn custom_validates_against_its_endpoint() {
+    let (base, hits) = spawn_validator(Reply::Ok).await;
+    let resp = get(state(custom(&base, None)), REFS, Some("Bearer good-token")).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "auth must clear");
+    let hits = hits.lock().await;
+    assert_eq!(hits.len(), 1);
+    // The repo from the request path reached the endpoint, `.git` stripped, and
+    // the client token rode along as a bearer.
+    assert_eq!(hits[0].uri, "/validate/repo");
+    assert_eq!(hits[0].authorization.as_deref(), Some("Bearer good-token"));
+}
+
+#[tokio::test]
+async fn custom_presents_a_basic_password_as_the_token() {
+    let (base, hits) = spawn_validator(Reply::Ok).await;
+    // What git's credential helpers produce: any username, the token as the
+    // password (the actions/checkout shape is x-access-token).
+    let basic = STANDARD.encode(b"x-access-token:good-token");
+    let resp = get(
+        state(custom(&base, None)),
+        REFS,
+        Some(&format!("Basic {basic}")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "auth must clear");
+    let hits = hits.lock().await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].authorization.as_deref(),
+        Some("Bearer good-token"),
+        "the password reached the endpoint"
+    );
+}
+
+#[tokio::test]
+async fn unrepresentable_tokens_are_denied_without_a_call() {
+    let (base, hits) = spawn_validator(Reply::Ok).await;
+    let basic = STANDARD.encode(b"user:bad\r\nInjected: 1");
+    let resp = get(
+        state(custom(&base, None)),
+        REFS,
+        Some(&format!("Basic {basic}")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(hits.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn custom_repo_forms_reach_the_endpoint() {
+    let (base, hits) = spawn_validator(Reply::Ok).await;
+    let resp = get(
+        state(custom(&base, Some(RepoForm::EncodedPath))),
+        "/g/p.git/info/refs?service=git-upload-pack",
+        Some("Bearer good-token"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "auth must clear");
+    assert_eq!(hits.lock().await[0].uri, "/validate/g%2Fp");
+}
+
 // --- test helpers --------------------------------------------------------
 
 fn build(base: &str, ttl: u64) -> Arc<Auth> {
     Arc::new(Auth::build(github_auth_config(base, ttl)).unwrap())
+}
+
+/// `custom` validating against the mock's `/validate/{repo}`.
+fn custom(base: &str, repo_form: Option<RepoForm>) -> Arc<Auth> {
+    Arc::new(
+        Auth::build(AuthConfig {
+            provider: AuthProvider::Custom,
+            validate_url: Some(format!("{base}/validate/{{repo}}")),
+            repo_form,
+            upstream_base: "https://upstream.invalid".into(),
+            ..github_auth_config(base, 0)
+        })
+        .unwrap(),
+    )
 }
 
 fn state(auth: Arc<Auth>) -> AppState {

@@ -217,8 +217,11 @@ Every flag has an environment-variable equivalent.
 | `--upstream`             | `GITCACHEPROXY_UPSTREAM`             | - (required)                 | Origin git base URL                                                            |
 | `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
-| `--auth-provider`        | `GITCACHEPROXY_AUTH_PROVIDER`        | `none`                       | Client-auth mode: `none`, `shared`, `github`, `gitlab` (see Auth model). Passing only `--serve-token` keeps the legacy shared-secret behavior |
+| `--auth-provider`        | `GITCACHEPROXY_AUTH_PROVIDER`        | `none`                       | Client-auth mode: `none`, `shared`, `github`, `gitlab`, `custom` (see Auth model). Passing only `--serve-token` keeps the legacy shared-secret behavior |
 | `--auth-signing-key`     | `GITCACHEPROXY_AUTH_SIGNING_KEY`     | random per process           | Provider modes: HMAC key (at least 32 bytes) signing LFS download grants; every replica behind one address needs the same key |
+| `--auth-validate-url`    | `GITCACHEPROXY_AUTH_VALIDATE_URL`    | -                            | `custom` only: URL template of the validation endpoint, with `{repo}` interpolated (the token goes in `--auth-token-header`, never the URL) |
+| `--auth-token-header`    | `GITCACHEPROXY_AUTH_TOKEN_HEADER`    | `Authorization: Bearer {token}` | `custom` only: header line presenting the client token to the endpoint, with `{token}` interpolated, e.g. `PRIVATE-TOKEN: {token}` |
+| `--auth-repo-form`       | `GITCACHEPROXY_AUTH_REPO_FORM`       | `path`                       | `custom` only: repo encoding for `{repo}` - `path` (`owner/repo`) or `encoded-path` (`owner%2Frepo`, GitLab-style) |
 | `--auth-timeout-seconds` | `GITCACHEPROXY_AUTH_TIMEOUT_SECONDS` | `10`                         | Budget for one token-validation request, shared by the `--auth-max-concurrent` slot wait and the HTTP call |
 | `--auth-ttl-seconds`     | `GITCACHEPROXY_AUTH_TTL_SECONDS`     | `0`                          | Reuse a validation verdict per `(credential, repo)` for this many seconds, so the requests of one clone, or repeated submodule fetches, validate once (`0` = validate every request) |
 | `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
@@ -306,11 +309,11 @@ Notes:
   <user:token>` (git's credential helpers and tokened clone URLs), and answers
   a 401 with a Basic challenge so git sends them.
 
-### Per-request token validation (`--auth-provider github|gitlab`)
+### Per-request token validation (`--auth-provider github|gitlab|custom`)
 
 With a shared serve token, anyone who can reach the proxy can read every repo
-its upstream credential can. In `github`/`gitlab` mode the proxy instead
-checks each request's credential *for the repo that request names*,
+its upstream credential can. In `github`/`gitlab`/`custom` mode the proxy
+instead checks each request's credential *for the repo that request names*,
 before any upstream or mirror work - so a client only reaches what its own
 credential could clone directly, and a CI fleet can run on short-lived per-job
 tokens. The repo that is checked is exactly the repo that is served, so a
@@ -318,14 +321,15 @@ credential can never be checked against one repo while fetching another: repo
 names must consist of letters, digits, `-`, `.`, `_`, `~`, and `/`, since a
 `%` escape could decode to a different path upstream than at the check.
 
-The probed `--upstream` receives every client credential, so it must be
-`https://` unless `--auth-allow-http` is set (e.g. for an in-cluster git server
+The validation endpoint receives every client credential, so it must be
+`https://` unless `--auth-allow-http` is set (e.g. for an in-cluster endpoint
 on a trusted network).
 
 | Provider | Check | Notes |
 | -------- | ----- | ----- |
 | `github` | `GET {upstream}/{repo}/info/refs?service=git-upload-pack` (protocol v2) | Basic is forwarded as sent; a Bearer token goes as Basic `x-access-token:<token>` |
 | `gitlab` | same | Basic is forwarded as sent (CI job tokens need the `gitlab-ci-token` username); a Bearer token goes as Basic `oauth2:<token>` |
+| `custom` | `GET --auth-validate-url` with `--auth-token-header` | Any HTTP endpoint: 2xx allows, 401/403/404 rejects |
 
 `github` and `gitlab` ask upstream's own git endpoint rather than a REST API: a
 metadata API also answers credentials that cannot read the code (GitHub tokens
@@ -405,7 +409,7 @@ explicit before you expose it:
   read_ - including repos a given client could not read directly. Restrict who
   can reach the proxy (private network, security group, mTLS at the ingress).
 - **Per-request validation bounds, not replaces, reachability.** In
-  `--auth-provider github/gitlab` mode each request must carry a
+  `--auth-provider github/gitlab/custom` mode each request must carry a
   credential that can clone *that repo*, so a leaked client token only exposes
   what that token already exposed; "can reach the port" becomes "can run an
   unauthenticated guessing attack against the validation endpoint". Validation
