@@ -17,9 +17,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use subtle::ConstantTimeEq;
 use tower::limit::GlobalConcurrencyLimitLayer;
 
+use crate::auth;
 use crate::git::GitCache;
 use crate::lfs::{Lfs, Outcome};
 use crate::metrics::{LfsResult, Metrics, RequestKind, Status};
@@ -37,7 +37,7 @@ pub struct AppState {
     pub lfs: Arc<Lfs>,
     pub upstream_base: String,
     pub cache_root: PathBuf,
-    pub serve_token: Option<String>,
+    pub auth: Arc<auth::Auth>,
     /// Upper bound (bytes) on a decoded upload-pack request body. See
     /// `Config::max_decoded_body_mb`.
     pub max_decoded_body: usize,
@@ -124,10 +124,10 @@ async fn handle_git(State(st): State<AppState>, req: Request<Body>) -> Response 
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    if let Some(resp) = check_auth(&st, &parts.headers) {
+    if st.auth.check(&parts.headers) == auth::Verdict::Deny {
         st.metrics
             .record_request(RequestKind::Auth, Status::Unauthorized, "-");
-        return resp;
+        return err(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
     }
 
     // Read-only: refuse anything that would write upstream.
@@ -421,31 +421,6 @@ async fn upload_pack(
     }
 }
 
-/// When a serve token is configured, require `Authorization: Bearer <token>`.
-/// Returns `Some(401)` to short-circuit, `None` to allow.
-fn check_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let expected = st.serve_token.as_ref()?;
-    let provided = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if provided.is_some_and(|t| token_matches(t, expected)) {
-        None
-    } else {
-        Some(err(
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid bearer token",
-        ))
-    }
-}
-
-/// Compare a client-supplied bearer token against the expected one in constant
-/// time, so response latency does not leak how many leading bytes matched. Only
-/// the length can differ observably, which is not sensitive for a shared secret.
-fn token_matches(provided: &str, expected: &str) -> bool {
-    provided.as_bytes().ct_eq(expected.as_bytes()).into()
-}
-
 /// Undo the request's `Content-Encoding`. Git only ever gzips, so that is the
 /// single encoding we decode; an absent/`identity` header passes through
 /// untouched, and any other encoding is rejected by the caller as a bad body.
@@ -562,16 +537,6 @@ mod tests {
     fn unsupported_encoding_is_rejected() {
         assert!(decode_body(Some("br"), Bytes::from_static(b"x"), 1024).is_err());
         assert!(decode_body(Some("deflate"), Bytes::from_static(b"x"), 1024).is_err());
-    }
-
-    #[test]
-    fn token_matches_only_the_exact_token() {
-        assert!(token_matches("s3cret", "s3cret"));
-        assert!(!token_matches("s3creT", "s3cret")); // last byte differs
-        assert!(!token_matches("s3cre", "s3cret")); // prefix, shorter
-        assert!(!token_matches("s3cret-extra", "s3cret")); // longer
-        assert!(!token_matches("", "s3cret"));
-        assert!(token_matches("", "")); // degenerate empty token
     }
 
     #[test]
