@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
     // first request.
     let auth = Arc::new(auth::Auth::build(auth::AuthConfig {
         provider: cfg.auth_provider,
-        serve_token: cfg.serve_token.clone(),
+        serve_token: cfg.serve_token,
+        signing_key: cfg.auth_signing_key,
         timeout: Duration::from_secs(cfg.auth_timeout_seconds),
         ttl: Duration::from_secs(cfg.auth_ttl_seconds),
         max_concurrent: cfg.auth_max_concurrent,
@@ -107,7 +108,6 @@ async fn main() -> Result<()> {
             upstream_base: upstream_base.clone(),
             cache_root: cfg.cache_root.clone(),
             upstream_auth_header,
-            serve_token: cfg.serve_token.clone(),
         },
         index.clone(),
     ));

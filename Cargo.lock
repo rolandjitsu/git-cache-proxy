@@ -468,6 +468,7 @@ dependencies = [
  "lru",
  "prometheus",
  "reqwest",
+ "ring",
  "rustix",
  "serde_json",
  "sha2",

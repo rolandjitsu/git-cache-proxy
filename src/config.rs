@@ -94,6 +94,12 @@ pub struct Config {
     )]
     pub auth_provider: AuthProvider,
 
+    /// Provider modes: HMAC key (at least 32 bytes) signing the LFS download
+    /// grants of batch responses. Every replica behind one address needs the
+    /// same key; unset, a random per-process key only suits a single replica.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_SIGNING_KEY", hide_env_values = true)]
+    pub auth_signing_key: Option<String>,
+
     /// Total budget for one token-validation request. A hung API must not pin
     /// a clone request on its own.
     #[arg(long, env = "GITCACHEPROXY_AUTH_TIMEOUT_SECONDS", default_value_t = 10)]
