@@ -214,9 +214,52 @@ Every flag has an environment-variable equivalent.
 | `--pack-threads`         | `GITCACHEPROXY_PACK_THREADS`         | -                            | git `pack.threads` when serving: delta-search threads per `pack-objects` (unset = one per CPU) |
 | `--pack-window-memory`   | `GITCACHEPROXY_PACK_WINDOW_MEMORY`   | -                            | git `pack.windowMemory` when serving: delta window memory per `pack-objects` thread, e.g. `64m` (unset = unlimited) |
 
-Endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus - per-repo request and
-upstream counters, cache-size gauges, LFS object hit/miss counters, and
-`*_duration_seconds` fetch/serve latency histograms).
+Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
+
+## Metrics
+
+`GET /metrics` serves Prometheus text-format metrics. All metrics are prefixed
+`gitcacheproxy_`:
+
+| Metric                      | Type      | Labels                 | Meaning                                                                       |
+| --------------------------- | --------- | ---------------------- | ----------------------------------------------------------------------------- |
+| `requests_total`            | counter   | `kind`, `result`, `repo` | Client requests served, by endpoint and outcome                              |
+| `upstream_ops_total`        | counter   | `op`, `result`, `repo` | Upstream git operations (initial mirror clone, refresh fetch, want fetch)     |
+| `cache_bytes`               | gauge     | -                      | Total size of the on-disk mirror cache, in bytes                              |
+| `cache_mirrors`             | gauge     | -                      | Number of cached mirrors on disk                                              |
+| `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
+| `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
+| `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
+| `serve_duration_seconds`    | histogram | `kind`, `repo`         | Time to serve a client, measured to the end of the response                   |
+
+Label values:
+
+- `kind` on `requests_total`: `info_refs`, `upload_pack`, `auth` (a request
+  that failed the `--serve-token` check), `receive_pack` (a push attempt,
+  always refused; the proxy is read-only), `lfs_batch`, `lfs_object`. On
+  `serve_duration_seconds`: `info_refs` (the buffered ref advertisement) or
+  `upload_pack` (the packfile stream, timed to EOF).
+- `result` on `requests_total`: `ok`, `error`, `upstream_error`, `unauthorized`,
+  `rejected`. On `upstream_ops_total`: `ok` or `error`. On `lfs_objects_total`:
+  `hit` (served from disk), `miss` (fetched from upstream, then cached), `error`.
+- `op`: `clone` (first mirror of a repo), `fetch` (refresh of an existing
+  mirror), `want_fetch` (on-demand fetch of a bare SHA the mirror lacks, e.g. a
+  PR merge commit).
+- `repo`: the served repo path (e.g. `group/project.git`). To keep cardinality
+  bounded, the real path is emitted only on success; every failure (failed auth,
+  malformed path, upstream error) uses a `-` sentinel, so a flood of distinct
+  but doomed paths cannot inflate the series count. Aggregate across repos with
+  `sum without (repo) (...)`.
+
+Notes:
+
+- `cache_bytes` and `cache_mirrors` are maintained only when a cache cap is
+  configured (`--cache-max-mb`); without a cap they stay `0`.
+- `lfs_objects_total` has no `repo` label: LFS objects are content-addressed
+  and shared across repos.
+- The histograms are observed only on success and share buckets from 50ms to
+  300s, sized for anything from a cached ref advertisement to a large clone
+  over a slow WAN.
 
 ## Auth model
 
