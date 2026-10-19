@@ -76,10 +76,13 @@ async fn github_probes_upstream_info_refs_over_protocol_v2() {
 async fn gitlab_forwards_basic_credentials_verbatim() {
     let (base, hits) = spawn_validator(Reply::Ok).await;
     let auth = Arc::new(
-        Auth::build(AuthConfig {
-            provider: AuthProvider::Gitlab,
-            ..github_auth_config(&base, 0)
-        })
+        Auth::build(
+            AuthConfig {
+                provider: AuthProvider::Gitlab,
+                ..github_auth_config(&base, 0)
+            },
+            Arc::new(Metrics::new()),
+        )
         .unwrap(),
     );
     // GitLab job tokens only authenticate with their `gitlab-ci-token` username.
@@ -229,6 +232,25 @@ async fn invalid_repo_names_are_denied_without_validation() {
 }
 
 #[tokio::test]
+async fn validation_calls_and_cache_hits_are_counted() {
+    let (base, _hits) = spawn_validator(Reply::Ok).await;
+    let metrics = Arc::new(Metrics::new());
+    let auth = Auth::build(github_auth_config(&base, 3600), metrics.clone()).unwrap();
+    let st = state(Arc::new(auth));
+    for token in [
+        "Bearer good-token",
+        "Bearer good-token",
+        "Bearer other-token",
+    ] {
+        let resp = get(st.clone(), REFS, Some(token)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "auth must clear");
+    }
+    let out = metrics.gather();
+    assert!(out.contains(r#"gitcacheproxy_auth_validations_total{result="allow"} 2"#));
+    assert!(out.contains("gitcacheproxy_auth_cache_hits_total 1"));
+}
+
+#[tokio::test]
 async fn custom_validates_against_its_endpoint() {
     let (base, hits) = spawn_validator(Reply::Ok).await;
     let resp = get(state(custom(&base, None)), REFS, Some("Bearer good-token")).await;
@@ -293,19 +315,22 @@ async fn custom_repo_forms_reach_the_endpoint() {
 // --- test helpers --------------------------------------------------------
 
 fn build(base: &str, ttl: u64) -> Arc<Auth> {
-    Arc::new(Auth::build(github_auth_config(base, ttl)).unwrap())
+    Arc::new(Auth::build(github_auth_config(base, ttl), Arc::new(Metrics::new())).unwrap())
 }
 
 /// `custom` validating against the mock's `/validate/{repo}`.
 fn custom(base: &str, repo_form: Option<RepoForm>) -> Arc<Auth> {
     Arc::new(
-        Auth::build(AuthConfig {
-            provider: AuthProvider::Custom,
-            validate_url: Some(format!("{base}/validate/{{repo}}")),
-            repo_form,
-            upstream_base: "https://upstream.invalid".into(),
-            ..github_auth_config(base, 0)
-        })
+        Auth::build(
+            AuthConfig {
+                provider: AuthProvider::Custom,
+                validate_url: Some(format!("{base}/validate/{{repo}}")),
+                repo_form,
+                upstream_base: "https://upstream.invalid".into(),
+                ..github_auth_config(base, 0)
+            },
+            Arc::new(Metrics::new()),
+        )
         .unwrap(),
     )
 }

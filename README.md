@@ -255,19 +255,24 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
 | `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
 | `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
 | `cache_outcome_total`       | counter   | `outcome`              | info/refs operations by outcome: served locally vs. fetched from upstream     |
+| `auth_validations_total`    | counter   | `result`               | Per-request token validation calls                                            |
+| `auth_cache_hits_total`     | counter   | -                      | Token checks answered from the `--auth-ttl-seconds` verdict cache             |
 | `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
 | `serve_duration_seconds`    | histogram | `kind`, `repo`         | Time to serve a client, measured to the end of the response                   |
 
 Label values:
 
 - `kind` on `requests_total`: `info_refs`, `upload_pack`, `auth` (a request
-  that failed the `--serve-token` check), `receive_pack` (a push attempt,
+  that failed the `--serve-token` check or token validation), `receive_pack` (a push attempt,
   always refused; the proxy is read-only), `lfs_batch`, `lfs_object`. On
   `serve_duration_seconds`: `info_refs` (the buffered ref advertisement) or
   `upload_pack` (the packfile stream, timed to EOF).
 - `result` on `requests_total`: `ok`, `error`, `upstream_error`, `unauthorized`,
   `rejected`. On `upstream_ops_total`: `ok` or `error`. On `lfs_objects_total`:
   `hit` (served from disk), `miss` (fetched from upstream, then cached), `error`.
+  On `auth_validations_total`: `allow`, `deny`, `unavailable` (the endpoint
+  failed, throttled, or answered something else), `saturated` (no call made: no
+  `--auth-max-concurrent` slot freed up in time).
 - `op`: `clone` (first mirror of a repo), `fetch` (refresh of an existing
   mirror), `want_fetch` (on-demand fetch of a bare SHA the mirror lacks, e.g. a
   PR merge commit).
@@ -288,7 +293,8 @@ Notes:
   gauges, set once at startup, so a dashboard can read cache utilization as
   `cache_bytes / cache_max_bytes` without hardcoding the cap.
 - `lfs_objects_total` has no `repo` label: LFS objects are content-addressed
-  and shared across repos.
+  and shared across repos. `auth_validations_total` has none either: a flood of
+  junk credentials names arbitrary repos.
 - `cache_outcome_total` is the local-vs-upstream signal: the share of operations
   served without touching upstream is `cached / sum without (outcome) (...)`.
 - The histograms are observed only on success and share buckets from 50ms to

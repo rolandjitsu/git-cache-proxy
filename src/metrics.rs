@@ -69,6 +69,17 @@ pub enum LfsResult {
     Error,
 }
 
+/// The `result` label on `auth_validations_total`.
+#[derive(Debug, Clone, Copy)]
+pub enum ValidationResult {
+    Allow,
+    Deny,
+    /// No verdict: the endpoint failed, throttled, or answered something else.
+    Unavailable,
+    /// No call made: no `--auth-max-concurrent` slot freed up in time.
+    Saturated,
+}
+
 impl RequestKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -123,6 +134,17 @@ impl LfsResult {
     }
 }
 
+impl ValidationResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Unavailable => "unavailable",
+            Self::Saturated => "saturated",
+        }
+    }
+}
+
 pub struct Metrics {
     pub registry: Registry,
     /// `requests_total{kind, result, repo}` - kind = info_refs | upload_pack |
@@ -157,6 +179,13 @@ pub struct Metrics {
     /// from the local mirror, no upstream call). Recorded once per advertisement,
     /// so the local-hit ratio is `cached / sum without (outcome) (...)`.
     cache_outcome: IntCounterVec,
+    /// `auth_validations_total{result}` - per-request token validation calls;
+    /// result = allow | deny | unavailable | saturated. No `repo` label: a flood
+    /// of junk credentials names arbitrary repos.
+    auth_validations: IntCounterVec,
+    /// `auth_cache_hits_total` - checks answered from the `--auth-ttl-seconds`
+    /// verdict cache instead of a validation call.
+    auth_cache_hits: IntCounter,
     /// `upstream_duration_seconds{op, repo}` - clone/fetch wall-clock, observed
     /// only on success (same bounded-`repo` discipline as the counters).
     upstream_duration: HistogramVec,
@@ -223,6 +252,19 @@ impl Metrics {
             &["outcome"],
         )
         .expect("valid metric");
+        let auth_validations = IntCounterVec::new(
+            Opts::new(
+                "gitcacheproxy_auth_validations_total",
+                "Per-request token validation calls (allow/deny/unavailable/saturated)",
+            ),
+            &["result"],
+        )
+        .expect("valid metric");
+        let auth_cache_hits = IntCounter::new(
+            "gitcacheproxy_auth_cache_hits_total",
+            "Token checks answered from the verdict cache",
+        )
+        .expect("valid metric");
         let upstream_duration = HistogramVec::new(
             HistogramOpts::new(
                 "gitcacheproxy_upstream_duration_seconds",
@@ -269,6 +311,12 @@ impl Metrics {
             .register(Box::new(cache_outcome.clone()))
             .expect("register cache_outcome");
         registry
+            .register(Box::new(auth_validations.clone()))
+            .expect("register auth_validations");
+        registry
+            .register(Box::new(auth_cache_hits.clone()))
+            .expect("register auth_cache_hits");
+        registry
             .register(Box::new(upstream_duration.clone()))
             .expect("register upstream_duration");
         registry
@@ -285,6 +333,8 @@ impl Metrics {
             evictions,
             lfs_objects,
             cache_outcome,
+            auth_validations,
+            auth_cache_hits,
             upstream_duration,
             serve_duration,
         }
@@ -340,6 +390,18 @@ impl Metrics {
         self.cache_outcome.with_label_values(&[label]).inc();
     }
 
+    /// Record one token validation call, or a check that found no slot for one.
+    pub fn record_validation(&self, result: ValidationResult) {
+        self.auth_validations
+            .with_label_values(&[result.as_str()])
+            .inc();
+    }
+
+    /// Record a token check answered from the verdict cache.
+    pub fn record_auth_cache_hit(&self) {
+        self.auth_cache_hits.inc();
+    }
+
     /// Observe an upstream op's duration. Call only on success with the real repo,
     /// matching the counters' bounded-`repo` cardinality discipline.
     pub fn observe_upstream(&self, op: UpstreamOp, repo: &str, seconds: f64) {
@@ -391,6 +453,8 @@ mod tests {
         m.record_cache_outcome(CacheOutcome::Cached);
         m.record_cache_outcome(CacheOutcome::Fetched);
         m.record_cache_outcome(CacheOutcome::Cloned);
+        m.record_validation(ValidationResult::Deny);
+        m.record_auth_cache_hit();
         m.observe_upstream(UpstreamOp::Clone, "group/foo.git", 1.5);
         m.observe_serve(ServeKind::UploadPack, "group/foo.git", 2.0);
 
@@ -405,6 +469,8 @@ mod tests {
         assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="cached"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="fetched"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="cloned"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_auth_validations_total{result="deny"} 1"#));
+        assert!(out.contains("gitcacheproxy_auth_cache_hits_total 1"));
         assert!(out.contains(
             r#"gitcacheproxy_upstream_duration_seconds_count{op="clone",repo="group/foo.git"} 1"#
         ));
