@@ -82,19 +82,22 @@ async fn main() -> Result<()> {
 
     // Resolved at startup so a misconfigured mode fails fast instead of on the
     // first request.
-    let auth = Arc::new(auth::Auth::build(auth::AuthConfig {
-        provider: cfg.auth_provider,
-        serve_token: cfg.serve_token,
-        validate_url: cfg.auth_validate_url,
-        token_header: cfg.auth_token_header,
-        repo_form: cfg.auth_repo_form,
-        signing_key: cfg.auth_signing_key,
-        timeout: Duration::from_secs(cfg.auth_timeout_seconds),
-        ttl: Duration::from_secs(cfg.auth_ttl_seconds),
-        max_concurrent: cfg.auth_max_concurrent,
-        allow_http: cfg.auth_allow_http,
-        upstream_base: upstream_base.clone(),
-    })?);
+    let auth = Arc::new(auth::Auth::build(
+        auth::AuthConfig {
+            provider: cfg.auth_provider,
+            serve_token: cfg.serve_token,
+            validate_url: cfg.auth_validate_url,
+            token_header: cfg.auth_token_header,
+            repo_form: cfg.auth_repo_form,
+            signing_key: cfg.auth_signing_key,
+            timeout: Duration::from_secs(cfg.auth_timeout_seconds),
+            ttl: Duration::from_secs(cfg.auth_ttl_seconds),
+            max_concurrent: cfg.auth_max_concurrent,
+            allow_http: cfg.auth_allow_http,
+            upstream_base: upstream_base.clone(),
+        },
+        metrics.clone(),
+    )?);
     tracing::info!("client auth: {}", auth.describe());
 
     // Clear any in-flight LFS downloads left by a crash so they never linger; the

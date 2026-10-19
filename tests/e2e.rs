@@ -1013,7 +1013,13 @@ async fn clone_with_per_request_token_auth() {
 
     // Serving clones the real `file://` upstream; only the probe goes here.
     let (validator, _hits) = helpers::spawn_validator(helpers::Reply::Password("good-token")).await;
-    let auth = Arc::new(Auth::build(helpers::github_auth_config(&validator, 0)).unwrap());
+    let auth = Arc::new(
+        Auth::build(
+            helpers::github_auth_config(&validator, 0),
+            Arc::new(Metrics::new()),
+        )
+        .unwrap(),
+    );
     let proxy = start_proxy_with_auth(up.path(), "8m", auth, "git").await;
 
     let dest = tempfile::tempdir().unwrap();

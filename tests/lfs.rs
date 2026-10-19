@@ -459,7 +459,13 @@ async fn body_bytes(resp: Response) -> Vec<u8> {
 
 /// `github` auth probing the mock at `validator`, revalidating every request.
 fn provider_auth(validator: &str) -> Arc<Auth> {
-    Arc::new(Auth::build(helpers::github_auth_config(validator, 0)).unwrap())
+    Arc::new(
+        Auth::build(
+            helpers::github_auth_config(validator, 0),
+            Arc::new(Metrics::new()),
+        )
+        .unwrap(),
+    )
 }
 
 /// Run a download batch for `oid` as a client holding `client-token`; returns
