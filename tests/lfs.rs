@@ -15,6 +15,7 @@ use axum::extract::State;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use git_cache_proxy::auth::Auth;
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
@@ -22,6 +23,8 @@ use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt; // for `oneshot`
+
+mod support;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_rewrites_download_href_to_the_proxy() {
@@ -56,6 +59,82 @@ async fn batch_rewrites_download_href_to_the_proxy() {
         download.get("header").is_none(),
         "the upstream object auth header must not leak to the client"
     );
+}
+
+/// Under provider auth the batch is validated against the client's credential,
+/// and each download action carries a signed grant for exactly that repo and
+/// object. The object GETs verify the grant locally: one validation call for
+/// the whole batch, not one per object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_batch_grants_serve_objects_without_revalidating() {
+    let (addr, _batches) = spawn_upstream(Mode::Ok).await;
+    let (validator, validations) = support::spawn_validator(support::Reply::Ok).await;
+    let cache = tempfile::tempdir().unwrap();
+    let mut state = proxy_state(addr, cache.path(), Arc::new(Metrics::new()));
+    state.auth = provider_auth(&validator);
+    let oid = oid_of(PAYLOAD);
+
+    let (href, authorization) = batch_grant(state.clone(), &oid).await;
+    assert_eq!(validations.lock().await.len(), 1);
+    assert!(
+        !authorization.contains("client-token"),
+        "the client's credential is not echoed back"
+    );
+
+    // The miss, then the hit, both on the grant alone.
+    for _ in 0..2 {
+        let resp = object_get(state.clone(), &href, Some(&authorization)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, PAYLOAD);
+    }
+    assert_eq!(
+        validations.lock().await.len(),
+        1,
+        "object GETs must not revalidate"
+    );
+
+    // The client's own token is not a grant.
+    let resp = object_get(state, &href, Some("Bearer client-token")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Objects are cached by oid across repos, so a credential valid for one repo
+/// must not reach a cached object through another repo's path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_does_not_open_another_repos_cached_object() {
+    let (addr, _batches) = spawn_upstream(Mode::Ok).await;
+    let (validator, _validations) = support::spawn_validator(support::Reply::Ok).await;
+    let cache = tempfile::tempdir().unwrap();
+    let mut state = proxy_state(addr, cache.path(), Arc::new(Metrics::new()));
+    state.auth = provider_auth(&validator);
+    let oid = oid_of(PAYLOAD);
+
+    let (href, authorization) = batch_grant(state.clone(), &oid).await;
+    let resp = object_get(state.clone(), &href, Some(&authorization)).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the object is now cached");
+
+    let other = href.replace(REPO, "other/secret.git");
+    let resp = object_get(state, &other, Some(&authorization)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Replicas share only the signing key, not their caches: a grant issued by
+/// one is honored by another, which fetches the object itself on a miss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_from_one_replica_is_honored_by_another() {
+    let (addr, _batches) = spawn_upstream(Mode::Ok).await;
+    let (validator, _validations) = support::spawn_validator(support::Reply::Ok).await;
+    let (cache_a, cache_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut a = proxy_state(addr, cache_a.path(), Arc::new(Metrics::new()));
+    a.auth = provider_auth(&validator);
+    let mut b = proxy_state(addr, cache_b.path(), Arc::new(Metrics::new()));
+    b.auth = provider_auth(&validator);
+    let oid = oid_of(PAYLOAD);
+
+    let (href, authorization) = batch_grant(a, &oid).await;
+    let resp = object_get(b, &href, Some(&authorization)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, PAYLOAD);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,13 +429,12 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
                 upstream_base: upstream.clone(),
                 cache_root: cache.to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             Some(idx),
         )),
         upstream_base: upstream,
         cache_root: cache.to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,
@@ -377,4 +455,50 @@ async fn body_bytes(resp: Response) -> Vec<u8> {
         .await
         .unwrap()
         .to_vec()
+}
+
+/// `github` auth probing the mock at `validator`, revalidating every request.
+fn provider_auth(validator: &str) -> Arc<Auth> {
+    Arc::new(
+        Auth::build(
+            support::github_auth_config(validator, 0),
+            Arc::new(Metrics::new()),
+        )
+        .unwrap(),
+    )
+}
+
+/// Run a download batch for `oid` as a client holding `client-token`; returns
+/// the rewritten href (as a request path) and its `Authorization` header.
+async fn batch_grant(state: AppState, oid: &str) -> (String, String) {
+    let resp = router(state)
+        .oneshot(
+            Request::post(format!("/{REPO}/info/lfs/objects/batch"))
+                .header(header::HOST, "proxy.test:8080")
+                .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+                .header(header::AUTHORIZATION, "Bearer client-token")
+                .body(Body::from(batch_body(oid, PAYLOAD.len())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let download = &json["objects"][0]["actions"]["download"];
+    assert_eq!(download["expires_in"], 900);
+    let href = download["href"].as_str().unwrap();
+    let path = href.strip_prefix("http://proxy.test:8080").unwrap();
+    let authorization = download["header"]["Authorization"].as_str().unwrap();
+    (path.to_string(), authorization.to_string())
+}
+
+async fn object_get(state: AppState, uri: &str, authorization: Option<&str>) -> Response {
+    let mut req = Request::get(uri);
+    if let Some(value) = authorization {
+        req = req.header(header::AUTHORIZATION, value);
+    }
+    router(state)
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
 }

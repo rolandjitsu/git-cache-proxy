@@ -57,9 +57,16 @@ pub struct LfsConfig {
     /// Full upstream auth header line (e.g. `Authorization: Basic <b64>`), or `None`
     /// for anonymous.
     pub upstream_auth_header: Option<String>,
-    /// The proxy's own serve token, if configured; embedded in each rewritten download
-    /// action so git-lfs re-presents it on the (auth-checked) object GET.
-    pub serve_token: Option<String>,
+}
+
+/// The credential git-lfs presents on a rewritten object GET, as a download
+/// action `Authorization` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadGrant {
+    pub authorization: String,
+    /// Advertised as the action's `expires_in`, so git-lfs re-batches rather
+    /// than presenting an expired grant. `None` leaves upstream's expiry as is.
+    pub expires_in: Option<Duration>,
 }
 
 pub struct Lfs {
@@ -84,6 +91,9 @@ impl Lfs {
     pub fn new(cfg: LfsConfig, index: Option<Arc<CacheIndex>>) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            // Bulk object streams each get their own connection rather than
+            // sharing one HTTP/2 connection's flow-control window.
+            .http1_only()
             .build()
             .expect("build reqwest client");
         Self {
@@ -97,21 +107,23 @@ impl Lfs {
 
     /// Proxy a client batch request to upstream and rewrite the download hrefs so the
     /// objects are fetched back through this proxy (and thus cached). `advertise_base`
-    /// is the proxy's own `scheme://host` as the client reached it. Returns the
-    /// rewritten batch JSON.
-    pub async fn batch(&self, repo: &str, body: &[u8], advertise_base: &str) -> Result<Vec<u8>> {
+    /// is the proxy's own `scheme://host` as the client reached it, and `grant`
+    /// yields the credential for one `(oid, size)` object GET (`None` for
+    /// anonymous serving). Returns the rewritten batch JSON.
+    pub async fn batch(
+        &self,
+        repo: &str,
+        body: &[u8],
+        advertise_base: &str,
+        grant: impl Fn(&str, u64) -> Option<DownloadGrant>,
+    ) -> Result<Vec<u8>> {
         let url = format!("{}/{repo}/info/lfs/objects/batch", self.cfg.upstream_base);
         let resp = self
             .post_batch(&url, body)
             .await
             .context("upstream lfs batch")?;
         let mut json: Value = serde_json::from_slice(&resp).context("parse lfs batch response")?;
-        rewrite_download_hrefs(
-            &mut json,
-            advertise_base,
-            repo,
-            self.cfg.serve_token.as_deref(),
-        );
+        rewrite_download_hrefs(&mut json, advertise_base, repo, grant);
         serde_json::to_vec(&json).context("serialize lfs batch response")
     }
 
@@ -287,15 +299,16 @@ impl Lfs {
 }
 
 /// Rewrite each object's `download` href to point back at this proxy so the fetch is
-/// cached, and replace the upstream authorization header with the proxy's serve token
-/// (or drop it when the proxy serves anonymously) - the client authenticates to the
-/// proxy, not upstream. Objects carrying an `error`, or an `upload` action, are left
-/// untouched. Malformed entries are skipped rather than failing the batch.
+/// cached, and set the object GET's credential from `grant` (or drop it when the
+/// proxy serves anonymously) - the client authenticates to the proxy, not upstream.
+/// Objects carrying an `error`, or an `upload` action, are left untouched, so a
+/// grant is only ever issued for an object upstream listed for `repo`.
+/// Malformed entries are skipped rather than failing the batch.
 fn rewrite_download_hrefs(
     json: &mut Value,
     advertise_base: &str,
     repo: &str,
-    serve_token: Option<&str>,
+    grant: impl Fn(&str, u64) -> Option<DownloadGrant>,
 ) {
     let Some(objects) = json.get_mut("objects").and_then(Value::as_array_mut) else {
         return;
@@ -318,12 +331,16 @@ fn rewrite_download_hrefs(
                 "{advertise_base}/{repo}/info/lfs/objects/{oid}?size={size}"
             )),
         );
-        match serve_token {
-            Some(token) => {
+        match grant(&oid, size) {
+            Some(grant) => {
                 download.insert(
                     "header".to_string(),
-                    serde_json::json!({ "Authorization": format!("Bearer {token}") }),
+                    serde_json::json!({ "Authorization": grant.authorization }),
                 );
+                if let Some(ttl) = grant.expires_in {
+                    download.remove("expires_at");
+                    download.insert("expires_in".to_string(), ttl.as_secs().into());
+                }
             }
             None => {
                 download.remove("header");
@@ -424,7 +441,7 @@ mod tests {
                 }
             }],
         });
-        rewrite_download_hrefs(&mut json, "http://proxy:8080", "g/r.git", None);
+        rewrite_download_hrefs(&mut json, "http://proxy:8080", "g/r.git", |_, _| None);
         let dl = &json["objects"][0]["actions"]["download"];
         assert_eq!(
             dl["href"],
@@ -448,16 +465,41 @@ mod tests {
                 }}
             }],
         });
-        rewrite_download_hrefs(
-            &mut json,
-            "http://proxy:8080",
-            "g/r.git",
-            Some("serve-secret"),
-        );
+        rewrite_download_hrefs(&mut json, "http://proxy:8080", "g/r.git", |_, _| {
+            Some(DownloadGrant {
+                authorization: "Bearer serve-secret".into(),
+                expires_in: None,
+            })
+        });
         let dl = &json["objects"][0]["actions"]["download"];
         // The upstream credential is replaced by the proxy's serve token so git-lfs
         // re-presents it on the (auth-checked) object GET.
         assert_eq!(dl["header"]["Authorization"], "Bearer serve-secret");
+    }
+
+    #[test]
+    fn a_per_object_grant_carries_its_own_expiry() {
+        let mut json = serde_json::json!({
+            "objects": [{
+                "oid": "abc123",
+                "size": 9,
+                "actions": { "download": {
+                    "href": "https://upstream/storage/abc123",
+                    "expires_at": "2026-01-01T00:00:00Z"
+                }}
+            }],
+        });
+        rewrite_download_hrefs(&mut json, "http://proxy:8080", "g/r.git", |oid, size| {
+            Some(DownloadGrant {
+                authorization: format!("Bearer {oid}-{size}"),
+                expires_in: Some(Duration::from_secs(60)),
+            })
+        });
+        let dl = &json["objects"][0]["actions"]["download"];
+        assert_eq!(dl["header"]["Authorization"], "Bearer abc123-9");
+        assert_eq!(dl["expires_in"], 60);
+        // Upstream's absolute expiry described its own URL, not ours.
+        assert!(dl.get("expires_at").is_none());
     }
 
     #[test]
@@ -470,7 +512,9 @@ mod tests {
             ],
         });
         let before = json.clone();
-        rewrite_download_hrefs(&mut json, "http://proxy:8080", "g/r.git", None);
+        rewrite_download_hrefs(&mut json, "http://proxy:8080", "g/r.git", |_, _| {
+            panic!("no grant is issued for an object without a download action")
+        });
         assert_eq!(json, before, "no download action -> nothing rewritten");
     }
 

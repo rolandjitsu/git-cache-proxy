@@ -45,8 +45,14 @@ GitLab, a personal access token goes in as HTTP Basic: the header value is
 By default the proxy serves anonymously, which is intended for a network-restricted
 deployment. Anyone who can reach the port can read **every mirrored repo** (the proxy holds
 one upstream credential). Restrict who can reach it (private network, NetworkPolicy, mTLS at
-the ingress), and/or require a client bearer token via `serveToken.existingSecret`. The
-proxy speaks plain HTTP, so terminate TLS in front of it on any untrusted network.
+the ingress), and/or require a client bearer token via `serveToken.existingSecret`.
+Alternatively, `clientAuth.enabled=true` checks each request's own credential for the repo
+it names (`clientAuth.provider=github|gitlab|custom`, required), so a client - e.g. a CI
+runner with a short-lived job token - only reaches what its own credential could clone
+directly. Validation fails closed: an outage means 503s, never unvalidated serving. When
+several proxies serve one address, give them the same `clientAuth.signingKey.existingSecret`
+so LFS download grants verify on any of them. Either way the proxy speaks plain HTTP, so
+terminate TLS in front of it on any untrusted network.
 
 ## Single writer (not HA)
 
@@ -95,6 +101,17 @@ pointing at the Service.
 | `upstreamAuth.key` | `auth-header` | Key in that Secret |
 | `serveToken.existingSecret` | `""` | Secret with a client bearer token to require (empty = anonymous) |
 | `serveToken.key` | `token` | Key in that Secret |
+| `clientAuth.enabled` | `false` | Turn on per-request token validation (see Security) |
+| `clientAuth.provider` | `""` | `github`, `gitlab`, or `custom` |
+| `clientAuth.validateUrl` | `""` | `custom`: URL template with `{repo}` |
+| `clientAuth.tokenHeader` | `""` | `custom`: header line template, e.g. `PRIVATE-TOKEN: {token}`; empty = `Authorization: Bearer {token}` |
+| `clientAuth.repoForm` | `""` | `custom`: repo encoding, `path` or `percent`; empty = `path` |
+| `clientAuth.timeoutSeconds` | `""` | Budget per validation request; empty = `10` |
+| `clientAuth.ttlSeconds` | `""` | Verdict reuse window per (token, repo); empty = `0` (always revalidate) |
+| `clientAuth.maxConcurrent` | `""` | Validation requests in flight at once; empty = `32`, `0` = unlimited |
+| `clientAuth.allowHttp` | `false` | Accept a plain http validation endpoint (credentials in cleartext) |
+| `clientAuth.signingKey.existingSecret` | `""` | Secret with the HMAC key signing LFS download grants; empty = a random key per pod |
+| `clientAuth.signingKey.key` | `signing-key` | Key in that Secret |
 | `config.fetchTtlSeconds` | `10` | Skip upstream fetch if refreshed within this window (`0` = always) |
 | `config.cacheMaxMb` | `0` | Cap on on-disk cache, MiB; evicts LRU idle mirrors (`0` = unlimited) |
 | `config.maxConcurrentRequests` | `64` | Max concurrent in-flight requests (`0` = unlimited) |

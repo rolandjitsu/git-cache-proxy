@@ -16,6 +16,8 @@ use prometheus::{
     TextEncoder,
 };
 
+use crate::auth::Verdict;
+
 /// Histogram buckets, in seconds, for git operation latency: from a fast cached
 /// advertisement (tens of ms) to a large clone over a slow WAN (minutes).
 const DURATION_BUCKETS: &[f64] = &[
@@ -65,6 +67,17 @@ pub enum LfsResult {
     Hit,
     Miss,
     Error,
+}
+
+/// The `result` label on `auth_validations_total`.
+#[derive(Debug, Clone, Copy)]
+pub enum ValidationResult {
+    Allow,
+    Deny,
+    /// No verdict: the endpoint failed, throttled, or answered something else.
+    Unavailable,
+    /// No call made: no `--auth-max-concurrent` slot freed up in time.
+    Saturated,
 }
 
 impl RequestKind {
@@ -121,6 +134,30 @@ impl LfsResult {
     }
 }
 
+impl ValidationResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Unavailable => "unavailable",
+            Self::Saturated => "saturated",
+        }
+    }
+}
+
+/// The auth verdict of a completed validation call, as its metric label.
+/// `Saturated` has no verdict: a call that never ran is recorded where it is
+/// refused.
+impl From<Verdict> for ValidationResult {
+    fn from(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Allow => Self::Allow,
+            Verdict::Deny => Self::Deny,
+            Verdict::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 pub struct Metrics {
     pub registry: Registry,
     /// `requests_total{kind, result, repo}` - kind = info_refs | upload_pack |
@@ -143,6 +180,13 @@ pub struct Metrics {
     /// (served from disk) | miss (fetched from upstream, then cached) | error. No
     /// `repo` label: objects are content-addressed and shared across repos.
     lfs_objects: IntCounterVec,
+    /// `auth_validations_total{result}` - per-request token validation calls;
+    /// result = allow | deny | unavailable | saturated. No `repo` label: a flood
+    /// of junk credentials names arbitrary repos.
+    auth_validations: IntCounterVec,
+    /// `auth_cache_hits_total` - checks answered from the `--auth-ttl-seconds`
+    /// verdict cache instead of a validation call.
+    auth_cache_hits: IntCounter,
     /// `upstream_duration_seconds{op, repo}` - clone/fetch wall-clock, observed
     /// only on success (same bounded-`repo` discipline as the counters).
     upstream_duration: HistogramVec,
@@ -191,6 +235,19 @@ impl Metrics {
             &["result"],
         )
         .expect("valid metric");
+        let auth_validations = IntCounterVec::new(
+            Opts::new(
+                "gitcacheproxy_auth_validations_total",
+                "Per-request token validation calls (allow/deny/unavailable/saturated)",
+            ),
+            &["result"],
+        )
+        .expect("valid metric");
+        let auth_cache_hits = IntCounter::new(
+            "gitcacheproxy_auth_cache_hits_total",
+            "Token checks answered from the verdict cache",
+        )
+        .expect("valid metric");
         let upstream_duration = HistogramVec::new(
             HistogramOpts::new(
                 "gitcacheproxy_upstream_duration_seconds",
@@ -228,6 +285,12 @@ impl Metrics {
             .register(Box::new(lfs_objects.clone()))
             .expect("register lfs_objects");
         registry
+            .register(Box::new(auth_validations.clone()))
+            .expect("register auth_validations");
+        registry
+            .register(Box::new(auth_cache_hits.clone()))
+            .expect("register auth_cache_hits");
+        registry
             .register(Box::new(upstream_duration.clone()))
             .expect("register upstream_duration");
         registry
@@ -241,6 +304,8 @@ impl Metrics {
             cache_mirrors,
             evictions,
             lfs_objects,
+            auth_validations,
+            auth_cache_hits,
             upstream_duration,
             serve_duration,
         }
@@ -277,6 +342,18 @@ impl Metrics {
     /// Record a cached LFS object lookup (hit / miss / error).
     pub fn record_lfs(&self, result: LfsResult) {
         self.lfs_objects.with_label_values(&[result.as_str()]).inc();
+    }
+
+    /// Record one token validation call, or a check that found no slot for one.
+    pub fn record_validation(&self, result: ValidationResult) {
+        self.auth_validations
+            .with_label_values(&[result.as_str()])
+            .inc();
+    }
+
+    /// Record a token check answered from the verdict cache.
+    pub fn record_auth_cache_hit(&self) {
+        self.auth_cache_hits.inc();
     }
 
     /// Observe an upstream op's duration. Call only on success with the real repo,
@@ -326,6 +403,8 @@ mod tests {
         m.record_eviction();
         m.record_lfs(LfsResult::Hit);
         m.record_lfs(LfsResult::Miss);
+        m.record_validation(ValidationResult::Deny);
+        m.record_auth_cache_hit();
         m.observe_upstream(UpstreamOp::Clone, "group/foo.git", 1.5);
         m.observe_serve(ServeKind::UploadPack, "group/foo.git", 2.0);
 
@@ -335,6 +414,8 @@ mod tests {
         assert!(out.contains("gitcacheproxy_evictions_total 2"));
         assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="hit"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="miss"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_auth_validations_total{result="deny"} 1"#));
+        assert!(out.contains("gitcacheproxy_auth_cache_hits_total 1"));
         assert!(out.contains(
             r#"gitcacheproxy_upstream_duration_seconds_count{op="clone",repo="group/foo.git"} 1"#
         ));

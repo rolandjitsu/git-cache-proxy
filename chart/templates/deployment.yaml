@@ -89,6 +89,50 @@ spec:
                   name: {{ .Values.serveToken.existingSecret | quote }}
                   key: {{ .Values.serveToken.key | quote }}
             {{- end }}
+            {{- with .Values.clientAuth }}
+            {{- if .enabled }}
+            {{- if $.Values.serveToken.existingSecret }}
+            {{- fail "clientAuth.enabled and serveToken.existingSecret are mutually exclusive" }}
+            {{- end }}
+            - name: GITCACHEPROXY_AUTH_PROVIDER
+              value: {{ required "clientAuth.provider is required when clientAuth.enabled" .provider | quote }}
+            {{- if .validateUrl }}
+            - name: GITCACHEPROXY_AUTH_VALIDATE_URL
+              value: {{ .validateUrl | quote }}
+            {{- end }}
+            {{- if .tokenHeader }}
+            - name: GITCACHEPROXY_AUTH_TOKEN_HEADER
+              value: {{ .tokenHeader | quote }}
+            {{- end }}
+            {{- if .repoForm }}
+            - name: GITCACHEPROXY_AUTH_REPO_FORM
+              value: {{ .repoForm | quote }}
+            {{- end }}
+            {{- if .timeoutSeconds }}
+            - name: GITCACHEPROXY_AUTH_TIMEOUT_SECONDS
+              value: {{ .timeoutSeconds | quote }}
+            {{- end }}
+            {{- if .ttlSeconds }}
+            - name: GITCACHEPROXY_AUTH_TTL_SECONDS
+              value: {{ .ttlSeconds | quote }}
+            {{- end }}
+            {{- if .maxConcurrent }}
+            - name: GITCACHEPROXY_AUTH_MAX_CONCURRENT
+              value: {{ .maxConcurrent | quote }}
+            {{- end }}
+            {{- if .allowHttp }}
+            - name: GITCACHEPROXY_AUTH_ALLOW_HTTP
+              value: "true"
+            {{- end }}
+            {{- with .signingKey.existingSecret }}
+            - name: GITCACHEPROXY_AUTH_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.clientAuth.signingKey.key | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.caTrust.enabled }}
             # Validate upstream TLS against the CA bundle mounted below.
             - name: GIT_SSL_CAINFO

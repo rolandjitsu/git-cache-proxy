@@ -203,6 +203,15 @@ Every flag has an environment-variable equivalent.
 | `--upstream`             | `GITCACHEPROXY_UPSTREAM`             | - (required)                 | Origin git base URL                                                            |
 | `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
+| `--auth-provider`        | `GITCACHEPROXY_AUTH_PROVIDER`        | `none`                       | Client-auth mode: `none`, `shared`, `github`, `gitlab`, `custom` (see Auth model). Passing only `--serve-token` keeps the legacy shared-secret behavior |
+| `--auth-signing-key`     | `GITCACHEPROXY_AUTH_SIGNING_KEY`     | random per process           | Provider modes: HMAC key (at least 32 bytes) signing LFS download grants; every replica behind one address needs the same key |
+| `--auth-validate-url`    | `GITCACHEPROXY_AUTH_VALIDATE_URL`    | -                            | `custom` only: URL template of the validation endpoint, with `{repo}` interpolated (the token goes in `--auth-token-header`, never the URL) |
+| `--auth-token-header`    | `GITCACHEPROXY_AUTH_TOKEN_HEADER`    | `Authorization: Bearer {token}` | `custom` only: header line presenting the client token to the endpoint, with `{token}` interpolated, e.g. `PRIVATE-TOKEN: {token}` |
+| `--auth-repo-form`       | `GITCACHEPROXY_AUTH_REPO_FORM`       | `path`                       | `custom` only: repo encoding for `{repo}` - `path` (`owner/repo`) or `percent` (`owner%2Frepo`, GitLab-style) |
+| `--auth-timeout-seconds` | `GITCACHEPROXY_AUTH_TIMEOUT_SECONDS` | `10`                         | Total budget for one token-validation request |
+| `--auth-ttl-seconds`     | `GITCACHEPROXY_AUTH_TTL_SECONDS`     | `0`                          | Reuse a validation verdict per `(credential, repo)` for this many seconds, so the requests of one clone, or repeated submodule fetches, validate once (`0` = validate every request) |
+| `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
+| `--auth-allow-http`      | `GITCACHEPROXY_AUTH_ALLOW_HTTP`      | `false`                      | Provider modes: accept a plain `http://` validation endpoint, which sends client credentials in cleartext |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
 | `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
@@ -229,19 +238,24 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
 | `cache_mirrors`             | gauge     | -                      | Number of cached mirrors on disk                                              |
 | `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
 | `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
+| `auth_validations_total`    | counter   | `result`               | Per-request token validation calls                                            |
+| `auth_cache_hits_total`     | counter   | -                      | Token checks answered from the `--auth-ttl-seconds` verdict cache             |
 | `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
 | `serve_duration_seconds`    | histogram | `kind`, `repo`         | Time to serve a client, measured to the end of the response                   |
 
 Label values:
 
 - `kind` on `requests_total`: `info_refs`, `upload_pack`, `auth` (a request
-  that failed the `--serve-token` check), `receive_pack` (a push attempt,
+  that failed the `--serve-token` check or token validation), `receive_pack` (a push attempt,
   always refused; the proxy is read-only), `lfs_batch`, `lfs_object`. On
   `serve_duration_seconds`: `info_refs` (the buffered ref advertisement) or
   `upload_pack` (the packfile stream, timed to EOF).
 - `result` on `requests_total`: `ok`, `error`, `upstream_error`, `unauthorized`,
   `rejected`. On `upstream_ops_total`: `ok` or `error`. On `lfs_objects_total`:
   `hit` (served from disk), `miss` (fetched from upstream, then cached), `error`.
+  On `auth_validations_total`: `allow`, `deny`, `unavailable` (the endpoint
+  failed, throttled, or answered something else), `saturated` (no call made: no
+  `--auth-max-concurrent` slot freed up in time).
 - `op`: `clone` (first mirror of a repo), `fetch` (refresh of an existing
   mirror), `want_fetch` (on-demand fetch of a bare SHA the mirror lacks, e.g. a
   PR merge commit).
@@ -256,7 +270,8 @@ Notes:
 - `cache_bytes` and `cache_mirrors` are maintained only when a cache cap is
   configured (`--cache-max-mb`); without a cap they stay `0`.
 - `lfs_objects_total` has no `repo` label: LFS objects are content-addressed
-  and shared across repos.
+  and shared across repos. `auth_validations_total` has none either: a flood of
+  junk credentials names arbitrary repos.
 - The histograms are observed only on success and share buckets from 50ms to
   300s, sized for anything from a cached ref advertisement to a large clone
   over a slow WAN.
@@ -268,7 +283,76 @@ Notes:
   header line and is passed verbatim to git as `http.extraHeader`. If it is
   unset/blank the proxy warns at startup and contacts upstream anonymously.
 - **Clients:** anonymous by default (intended for a network-restricted
-  deployment); set `--serve-token` to require a bearer token.
+  deployment); set `--serve-token` to require one shared bearer token, or set
+  `--auth-provider` to validate each request's own credential per repo
+  (below). The shared token is read from `Authorization: Bearer <token>`
+  (git's `http.extraHeader`). Provider mode also reads `Authorization: Basic
+  <user:token>` (git's credential helpers and tokened clone URLs), and answers
+  a 401 with a Basic challenge so git sends them.
+
+### Per-request token validation (`--auth-provider github|gitlab|custom`)
+
+With a shared serve token, anyone who can reach the proxy can read every repo
+its upstream credential can. In `github`/`gitlab`/`custom` mode the proxy
+instead checks each request's credential *for the repo that request names*,
+before any upstream or mirror work - so a client only reaches what its own
+credential could clone directly, and a CI fleet can run on short-lived per-job
+tokens. The repo that is checked is exactly the repo that is served, so a
+credential can never be checked against one repo while fetching another: repo
+names must consist of letters, digits, `-`, `.`, `_`, `~`, and `/`, since a
+`%` escape could decode to a different path upstream than at the check.
+
+The validation endpoint receives every client credential, so it must be
+`https://` unless `--auth-allow-http` is set (e.g. for an in-cluster endpoint
+on a trusted network).
+
+| Provider | Check | Notes |
+| -------- | ----- | ----- |
+| `github` | `GET {upstream}/{repo}/info/refs?service=git-upload-pack` (protocol v2) | Basic is forwarded as sent; a Bearer token goes as Basic `x-access-token:<token>` |
+| `gitlab` | same | Basic is forwarded as sent (CI job tokens need the `gitlab-ci-token` username); a Bearer token goes as Basic `oauth2:<token>` |
+| `custom` | `GET --auth-validate-url` with `--auth-token-header` | Any HTTP endpoint: 2xx allows, 401/403/404 rejects |
+
+`github` and `gitlab` ask upstream's own git endpoint rather than a REST API: a
+metadata API also answers credentials that cannot read the code (GitHub tokens
+with only the Metadata permission, GitLab Guest members, `read_api`-only
+tokens), while `info/refs` only advertises to a credential that can clone. Over
+protocol v2 the answer is a few hundred bytes of capabilities, not the ref
+list, and a 200 only counts if it is a git advertisement.
+
+A 2xx allows the request; 401/403/404 rejects it with 401. Everything else -
+5xx, 3xx (redirects are not followed, so a renamed repo needs its new path),
+429, a throttled 403 (`x-ratelimit-remaining: 0` or `retry-after`) - is *not* a
+verdict on the credential, so the request fails closed with 503: during an
+outage the proxy serves nothing rather than something unvalidated. Concurrent
+identical checks share one call.
+
+`--auth-ttl-seconds` reuses a verdict per `(credential, repo)`. The default `0`
+revalidates every request, so a protocol v2 clone costs at least three checks
+(info/refs, then an upload-pack POST each for `ls-refs` and `fetch`), and a
+checkout with submodules pays that per submodule on every fetch. For
+submodule-heavy or frequently re-fetching workloads, set a short TTL (e.g.
+`60`): that bounds how long a revoked credential keeps working.
+
+Clients route through the proxy as usual and present their credential to it;
+for GitHub Actions:
+
+```bash
+git config --global url."http://git-cache-proxy:8080/".insteadOf "https://github.com/"
+git config --global http."http://git-cache-proxy:8080/".extraHeader \
+  "Authorization: Bearer $GITHUB_TOKEN"
+```
+
+The per-run `GITHUB_TOKEN` is scoped to its repository and expires with the
+job, so a compromised runner can only clone its own repo and cannot persist
+access.
+
+git-LFS does not need a TTL. The batch request is checked like any other, and
+each rewritten download action carries a grant the proxy signs for exactly
+that repo, object, and size, valid for 15 minutes. Object GETs verify the
+grant locally instead of rechecking the credential, and a grant for one repo
+cannot fetch another repo's object from the shared object cache. Every replica
+behind one address must share `--auth-signing-key`, or a grant issued by one
+is refused by the others; the caches themselves stay independent.
 
 ### GitLab with a personal access token
 
@@ -300,26 +384,41 @@ The proxy is a shared, credentialed reader, so a few properties are worth making
 explicit before you expose it:
 
 - **Reachability is the trust boundary.** The proxy fetches from upstream with
-  its own single credential and serves the result to whoever asked. There is no
-  per-repo authorization: with `--serve-token` unset it serves anonymously, and
-  when set the token is one shared secret that grants access to _everything the
-  upstream credential can read_ - including repos a given client could not read
-  directly. Restrict who can reach the proxy (private network, security group,
-  mTLS at the ingress) and treat "can reach the port" as "can read every
-  mirrored repo".
-- **Plain HTTP.** The proxy speaks HTTP, so a `--serve-token` bearer travels in
+  its own single credential and serves the result to whoever asked. With
+  `--serve-token` unset it serves anonymously, and when set the token is one
+  shared secret that grants access to _everything the upstream credential can
+  read_ - including repos a given client could not read directly. Restrict who
+  can reach the proxy (private network, security group, mTLS at the ingress).
+- **Per-request validation bounds, not replaces, reachability.** In
+  `--auth-provider github/gitlab/custom` mode each request must carry a
+  credential that can clone *that repo*, so a leaked client token only exposes
+  what that token already exposed; "can reach the port" becomes "can run an
+  unauthenticated guessing attack against the validation endpoint". Validation
+  fails closed: an outage means a 503 for clients, never an allow, and the
+  proxy still fetches upstream with its own shared read credential - keep that
+  one as narrowly scoped as the fleet allows.
+- **Plain HTTP.** The proxy speaks HTTP, so a client bearer travels in
   cleartext. Terminate TLS in front of it (reverse proxy / ingress) on any
   network you do not fully trust. Upstream fetches use whatever scheme the
   `--upstream` URL specifies - use `https://`.
 - **Defaults are open.** It binds `0.0.0.0:8080` and serves anonymously unless
-  `--serve-token` is set. That is deliberate for a locked-down CI network; do
-  not place it on an untrusted one without a token and TLS.
+  `--serve-token` is set or a provider is configured. That is deliberate for a
+  locked-down CI network; do not place it on an untrusted one without auth and
+  TLS.
 - **DoS knobs.** `--max-concurrent-requests` caps concurrent upstream
   clone/fetch work, `--max-concurrent-upload-packs` caps concurrent
   `pack-objects` memory, and `--max-decoded-body-mb` bounds request-body memory
   (defusing a decompression bomb). `--cache-max-mb` bounds on-disk growth by
   evicting least-recently-used idle mirrors; it defaults to `0` (unlimited), so
   set it - or isolate and monitor the cache volume - on an untrusted network.
+  Provider validation adds one round-trip per request (`3` per v2 clone
+  without a TTL), capped by `--auth-timeout-seconds`, and runs outside the
+  concurrency limit so a hung or flooded check cannot starve serving.
+  `--auth-max-concurrent` bounds the outbound calls in flight, so a flood of
+  junk credentials turns into 503s rather than unbounded load on the git host.
+  Each junk credential still costs one call, and failed logins count against
+  the proxy's egress IP at the git host: rate-limit unauthenticated clients at
+  the ingress.
 - **Read-only.** Only `git-upload-pack` (clone/fetch) is served; `git-receive-pack`
   (push) is refused and upstream is only ever pulled from, never written.
 

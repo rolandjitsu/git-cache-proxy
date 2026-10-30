@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Command-line / environment configuration.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
@@ -12,6 +13,47 @@ pub enum LogFormat {
     Text,
     /// One JSON object per line (for log shippers).
     Json,
+}
+
+/// How clients authenticate to the serving surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthProvider {
+    /// Serve anonymously - for a network-restricted deployment.
+    None,
+    /// Require one shared bearer token, given by `--serve-token`.
+    Shared,
+    /// Validate each request's credential by probing `--upstream` with it
+    /// (`GET {upstream}/{repo}/info/refs`, protocol v2); a bare token is sent
+    /// as Basic `x-access-token:<token>`.
+    Github,
+    /// Like `github`; a bare token is sent as Basic `oauth2:<token>`.
+    Gitlab,
+    /// Validate each request's token against any HTTP endpoint given
+    /// by `--auth-validate-url`.
+    Custom,
+}
+
+impl fmt::Display for AuthProvider {
+    /// The flag value, so messages name the provider exactly as it is passed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_possible_value()
+            .expect("no value is skipped")
+            .get_name()
+            .fmt(f)
+    }
+}
+
+/// How the repo path of a request is presented to the validation endpoint.
+/// Provider modes only admit names of RFC 3986 unreserved characters and `/`,
+/// so no other byte ever needs encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RepoForm {
+    /// `owner/repo`: strip a `.git` suffix (REST-style: one path component per
+    /// segment).
+    Path,
+    /// `owner%2Frepo`: strip `.git`, then encode each `/` (single-parameter
+    /// style, as GitLab's `/projects/{id}` wants).
+    Percent,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -53,6 +95,70 @@ pub struct Config {
     /// Unset = serve anonymously (intended for a network-restricted deployment).
     #[arg(long, env = "GITCACHEPROXY_SERVE_TOKEN", hide_env_values = true)]
     pub serve_token: Option<String>,
+
+    /// Client-auth mode. `github`/`gitlab`/`custom` validate each request's
+    /// credential for the repo it names before any serving, so a client only
+    /// reaches what its own credential could clone directly - the blast radius
+    /// of one leaked runner token is that runner's repos, not the fleet's. The
+    /// default `none` serves anonymously; passing only `--serve-token` keeps the
+    /// legacy shared-secret behavior.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_AUTH_PROVIDER",
+        value_enum,
+        default_value = "none"
+    )]
+    pub auth_provider: AuthProvider,
+
+    /// Provider modes: HMAC key (at least 32 bytes) signing the LFS download
+    /// grants of batch responses. Every replica behind one address needs the
+    /// same key; unset, a random per-process key only suits a single replica.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_SIGNING_KEY", hide_env_values = true)]
+    pub auth_signing_key: Option<String>,
+
+    /// `custom` only: URL template of the validation endpoint, with `{repo}`
+    /// interpolated (already encoded per `--auth-repo-form`). The token must go
+    /// in `--auth-token-header`, not this URL.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_VALIDATE_URL")]
+    pub auth_validate_url: Option<String>,
+
+    /// `custom` only: header line template presenting the client token, with
+    /// `{token}` interpolated - any scheme the endpoint wants, e.g.
+    /// `PRIVATE-TOKEN: {token}`.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_TOKEN_HEADER")]
+    pub auth_token_header: Option<String>,
+
+    /// `custom` only: how the repo name is encoded into `--auth-validate-url`'s
+    /// `{repo}` placeholder.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_REPO_FORM", value_enum)]
+    pub auth_repo_form: Option<RepoForm>,
+
+    /// Total budget for one token-validation request. A hung API must not pin
+    /// a clone request on its own.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_TIMEOUT_SECONDS", default_value_t = 10)]
+    pub auth_timeout_seconds: u64,
+
+    /// Maximum number of token-validation requests in flight. Validation runs
+    /// before `--max-concurrent-requests` admits a request, so this is what
+    /// bounds the outbound calls a flood of junk credentials can trigger. A
+    /// check waits up to `--auth-timeout-seconds` for a slot, then fails closed
+    /// with 503. `0` = unlimited.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_MAX_CONCURRENT", default_value_t = 32)]
+    pub auth_max_concurrent: usize,
+
+    /// Provider modes: allow an `http://` validation endpoint (`--upstream` for
+    /// `github`/`gitlab`, `--auth-validate-url` for `custom`). Off by default:
+    /// every client credential would cross the network in cleartext.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_ALLOW_HTTP")]
+    pub auth_allow_http: bool,
+
+    /// Reuse a validation verdict per `(credential, repo)` for this many
+    /// seconds, so the requests of one clone (info/refs, then an upload-pack
+    /// POST each for `ls-refs` and `fetch` over protocol v2), or repeated
+    /// fetches of the same submodules, validate once. `0` = validate
+    /// every request, the safest default.
+    #[arg(long, env = "GITCACHEPROXY_AUTH_TTL_SECONDS", default_value_t = 0)]
+    pub auth_ttl_seconds: u64,
 
     /// Skip the upstream fetch on `info/refs` if the last fetch started within
     /// this many seconds. Coalesces bursts of clones for the same repo. `0` =

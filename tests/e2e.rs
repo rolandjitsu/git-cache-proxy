@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
+use git_cache_proxy::auth::Auth;
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
@@ -23,6 +24,8 @@ use git_cache_proxy::repo::resolve;
 use git_cache_proxy::server::{AppState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt; // for `oneshot`
+
+mod support;
 
 /// Regression test for the gzip transport bug: git's smart-HTTP client
 /// compresses the `git-upload-pack` request body and sends `Content-Encoding:
@@ -74,13 +77,12 @@ async fn upload_pack_decodes_gzip_encoded_request() {
                 upstream_base: format!("file://{}", up.path().display()),
                 cache_root: cache.path().to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             None,
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,
@@ -203,13 +205,12 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
                 upstream_base: format!("file://{}", up.path().display()),
                 cache_root: cache.path().to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             None,
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -340,13 +341,12 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
                 upstream_base: format!("file://{}", up.path().display()),
                 cache_root: cache.path().to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             None,
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -473,13 +473,12 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
                 upstream_base: format!("file://{}", up.path().display()),
                 cache_root: cache.path().to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             None,
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -854,13 +853,12 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
                 upstream_base: format!("file://{}", up.path().display()),
                 cache_root: cache.path().to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             Some(idx.clone()),
         )),
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: Arc::new(Auth::anonymous()),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -987,6 +985,101 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
     );
 
     server.abort();
+}
+
+/// A real clone through the proxy in `github` mode, probing a mock upstream
+/// `info/refs`: every request of the clone validates, the token reaches git as
+/// an `http.extraHeader` or a tokened URL, and a wrong token is refused with a
+/// 401 before any clone work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_with_per_request_token_auth() {
+    let work = tempfile::tempdir().unwrap();
+    git(work.path(), &["init", "-q", "-b", "main", "."]);
+    std::fs::write(work.path().join("README.md"), "hello\n").unwrap();
+    git(work.path(), &["add", "."]);
+    git(work.path(), &["commit", "-q", "-m", "init"]);
+
+    let up = tempfile::tempdir().unwrap();
+    git(
+        work.path(),
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            ".",
+            up.path().join("repo.git").to_str().unwrap(),
+        ],
+    );
+
+    // Serving clones the real `file://` upstream; only the probe goes here.
+    let (validator, _hits) = support::spawn_validator(support::Reply::Password("good-token")).await;
+    let auth = Arc::new(
+        Auth::build(
+            support::github_auth_config(&validator, 0),
+            Arc::new(Metrics::new()),
+        )
+        .unwrap(),
+    );
+    let proxy = start_proxy_with_auth(up.path(), "8m", auth, "git").await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let checkout = dest.path().join("checkout");
+    let url = proxy.url("repo.git");
+    let extra = format!("http.{url}.extraHeader=Authorization: Bearer good-token");
+    let out = tokio::process::Command::new("git")
+        .arg("-c")
+        .arg(&extra)
+        .arg("clone")
+        .arg("-q")
+        .arg(&url)
+        .arg(&checkout)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .expect("spawn git clone");
+    assert!(
+        out.status.success(),
+        "clone with a valid token failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A tokened clone URL (the credential-helper shape): git only sends it as
+    // Basic after the 401's Basic challenge.
+    let tokened = format!("http://x-access-token:good-token@{}/repo.git", proxy.addr);
+    let out = tokio::process::Command::new("git")
+        .arg("clone")
+        .arg("-q")
+        .arg(&tokened)
+        .arg(dest.path().join("tokened"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .expect("spawn git clone with a tokened url");
+    assert!(
+        out.status.success(),
+        "clone with a tokened url failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A wrong token is refused at auth before any upstream work.
+    let bad_extra = format!("http.{url}.extraHeader=Authorization: Bearer wrong-token");
+    let out = tokio::process::Command::new("git")
+        .arg("-c")
+        .arg(&bad_extra)
+        .arg("clone")
+        .arg("-q")
+        .arg(&url)
+        .arg(dest.path().join("denied"))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .expect("spawn git clone with a bad token");
+    assert!(
+        !out.status.success(),
+        "a wrong token must not clone: the whole point of the mode"
+    );
+
+    proxy.server.abort();
 }
 
 /// A `--depth 1` clone through the proxy must truncate history to the tip commit
@@ -1486,10 +1579,19 @@ impl Proxy {
 /// served over `file://`) with the given `core.bigFileThreshold`. Factors out the
 /// inline proxy setup shared by the protocol-coverage tests.
 async fn start_proxy(up: &Path, big_file_threshold: &str) -> Proxy {
-    start_proxy_with_git(up, big_file_threshold, "git").await
+    start_proxy_with_auth(up, big_file_threshold, Auth::anonymous().into(), "git").await
 }
 
 async fn start_proxy_with_git(up: &Path, big_file_threshold: &str, git_binary: &str) -> Proxy {
+    start_proxy_with_auth(up, big_file_threshold, Auth::anonymous().into(), git_binary).await
+}
+
+async fn start_proxy_with_auth(
+    up: &Path,
+    big_file_threshold: &str,
+    auth: Arc<Auth>,
+    git_binary: &str,
+) -> Proxy {
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
@@ -1509,13 +1611,12 @@ async fn start_proxy_with_git(up: &Path, big_file_threshold: &str, git_binary: &
                 upstream_base: format!("file://{}", up.display()),
                 cache_root: cache.path().to_path_buf(),
                 upstream_auth_header: None,
-                serve_token: None,
             },
             None,
         )),
         upstream_base: format!("file://{}", up.display()),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,

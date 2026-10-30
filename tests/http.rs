@@ -10,13 +10,22 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use git_cache_proxy::auth::Auth;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
 use tower::ServiceExt; // for `oneshot`
 
-fn state(serve_token: Option<String>) -> AppState {
+fn anon() -> Arc<Auth> {
+    Arc::new(Auth::anonymous())
+}
+
+fn shared(token: &str) -> Arc<Auth> {
+    Arc::new(Auth::shared(token))
+}
+
+fn state(auth: Arc<Auth>) -> AppState {
     // None of these tests reach the cache dir; a path under the temp dir that is
     // never created is fine, and keeps the test filesystem-free.
     let cache_root = std::env::temp_dir().join("git-cache-proxy-tests-unused");
@@ -36,7 +45,6 @@ fn state(serve_token: Option<String>) -> AppState {
             upstream_base: "https://upstream.invalid".into(),
             cache_root: cache_root.clone(),
             upstream_auth_header: None,
-            serve_token: None,
         },
         None,
     ));
@@ -45,7 +53,7 @@ fn state(serve_token: Option<String>) -> AppState {
         lfs,
         upstream_base: "https://upstream.invalid".into(),
         cache_root,
-        serve_token,
+        auth,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 0,
         metrics,
@@ -68,12 +76,15 @@ async fn body_string(resp: axum::http::Response<Body>) -> String {
 
 #[tokio::test]
 async fn health_endpoints_return_ok() {
-    assert_eq!(get(state(None), "/healthz").await.status(), StatusCode::OK);
+    assert_eq!(
+        get(state(anon()), "/healthz").await.status(),
+        StatusCode::OK
+    );
 
     // `/readyz` now writes a probe file into the cache root, so give it a real
     // writable dir (kept alive for the duration of the calls).
     let cache = tempfile::tempdir().unwrap();
-    let mut st = state(None);
+    let mut st = state(anon());
     st.cache_root = cache.path().to_path_buf();
     let resp = get(st, "/readyz").await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -85,7 +96,7 @@ async fn readyz_reports_unwritable_cache_as_not_ready() {
     // Point the cache root *under a regular file* so `create_dir_all` fails;
     // readiness must then report 503 rather than a hollow "ok".
     let file = tempfile::NamedTempFile::new().unwrap();
-    let mut st = state(None);
+    let mut st = state(anon());
     st.cache_root = file.path().join("cache");
     let resp = get(st, "/readyz").await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -93,13 +104,17 @@ async fn readyz_reports_unwritable_cache_as_not_ready() {
 
 #[tokio::test]
 async fn push_over_get_is_rejected() {
-    let resp = get(state(None), "/repo.git/info/refs?service=git-receive-pack").await;
+    let resp = get(
+        state(anon()),
+        "/repo.git/info/refs?service=git-receive-pack",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
 async fn push_over_post_is_rejected() {
-    let resp = router(state(None))
+    let resp = router(state(anon()))
         .oneshot(
             Request::post("/repo.git/git-receive-pack")
                 .body(Body::from("0000"))
@@ -113,19 +128,19 @@ async fn push_over_post_is_rejected() {
 #[tokio::test]
 async fn info_refs_requires_upload_pack_service() {
     // No `service=` param -> dumb-http request, which we don't support.
-    let resp = get(state(None), "/repo.git/info/refs").await;
+    let resp = get(state(anon()), "/repo.git/info/refs").await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn unknown_path_is_not_found() {
-    let resp = get(state(None), "/not/a/git/endpoint").await;
+    let resp = get(state(anon()), "/not/a/git/endpoint").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn serve_token_required_when_configured() {
-    let st = state(Some("s3cret".into()));
+    let st = state(shared("s3cret"));
 
     // Missing token -> 401.
     let resp = get(st.clone(), "/repo.git/info/refs?service=git-upload-pack").await;
@@ -146,19 +161,31 @@ async fn serve_token_required_when_configured() {
 
 #[tokio::test]
 async fn valid_token_passes_auth() {
-    // The correct bearer takes check_auth's success path; the request is then
-    // refused as a push (read-only). Reaching that 403 proves auth was accepted,
-    // not short-circuited with a 401.
-    let resp = router(state(Some("s3cret".into())))
+    // The correct bearer clears auth; the path is then not a git endpoint.
+    // Reaching that 404 proves auth was accepted, not short-circuited with a 401.
+    let resp = router(state(shared("s3cret")))
         .oneshot(
-            Request::get("/repo.git/info/refs?service=git-receive-pack")
+            Request::get("/not/a/git/endpoint")
                 .header(header::AUTHORIZATION, "Bearer s3cret")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pushes_and_dumb_http_are_refused_before_auth() {
+    // Refused for everyone, so there is nothing to authenticate.
+    let resp = get(
+        state(shared("s3cret")),
+        "/repo.git/info/refs?service=git-receive-pack",
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = get(state(shared("s3cret")), "/repo.git/info/refs").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -167,20 +194,20 @@ async fn reserved_suffix_repo_path_is_rejected() {
     // mirror's in-flight clone dir (`.__incoming__`) or a mirror mid-eviction
     // (`.__evicting__`); resolve rejects both before any upstream work.
     let resp = get(
-        state(None),
+        state(anon()),
         "/repo.__incoming__.git/info/refs?service=git-upload-pack",
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let resp = get(
-        state(None),
+        state(anon()),
         "/repo.__evicting__.git/info/refs?service=git-upload-pack",
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    let resp = router(state(None))
+    let resp = router(state(anon()))
         .oneshot(
             Request::post("/repo.__incoming__.git/git-upload-pack")
                 .body(Body::from("0000"))
@@ -195,7 +222,7 @@ async fn reserved_suffix_repo_path_is_rejected() {
 async fn upload_pack_rejects_undecodable_body() {
     // A gzip Content-Encoding with a body that is not gzip fails to decode -> 400,
     // before any upstream work.
-    let resp = router(state(None))
+    let resp = router(state(anon()))
         .oneshot(
             Request::post("/repo.git/git-upload-pack")
                 .header(header::CONTENT_ENCODING, "gzip")
@@ -228,7 +255,6 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
             upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
             cache_root: cache.path().to_path_buf(),
             upstream_auth_header: None,
-            serve_token: None,
         },
         None,
     ));
@@ -237,7 +263,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         lfs,
         upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
         cache_root: cache.path().to_path_buf(),
-        serve_token: None,
+        auth: anon(),
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 0,
         metrics: metrics.clone(),
@@ -268,27 +294,27 @@ async fn concurrency_limit_serializes_without_deadlock() {
     // The limit wraps the git-serving fallback (health/readiness/metrics are
     // exempt), and is shared across per-connection service clones. Three
     // concurrent requests through a limit of 1 must serialize and all still
-    // complete - proving permits are released and reused, not leaked. The
-    // push-rejection path is a limited route that returns without upstream work.
-    let mut st = state(None);
+    // complete - proving permits are released and reused, not leaked. A
+    // dumb-http info/refs is a limited route that returns without upstream work.
+    let mut st = state(anon());
     st.max_concurrent = 1;
     let app = router(st);
     let hit = || {
         app.clone().oneshot(
-            Request::get("/repo.git/info/refs?service=git-receive-pack")
+            Request::get("/repo.git/info/refs")
                 .body(Body::empty())
                 .unwrap(),
         )
     };
     let (a, b, c) = tokio::join!(hit(), hit(), hit());
     for r in [a, b, c] {
-        assert_eq!(r.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(r.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 }
 
 #[tokio::test]
 async fn metrics_endpoint_renders_recorded_series() {
-    let st = state(None);
+    let st = state(anon());
     // Drive an auth rejection so at least one series exists, then scrape.
     let _ = get(st.clone(), "/repo.git/info/refs?service=git-receive-pack").await;
 

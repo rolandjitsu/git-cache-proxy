@@ -35,6 +35,41 @@ serveToken:
   existingSecret: ""
   key: token
 
+# Per-request client token validation: each request's credential is checked
+# for the repo it names, so a client only reaches what its own credential could
+# clone directly (short-lived CI tokens are the intended use). Disabled keeps
+# the legacy anonymous/shared-token behavior.
+clientAuth:
+  enabled: false
+  # Required when enabled: github | gitlab | custom. github and gitlab probe the
+  # upstream's own info/refs with the client's credential.
+  provider: ""
+  # custom only: URL template with {repo}, e.g.
+  # http://auth.example.com/validate/{repo}. The token never goes in the URL.
+  validateUrl: ""
+  # custom only: header line presenting the client token, e.g.
+  # `PRIVATE-TOKEN: {token}`. Empty = Authorization: Bearer {token}.
+  tokenHeader: ""
+  # custom only: repo encoding for {repo} - `path` (owner/repo) or `percent`
+  # (owner%2Frepo, GitLab-style). Empty = path.
+  repoForm: ""
+  # Total budget for one validation request. Empty = the binary default (10).
+  timeoutSeconds: ""
+  # Reuse a verdict per (credential, repo) for this many seconds. Empty = 0
+  # (validate every request); set a short TTL for submodule-heavy workloads.
+  ttlSeconds: ""
+  # Validation requests in flight at once; bounds the outbound calls a flood of
+  # junk credentials can cause. Empty = the binary default (32); 0 = unlimited.
+  maxConcurrent: ""
+  # Accept a plain http validation endpoint (upstream for github/gitlab,
+  # validateUrl for custom). Client credentials would travel in cleartext.
+  allowHttp: false
+  # HMAC key (at least 32 bytes) signing LFS download grants. Every replica
+  # behind one Service needs the same key; empty = a random key per pod.
+  signingKey:
+    existingSecret: ""
+    key: signing-key
+
 # Proxy configuration (each maps to a GITCACHEPROXY_* env var / flag).
 config:
   # Skip the upstream fetch on info/refs if the mirror was refreshed within this

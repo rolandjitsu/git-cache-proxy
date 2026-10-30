@@ -15,7 +15,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use git_cache_proxy::config::{Config, LogFormat};
-use git_cache_proxy::{evict, git, lfs, metrics, repo, server};
+use git_cache_proxy::{auth, evict, git, lfs, metrics, repo, server};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -76,6 +76,26 @@ async fn main() -> Result<()> {
 
     let upstream_base = cfg.upstream.trim_end_matches('/').to_string();
 
+    // Resolved at startup so a misconfigured mode fails fast instead of on the
+    // first request.
+    let auth = Arc::new(auth::Auth::build(
+        auth::AuthConfig {
+            provider: cfg.auth_provider,
+            serve_token: cfg.serve_token,
+            validate_url: cfg.auth_validate_url,
+            token_header: cfg.auth_token_header,
+            repo_form: cfg.auth_repo_form,
+            signing_key: cfg.auth_signing_key,
+            timeout: Duration::from_secs(cfg.auth_timeout_seconds),
+            ttl: Duration::from_secs(cfg.auth_ttl_seconds),
+            max_concurrent: cfg.auth_max_concurrent,
+            allow_http: cfg.auth_allow_http,
+            upstream_base: upstream_base.clone(),
+        },
+        metrics.clone(),
+    )?);
+    tracing::info!("client auth: {}", auth.describe());
+
     // Clear any in-flight LFS downloads left by a crash so they never linger; the
     // objects themselves are content-addressed and re-fetched on demand.
     let _ = tokio::fs::remove_dir_all(
@@ -90,7 +110,6 @@ async fn main() -> Result<()> {
             upstream_base: upstream_base.clone(),
             cache_root: cfg.cache_root.clone(),
             upstream_auth_header,
-            serve_token: cfg.serve_token.clone(),
         },
         index.clone(),
     ));
@@ -100,7 +119,7 @@ async fn main() -> Result<()> {
         lfs,
         upstream_base,
         cache_root: cfg.cache_root.clone(),
-        serve_token: cfg.serve_token.clone(),
+        auth,
         max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),
         max_concurrent: cfg.max_concurrent_requests,
         metrics: metrics.clone(),

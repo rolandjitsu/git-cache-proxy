@@ -5,6 +5,7 @@
 //! binary in `main.rs`) so that integration tests can drive the HTTP router and
 //! the git cache in-process. See the binary crate for the runnable entry point.
 
+pub mod auth;
 pub mod config;
 pub mod evict;
 pub mod git;
