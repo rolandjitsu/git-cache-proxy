@@ -18,15 +18,21 @@
 //! behaviour.
 
 use std::collections::HashSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use lru::LruCache;
 use tokio::sync::{Notify, watch};
 
 use crate::git::GitCache;
 use crate::metrics::Metrics;
+
+/// How often the background task reconciles the in-memory index against disk,
+/// dropping entries whose mirror an operator deleted out of band. Only a
+/// coarse resync of the cache-size gauges, so a slow cadence is plenty.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 struct Inner {
     /// Mirror name -> size, kept in access order (front = most-recently-used, back =
@@ -178,6 +184,54 @@ impl CacheIndex {
         victims
     }
 
+    /// Drop tracked entries whose on-disk path has vanished, correcting the total
+    /// and gauges. The index normally assumes the proxy owns the cache dir and keeps
+    /// the total by incremental bookkeeping; this is the one path that tolerates an
+    /// out-of-band deletion (an operator removing a mirror by hand), so the gauges do
+    /// not drift until the next restart rescans. Runs on a timer, off the request
+    /// path; the stat sweep is blocking, so it is done on the blocking pool.
+    async fn reconcile_missing(&self) {
+        let tracked: Vec<(String, PathBuf)> = {
+            let inner = self.lock();
+            inner
+                .cache
+                .iter()
+                .map(|(name, _)| (name.clone(), self.cache_dir(name)))
+                .collect()
+        };
+        if tracked.is_empty() {
+            return;
+        }
+        // Treat only a definitive "not found" as gone; a transient stat error must
+        // not evict a live entry from the index.
+        let missing = tokio::task::spawn_blocking(move || {
+            tracked
+                .into_iter()
+                .filter(|(_, dir)| {
+                    matches!(std::fs::symlink_metadata(dir), Err(e) if e.kind() == ErrorKind::NotFound)
+                })
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        if missing.is_empty() {
+            return;
+        }
+        let mut inner = self.lock();
+        for name in missing {
+            // An entry re-touched since the snapshot (a concurrent re-clone marks it
+            // dirty) is tracked again and pending measurement, so leave it be.
+            if inner.dirty.contains(&name) {
+                continue;
+            }
+            if let Some(size) = inner.cache.pop(&name) {
+                inner.total -= size;
+            }
+        }
+        self.set_gauges(&inner);
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.state.lock().expect("cache index lock")
     }
@@ -188,21 +242,28 @@ impl CacheIndex {
 }
 
 /// Background maintenance task. Measures changed mirrors and evicts the LRU tail
-/// whenever the index signals work, and exits cleanly when `shutdown` fires (or its
+/// whenever the index signals work, periodically reconciles the index against disk
+/// to drop out-of-band deletions, and exits cleanly when `shutdown` fires (or its
 /// sender drops).
 pub async fn run(
     cache: Arc<GitCache>,
     index: Arc<CacheIndex>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
+    // A stall must not unleash a burst of catch-up ticks; one resync suffices.
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The startup scan just read disk, so skip the interval's immediate first tick.
+    reconcile.tick().await;
     loop {
         // Run first: covers the startup-over-cap permit and any signal that arrived
         // while the previous pass ran (a stored `notify_one` permit makes the next
         // wait return immediately, so no work is missed).
         maintain(&cache, &index).await;
         tokio::select! {
-            biased; // prefer shutdown over another pass when both are ready
+            biased; // prefer shutdown over work/reconcile when several are ready
             _ = shutdown.changed() => break,
+            _ = reconcile.tick() => index.reconcile_missing().await,
             _ = index.work.notified() => {}
         }
     }
@@ -603,6 +664,60 @@ mod tests {
         assert!(!blob.exists(), "over-cap LFS blob should be evicted");
         assert_eq!(idx.totals(), (0, 0));
         assert!(metrics.gather().contains("gitcacheproxy_evictions_total 1"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_mirrors_deleted_out_of_band() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        make_mirror(&root.join("keep.git"), 1000, None);
+        make_mirror(&root.join("gone.git"), 2000, None);
+        let metrics = Arc::new(Metrics::new());
+        let idx = CacheIndex::new(root.to_path_buf(), u64::MAX, metrics.clone());
+        let (before, count) = idx.totals();
+        assert_eq!(count, 2);
+
+        // An operator deletes a mirror by hand; nothing signals the index.
+        std::fs::remove_dir_all(root.join("gone.git")).unwrap();
+        assert_eq!(idx.totals(), (before, 2), "index is stale until reconcile");
+
+        idx.reconcile_missing().await;
+        // HEAD (21 bytes) + the 1000-byte pack file.
+        assert_eq!(
+            idx.totals(),
+            (1021, 1),
+            "the vanished mirror is dropped and the total corrected"
+        );
+        assert!(metrics.gather().contains("gitcacheproxy_cache_mirrors 1"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_a_noop_when_nothing_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // An empty index returns before any disk work.
+        let empty = CacheIndex::new(root.to_path_buf(), u64::MAX, Arc::new(Metrics::new()));
+        empty.reconcile_missing().await;
+        assert_eq!(empty.totals(), (0, 0));
+
+        // A populated index whose mirrors all still exist drops nothing.
+        make_mirror(&root.join("present.git"), 100, None);
+        let idx = CacheIndex::new(root.to_path_buf(), u64::MAX, Arc::new(Metrics::new()));
+        let before = idx.totals();
+        idx.reconcile_missing().await;
+        assert_eq!(idx.totals(), before, "present mirrors are left tracked");
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_a_dirty_entry_pending_measurement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = CacheIndex::new(tmp.path().to_path_buf(), u64::MAX, Arc::new(Metrics::new()));
+        // Tracked and dirty but not yet on disk: a mirror deleted and re-cloned,
+        // re-tracked before the reclone has finished writing its dir. Reconcile must
+        // not drop it out from under the pending measurement.
+        idx.mark_changed("recloning.git");
+        idx.reconcile_missing().await;
+        assert_eq!(idx.totals(), (0, 1));
     }
 
     fn dummy_cfg() -> GitConfig {
