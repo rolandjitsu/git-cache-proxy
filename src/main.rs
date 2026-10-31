@@ -59,6 +59,10 @@ async fn main() -> Result<()> {
     };
 
     let metrics = Arc::new(metrics::Metrics::new());
+    metrics.set_config(
+        cfg.cache_max_mb.saturating_mul(1024 * 1024),
+        cfg.fetch_ttl_seconds,
+    );
 
     // Bound the cache on disk only when a cap is set; with `0` no index is built
     // and the eviction machinery stays inert, preserving the zero-overhead

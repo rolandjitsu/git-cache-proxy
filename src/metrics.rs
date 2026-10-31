@@ -137,6 +137,13 @@ pub struct Metrics {
     cache_bytes: IntGauge,
     /// `cache_mirrors` - number of cached mirrors (same caveat as `cache_bytes`).
     cache_mirrors: IntGauge,
+    /// `cache_max_bytes` - the configured on-disk cache cap in bytes (`0` =
+    /// unlimited). Static, set once at startup; pairs with `cache_bytes` so a
+    /// dashboard can show utilization without hardcoding the cap.
+    cache_max_bytes: IntGauge,
+    /// `fetch_ttl_seconds` - the configured upstream fetch TTL in seconds (`0` =
+    /// always fetch). Static, set once at startup.
+    fetch_ttl_seconds: IntGauge,
     /// `evictions_total` - idle mirrors evicted to keep the cache under the cap.
     evictions: IntCounter,
     /// `lfs_objects_total{result}` - cached git-LFS object lookups; result = hit
@@ -176,6 +183,16 @@ impl Metrics {
         let cache_mirrors = IntGauge::new(
             "gitcacheproxy_cache_mirrors",
             "Number of cached mirrors on disk",
+        )
+        .expect("valid metric");
+        let cache_max_bytes = IntGauge::new(
+            "gitcacheproxy_cache_max_bytes",
+            "Configured on-disk cache cap in bytes (0 = unlimited)",
+        )
+        .expect("valid metric");
+        let fetch_ttl_seconds = IntGauge::new(
+            "gitcacheproxy_fetch_ttl_seconds",
+            "Configured upstream fetch TTL in seconds (0 = always fetch)",
         )
         .expect("valid metric");
         let evictions = IntCounter::new(
@@ -222,6 +239,12 @@ impl Metrics {
             .register(Box::new(cache_mirrors.clone()))
             .expect("register cache_mirrors");
         registry
+            .register(Box::new(cache_max_bytes.clone()))
+            .expect("register cache_max_bytes");
+        registry
+            .register(Box::new(fetch_ttl_seconds.clone()))
+            .expect("register fetch_ttl_seconds");
+        registry
             .register(Box::new(evictions.clone()))
             .expect("register evictions");
         registry
@@ -239,6 +262,8 @@ impl Metrics {
             upstream,
             cache_bytes,
             cache_mirrors,
+            cache_max_bytes,
+            fetch_ttl_seconds,
             evictions,
             lfs_objects,
             upstream_duration,
@@ -267,6 +292,12 @@ impl Metrics {
     pub fn set_cache_size(&self, bytes: u64, mirrors: usize) {
         self.cache_bytes.set(bytes as i64);
         self.cache_mirrors.set(mirrors as i64);
+    }
+
+    /// Publish the static config gauges. Called once at startup.
+    pub fn set_config(&self, cache_max_bytes: u64, fetch_ttl_seconds: u64) {
+        self.cache_max_bytes.set(cache_max_bytes as i64);
+        self.fetch_ttl_seconds.set(fetch_ttl_seconds as i64);
     }
 
     /// Record one evicted mirror.
@@ -322,6 +353,7 @@ mod tests {
         m.record_upstream(UpstreamOp::Fetch, Status::Ok, "group/foo.git");
         m.record_upstream(UpstreamOp::Clone, Status::Error, "group/bar.git");
         m.set_cache_size(2048, 3);
+        m.set_config(1024 * 1024, 10);
         m.record_eviction();
         m.record_eviction();
         m.record_lfs(LfsResult::Hit);
@@ -332,6 +364,8 @@ mod tests {
         let out = m.gather();
         assert!(out.contains("gitcacheproxy_cache_bytes 2048"));
         assert!(out.contains("gitcacheproxy_cache_mirrors 3"));
+        assert!(out.contains("gitcacheproxy_cache_max_bytes 1048576"));
+        assert!(out.contains("gitcacheproxy_fetch_ttl_seconds 10"));
         assert!(out.contains("gitcacheproxy_evictions_total 2"));
         assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="hit"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="miss"} 1"#));
