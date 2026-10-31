@@ -241,6 +241,8 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
 | `upstream_ops_total`        | counter   | `op`, `result`, `repo` | Upstream git operations (initial mirror clone, refresh fetch, want fetch)     |
 | `cache_bytes`               | gauge     | -                      | Total size of the on-disk mirror cache, in bytes                              |
 | `cache_mirrors`             | gauge     | -                      | Number of cached mirrors on disk                                              |
+| `cache_max_bytes`           | gauge     | -                      | Configured on-disk cache cap in bytes (`0` = unlimited)                        |
+| `fetch_ttl_seconds`         | gauge     | -                      | Configured upstream fetch TTL in seconds (`0` = always fetch)                  |
 | `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
 | `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
 | `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
@@ -269,6 +271,9 @@ Notes:
 
 - `cache_bytes` and `cache_mirrors` are maintained only when a cache cap is
   configured (`--cache-max-mb`); without a cap they stay `0`.
+- `cache_max_bytes` and `fetch_ttl_seconds` echo the configured flags as static
+  gauges, set once at startup, so a dashboard can read cache utilization as
+  `cache_bytes / cache_max_bytes` without hardcoding the cap.
 - `lfs_objects_total` has no `repo` label: LFS objects are content-addressed
   and shared across repos.
 - The histograms are observed only on success and share buckets from 50ms to
