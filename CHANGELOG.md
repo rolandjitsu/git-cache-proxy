@@ -3,6 +3,17 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.8 (2026-10-31)
+
+### Features
+
+- expose cache cap and TTL gauges
+- count info/refs cache outcomes
+
+### Fixes
+
+- heal index after out-of-band deletes
+
 ## 0.2.7 (2026-10-31)
 
 ### Fixes
