@@ -126,6 +126,20 @@ linked. Cached objects share the `--cache-max-mb` budget and LRU eviction with t
 git mirrors. No configuration is needed: LFS is served on the same endpoints the git
 client already routes through the proxy.
 
+### Cache management
+
+The cache is self-managing. Mirrors are created on first request, and with
+`--cache-max-mb` set, least-recently-used idle ones are evicted in the background
+once the total exceeds the cap - that cap is the intended way to reclaim disk. There
+is no endpoint to delete a specific mirror, and none is needed: an evicted or missing
+mirror is transparently re-cloned on its next request, so eviction is a cache
+concern, never a correctness one.
+
+Deleting a mirror directory by hand works but is not the intended lever. The proxy
+assumes it owns the cache root, so a manual deletion reaches the cache-size metrics
+only once the background task reconciles it (within a minute) or the next restart
+rescans. Prefer `--cache-max-mb`.
+
 ## Benchmark
 
 For a fleet of ephemeral clients fetching the same content, only the first fetch
