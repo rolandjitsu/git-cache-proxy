@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.7 (2026-10-31)
+
+### Fixes
+
+- bump quinn-proto and chacha20
+
 ## 0.2.6 (2026-10-17)
 
 ### Features
