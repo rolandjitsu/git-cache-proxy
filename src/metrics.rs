@@ -16,6 +16,8 @@ use prometheus::{
     TextEncoder,
 };
 
+use crate::git::CacheOutcome;
+
 /// Histogram buckets, in seconds, for git operation latency: from a fast cached
 /// advertisement (tens of ms) to a large clone over a slow WAN (minutes).
 const DURATION_BUCKETS: &[f64] = &[
@@ -150,6 +152,11 @@ pub struct Metrics {
     /// (served from disk) | miss (fetched from upstream, then cached) | error. No
     /// `repo` label: objects are content-addressed and shared across repos.
     lfs_objects: IntCounterVec,
+    /// `cache_outcome_total{outcome}` - info/refs operations by outcome: cloned
+    /// (first mirror of a repo) | fetched (refresh from upstream) | cached (served
+    /// from the local mirror, no upstream call). Recorded once per advertisement,
+    /// so the local-hit ratio is `cached / sum without (outcome) (...)`.
+    cache_outcome: IntCounterVec,
     /// `upstream_duration_seconds{op, repo}` - clone/fetch wall-clock, observed
     /// only on success (same bounded-`repo` discipline as the counters).
     upstream_duration: HistogramVec,
@@ -208,6 +215,14 @@ impl Metrics {
             &["result"],
         )
         .expect("valid metric");
+        let cache_outcome = IntCounterVec::new(
+            Opts::new(
+                "gitcacheproxy_cache_outcome_total",
+                "info/refs operations by cache outcome (cloned/fetched/cached)",
+            ),
+            &["outcome"],
+        )
+        .expect("valid metric");
         let upstream_duration = HistogramVec::new(
             HistogramOpts::new(
                 "gitcacheproxy_upstream_duration_seconds",
@@ -251,6 +266,9 @@ impl Metrics {
             .register(Box::new(lfs_objects.clone()))
             .expect("register lfs_objects");
         registry
+            .register(Box::new(cache_outcome.clone()))
+            .expect("register cache_outcome");
+        registry
             .register(Box::new(upstream_duration.clone()))
             .expect("register upstream_duration");
         registry
@@ -266,6 +284,7 @@ impl Metrics {
             fetch_ttl_seconds,
             evictions,
             lfs_objects,
+            cache_outcome,
             upstream_duration,
             serve_duration,
         }
@@ -308,6 +327,17 @@ impl Metrics {
     /// Record a cached LFS object lookup (hit / miss / error).
     pub fn record_lfs(&self, result: LfsResult) {
         self.lfs_objects.with_label_values(&[result.as_str()]).inc();
+    }
+
+    /// Record the outcome of an info/refs operation (cloned / fetched / cached) -
+    /// the local-vs-upstream signal for one clone/fetch.
+    pub fn record_cache_outcome(&self, outcome: CacheOutcome) {
+        let label = match outcome {
+            CacheOutcome::Cloned => "cloned",
+            CacheOutcome::Fetched => "fetched",
+            CacheOutcome::Cached => "cached",
+        };
+        self.cache_outcome.with_label_values(&[label]).inc();
     }
 
     /// Observe an upstream op's duration. Call only on success with the real repo,
@@ -358,6 +388,9 @@ mod tests {
         m.record_eviction();
         m.record_lfs(LfsResult::Hit);
         m.record_lfs(LfsResult::Miss);
+        m.record_cache_outcome(CacheOutcome::Cached);
+        m.record_cache_outcome(CacheOutcome::Fetched);
+        m.record_cache_outcome(CacheOutcome::Cloned);
         m.observe_upstream(UpstreamOp::Clone, "group/foo.git", 1.5);
         m.observe_serve(ServeKind::UploadPack, "group/foo.git", 2.0);
 
@@ -369,6 +402,9 @@ mod tests {
         assert!(out.contains("gitcacheproxy_evictions_total 2"));
         assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="hit"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_lfs_objects_total{result="miss"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="cached"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="fetched"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="cloned"} 1"#));
         assert!(out.contains(
             r#"gitcacheproxy_upstream_duration_seconds_count{op="clone",repo="group/foo.git"} 1"#
         ));

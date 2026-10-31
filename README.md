@@ -245,6 +245,7 @@ Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
 | `fetch_ttl_seconds`         | gauge     | -                      | Configured upstream fetch TTL in seconds (`0` = always fetch)                  |
 | `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
 | `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
+| `cache_outcome_total`       | counter   | `outcome`              | info/refs operations by outcome: served locally vs. fetched from upstream     |
 | `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
 | `serve_duration_seconds`    | histogram | `kind`, `repo`         | Time to serve a client, measured to the end of the response                   |
 
@@ -261,6 +262,9 @@ Label values:
 - `op`: `clone` (first mirror of a repo), `fetch` (refresh of an existing
   mirror), `want_fetch` (on-demand fetch of a bare SHA the mirror lacks, e.g. a
   PR merge commit).
+- `outcome` on `cache_outcome_total`: `cloned` (first mirror of a repo),
+  `fetched` (refresh from upstream), `cached` (served from the local mirror with
+  no upstream call). Recorded once per info/refs advertisement.
 - `repo`: the served repo path (e.g. `group/project.git`). To keep cardinality
   bounded, the real path is emitted only on success; every failure (failed auth,
   malformed path, upstream error) uses a `-` sentinel, so a flood of distinct
@@ -276,6 +280,8 @@ Notes:
   `cache_bytes / cache_max_bytes` without hardcoding the cap.
 - `lfs_objects_total` has no `repo` label: LFS objects are content-addressed
   and shared across repos.
+- `cache_outcome_total` is the local-vs-upstream signal: the share of operations
+  served without touching upstream is `cached / sum without (outcome) (...)`.
 - The histograms are observed only on success and share buckets from 50ms to
   300s, sized for anything from a cached ref advertisement to a large clone
   over a slow WAN.

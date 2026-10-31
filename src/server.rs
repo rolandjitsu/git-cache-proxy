@@ -336,11 +336,18 @@ async fn info_refs(st: AppState, path: &str, git_protocol: Option<&str>) -> Resp
     // here we only account for the client request. The `repo` label is emitted only
     // once a request is served; failures use `-` so a flood of distinct but doomed
     // repo paths cannot inflate label cardinality (see `metrics`).
-    if let Err(e) = st.cache.ensure_fresh(&repo, true, &[]).await {
-        st.metrics
-            .record_request(RequestKind::InfoRefs, Status::UpstreamError, "-");
-        tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
-        return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
+    // Record the cache outcome here, not on the upload-pack path: info/refs is
+    // where the clone/fetch/TTL decision is made, so it is the per-operation
+    // local-vs-upstream signal (upload-pack runs with `want_fetch=false` and is
+    // almost always `Cached`, which would skew the ratio).
+    match st.cache.ensure_fresh(&repo, true, &[]).await {
+        Ok(outcome) => st.metrics.record_cache_outcome(outcome),
+        Err(e) => {
+            st.metrics
+                .record_request(RequestKind::InfoRefs, Status::UpstreamError, "-");
+            tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
+            return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
+        }
     }
 
     match st.cache.advertise_refs(&repo, git_protocol).await {
