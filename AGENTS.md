@@ -36,6 +36,10 @@ cargo test --all-features
   voice: `feat: add fetch TTL`, not `added` or `adds`.
 - Keep the body minimal. The subject alone is often enough; add body lines only for the
   non-obvious *why*. Do not restate the diff or enumerate every file changed.
+- Wrap body lines at 72 columns. The CI `commits` job runs `crate-ci/committed`, which fails
+  with `error Line is too long, N exceeds the max length of 72` on a longer line. A line that
+  cannot be wrapped (one unbreakable token, or a long URL or path at its end) is exempt;
+  ordinary prose is not, even when it ends in a long token.
 - Disclose AI with an `Assisted-by: Claude:claude-opus-4-8` trailer. Never `Co-Authored-By`, and
   never add a human's `Signed-off-by`.
 
