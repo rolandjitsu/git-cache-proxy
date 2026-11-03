@@ -489,8 +489,15 @@ async fn info_refs(
     // where the clone/fetch/TTL decision is made, so it is the per-operation
     // local-vs-upstream signal (upload-pack runs with `want_fetch=false` and is
     // almost always `Cached`, which would skew the ratio).
-    match st.cache.ensure_fresh(&repo, true, &[], cred).await {
-        Ok(outcome) => st.metrics.record_cache_outcome(outcome),
+    let guard = match st
+        .cache
+        .prepare(repo.clone(), true, Bytes::new(), cred)
+        .await
+    {
+        Ok((outcome, guard)) => {
+            st.metrics.record_cache_outcome(outcome);
+            guard
+        }
         Err(e) => {
             // In `client` mode the credential is the client's own, so an upstream
             // rejection is the client's 401, not a 502; drop the stale verdict so
@@ -506,9 +513,13 @@ async fn info_refs(
             tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
             return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
         }
-    }
+    };
 
-    match st.cache.advertise_refs(&repo, git_protocol).await {
+    match st
+        .cache
+        .advertise_refs_guarded(&repo, git_protocol, guard)
+        .await
+    {
         Ok(body) => {
             st.metrics
                 .record_request(RequestKind::InfoRefs, Status::Ok, name);
@@ -550,20 +561,31 @@ async fn upload_pack(
     // The preceding info/refs already refreshed; here just ensure the mirror is
     // present (a client could POST against a not-yet-cloned repo) and that any
     // want-by-SHA the body asks for is fetched and pinned before serving.
-    if let Err(e) = st.cache.ensure_fresh(&repo, false, &body, cred).await {
-        if st.upstream_credential == UpstreamCredential::Client && is_auth_failure(&e) {
-            st.auth.invalidate(headers, name);
+    let guard = match st
+        .cache
+        .prepare(repo.clone(), false, body.clone(), cred)
+        .await
+    {
+        Ok((_, guard)) => guard,
+        Err(e) => {
+            if st.upstream_credential == UpstreamCredential::Client && is_auth_failure(&e) {
+                st.auth.invalidate(headers, name);
+                st.metrics
+                    .record_request(RequestKind::UploadPack, Status::Unauthorized, "-");
+                return unauthorized(&st.auth, "upstream rejected the credential");
+            }
             st.metrics
-                .record_request(RequestKind::UploadPack, Status::Unauthorized, "-");
-            return unauthorized(&st.auth, "upstream rejected the credential");
+                .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
+            tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
+            return err(StatusCode::BAD_GATEWAY, "upstream unavailable");
         }
-        st.metrics
-            .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
-        tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
-        return err(StatusCode::BAD_GATEWAY, "upstream unavailable");
-    }
+    };
 
-    match st.cache.upload_pack_rpc(&repo, git_protocol, body).await {
+    match st
+        .cache
+        .upload_pack_rpc_guarded(&repo, git_protocol, body, guard)
+        .await
+    {
         Ok(stream) => {
             st.metrics
                 .record_request(RequestKind::UploadPack, Status::Ok, name);

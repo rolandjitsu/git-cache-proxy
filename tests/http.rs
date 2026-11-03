@@ -328,6 +328,82 @@ async fn metrics_endpoint_renders_recorded_series() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn local_git_failures_return_internal_server_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let wrapper = dir.path().join("git");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = fetch ]; then exit 0; fi\ndone\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut st = state(anon_auth());
+    st.cache_root = dir.path().join("cache");
+    let mirror = st.cache_root.join("repo.git");
+    std::fs::create_dir_all(&mirror).unwrap();
+    std::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    st.cache = Arc::new(GitCache::new(
+        GitConfig {
+            git_binary: wrapper.to_string_lossy().into_owned(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(60),
+            max_wants: 100,
+            max_upload_packs: 0,
+            pack_threads: None,
+            pack_window_memory: None,
+        },
+        st.metrics.clone(),
+        None,
+    ));
+    let repo =
+        git_cache_proxy::repo::resolve("repo.git", &st.upstream_base, &st.cache_root).unwrap();
+    // Establish freshness so the HTTP requests exercise only serving failures.
+    st.cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+    let response = get(st.clone(), "/repo.git/info/refs?service=git-upload-pack").await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body_string(response).await, "advertise-refs failed\n");
+
+    assert!(st.cache.advertise_refs(&repo, None).await.is_err());
+    std::fs::remove_file(&wrapper).unwrap();
+    assert!(st.cache.advertise_refs(&repo, None).await.is_err());
+    assert!(
+        st.cache
+            .upload_pack_rpc(&repo, None, axum::body::Bytes::new())
+            .await
+            .is_err()
+    );
+    let response = router(st.clone())
+        .oneshot(
+            Request::post("/repo.git/git-upload-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body_string(response).await, "upload-pack failed\n");
+    st.cache.shutdown().await;
+}
+
+#[test]
+fn auth_debug_redacts_shared_credentials() {
+    let auth = Auth::shared("private-serve-token");
+    let debug = format!("{auth:?}");
+    assert!(debug.contains("Auth"));
+    assert!(!debug.contains("private-serve-token"));
+}
+
+#[test]
+fn default_metrics_exports_registered_counters() {
+    let metrics = Metrics::default();
+    assert!(metrics.gather().contains("gitcacheproxy_"));
+}
+
 // --- Test helpers ---------------------------------------------------------
 
 /// An anonymous `Auth`: no client credential is checked.
@@ -388,4 +464,109 @@ async fn body_string(resp: axum::http::Response<Body>) -> String {
         .await
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn cancelled_advertisements_keep_request_cap_until_exit() {
+    check_cancelled_advertisements(false).await;
+    check_cancelled_advertisements(true).await;
+}
+
+#[cfg(unix)]
+async fn check_cancelled_advertisements(stale: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mirror = root.join("repo.git");
+    std::fs::create_dir_all(&mirror).unwrap();
+    std::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let marker = dir.path().join("started");
+    let gate = dir.path().join("gate");
+    let log = dir.path().join("log");
+    for fifo in [&marker, &gate] {
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let wrapper = dir.path().join("git");
+    std::fs::write(&wrapper, format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --advertise-refs ]; then\n    echo started >> '{}'\n    echo started > '{}'\n    read gate < '{}'\n  fi\ndone\nexit 0\n", log.display(), marker.display(), gate.display())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let cfg = GitConfig {
+        git_binary: wrapper.to_string_lossy().into_owned(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::from_secs(60),
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+    };
+    let cache = Arc::new(
+        GitCache::new(cfg, metrics.clone(), None)
+            .with_stale(Duration::from_secs(if stale { 60 } else { 0 }), 1)
+            .with_request_limit(1),
+    );
+    let mut st = state(anon_auth());
+    st.cache = cache.clone();
+    st.cache_root = root;
+    st.metrics = metrics;
+    st.max_concurrent = 1;
+    let app = router(st);
+
+    for attempt in 1..=3 {
+        let started = tokio::spawn({
+            let marker = marker.clone();
+            async move { tokio::fs::read_to_string(marker).await.unwrap() }
+        });
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/repo.git/info/refs?service=git-upload-pack")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+            }
+        });
+        if attempt > 1 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(!request.is_finished());
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap().lines().count(),
+                attempt - 1
+            );
+            let mut writer = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&gate)
+                .await
+                .unwrap();
+            writer.write_all(b"go\n").await.unwrap();
+        }
+        assert_eq!(started.await.unwrap().trim(), "started");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            attempt
+        );
+        request.abort();
+        let _ = request.await;
+    }
+    let mut writer = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&gate)
+        .await
+        .unwrap();
+    writer.write_all(b"go\n").await.unwrap();
+    drop(writer);
+    cache.evict("repo.git", &mirror).await.unwrap();
+    cache.shutdown().await;
+    assert!(!mirror.exists());
 }

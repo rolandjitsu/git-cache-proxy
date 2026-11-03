@@ -79,6 +79,24 @@ Every flag has an environment-variable equivalent; the full reference is in
 - `--serve-token` / `--auth-provider`: how clients authenticate to the proxy.
 - `--cache-max-mb`: cap on-disk cache size (LRU eviction; `0` = unlimited).
 
+With a positive `--max-stale-seconds`, an existing mirror can serve cached refs
+while one background fetch updates it. Age is measured from the start of the last
+successful clone or fetch. When its age exceeds the limit, a request waits for a
+refresh or fails. After restart, a mirror's age is unknown and it must refresh
+before serving. Background attempts are limited globally and retried no sooner
+than the fetch TTL, or one second, after the previous attempt completes.
+
+Fetch-triggered automatic Git maintenance is disabled in this mode so a refresh
+does not delete objects just advertised to a client. Active requests are protected
+from proxy eviction until their Git process exits. There is no fixed limit between
+advertisement and upload-pack, so eviction or external Git maintenance between
+requests can remove an old object. A missing SHA is fetched on demand when the
+upstream permits it; this is best effort. In this mode a client with access to a
+mirror can request any object already present in that mirror by SHA, including an
+object no longer reachable from an advertised ref.
+
+Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text-format metrics - per-repo request and
@@ -129,8 +147,7 @@ Pin a version and try it against your own setup before relying on it.
 
 Not yet implemented:
 
-- A background/scheduled refresh (today every `info/refs` triggers an on-demand,
-  TTL-coalesced fetch).
+- Scheduled refresh. Background refresh is triggered by requests.
 
 **Non-goal: a git-free image.** The `git` binary is a permanent runtime
 dependency: the proxy serves clients by running `git upload-pack`, and no

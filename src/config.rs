@@ -7,6 +7,14 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
+fn positive_usize(value: &str) -> Result<usize, String> {
+    let value: usize = value.parse().map_err(|_| "expected a positive integer")?;
+    if value == 0 || value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err("value is outside the semaphore range".into());
+    }
+    Ok(value)
+}
+
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LogFormat {
@@ -215,6 +223,14 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_FETCH_TTL_SECONDS", default_value_t = 10)]
     pub fetch_ttl_seconds: u64,
 
+    /// Maximum age of cached refs served while refreshing; 0 disables this mode.
+    #[arg(long, env = "GITCACHEPROXY_MAX_STALE_SECONDS", default_value_t = 0)]
+    pub max_stale_seconds: u64,
+
+    /// Maximum number of concurrent background refreshes.
+    #[arg(long, env = "GITCACHEPROXY_MAX_BACKGROUND_FETCHES", default_value_t = 4, value_parser = positive_usize)]
+    pub max_background_fetches: usize,
+
     /// Maximum number of requests handled concurrently, shared across all
     /// connections. Excess requests queue until a slot frees. This bounds the
     /// concurrent upstream clone/fetch work a burst can trigger (the slot is held
@@ -349,5 +365,13 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("--upstream-auth-header"), "{err}");
+    }
+
+    #[test]
+    fn background_fetch_limit_must_be_positive_and_fit_a_semaphore() {
+        assert_eq!(positive_usize("1").unwrap(), 1);
+        assert!(positive_usize("0").is_err());
+        assert!(positive_usize("invalid").is_err());
+        assert!(positive_usize(&usize::MAX.to_string()).is_err());
     }
 }
