@@ -16,149 +16,15 @@ over a slow or expensive link to an on-prem origin. Point the fleet at a
 proxy running next to them and the bulk history is served locally; only new
 commits cross the WAN, deduplicated across the whole fleet.
 
-## Why not just a mirror or an HTTP cache?
+It is **lazy and pull-only**: it caches on first request, runs an incremental
+`git fetch` before serving so a client always gets the ref it asked for, and
+never pushes or replicates to the origin. All wire-protocol work is delegated to
+the system `git` binary, so **v2**, shallow, and partial (filtered) clones are
+git's responsibility, not something the proxy reimplements. git-LFS objects are
+cached too.
 
-- A **generic HTTP cache** doesn't work: `git fetch` is a _negotiated_ pack
-  transfer (`POST /git-upload-pack` responses are computed per request), so
-  there's nothing static to cache.
-- A **scheduled full mirror** (Gitea pull-mirror, etc.) means enumerating and
-  replicating every repo, and it can lag the exact commit CI just pushed.
-
-This proxy is **lazy and pull-only**: it caches on first request, and on every
-request it does an incremental `git fetch` from upstream _before_ serving - so
-a client always gets the ref it asked for, and nothing is ever proactively
-pushed or replicated to where the proxy runs. That last property tends to be
-the difference between "sure" and "absolutely not" when the origin is sensitive.
-
-## How it compares
-
-| Approach                                     | Caches `fetch` [1] | Lazy [2] | Fresh ref [3] | Delta-only WAN [4] | Pull-only [5] | Any origin [6] |
-| -------------------------------------------- | :----------------: | :------: | :-----------: | :----------------: | :-----------: | :------------: |
-| **git-cache-proxy**                          |        yes         |   yes    |      yes      |        yes         |      yes      |      yes       |
-| Generic HTTP cache (nginx / Varnish)         |         no         |   n/a    |      no       |         no         |      yes      |      yes       |
-| Scheduled mirror (Gitea / GitLab pull-mirror)|        yes         |    no    |      lag      |         no         |      no       |      yes       |
-| `git clone --reference` / alternates         |        n/a         |    no    |     seed      |        yes         |      yes      |      yes       |
-| GitLab Geo / server geo-replication          |        yes         |    no    |      yes      |         no         |      no       |       no       |
-
-1. Caches the _negotiated_ `git-upload-pack` response, not just static objects - a plain
-   HTTP cache can't, because every fetch is computed per request.
-2. Caches on first request; no repo enumeration or replication schedule to run.
-3. Serves the exact ref asked for. The proxy fetches upstream _before_ serving; a scheduled
-   mirror can lag its refresh interval (`lag`); `--reference` is only as fresh as its local
-   seed (`seed`).
-4. Only new objects cross the WAN per request; the bulk history is served from the local mirror.
-5. Never writes to or proactively replicates from the origin - it only ever pulls what a
-   client requested.
-6. Works against any unmodified Git smart-HTTP origin. GitLab Geo needs GitLab on both ends.
-
-## How it works
-
-All git work is delegated to the system `git` binary, so protocol correctness -
-**protocol v2**, shallow and partial (filtered) clones - comes for free.
-
-```
-GET  <repo>/info/refs?service=git-upload-pack
-  1. resolve <repo> -> upstream URL + local bare mirror dir
-  2. clone --mirror (first time) or fetch --prune (coalesced per repo)
-  3. serve `git upload-pack --advertise-refs` from the mirror
-POST <repo>/git-upload-pack
-  -> stream `git upload-pack --stateless-rpc` from the mirror (packfile)
-anything git-receive-pack  -> 403 (read-only)
-```
-
-Concurrent clients for the same repo are serialized so a burst triggers a single
-upstream fetch; a short TTL coalesces repeated requests.
-
-Upstream clone/fetch retries recognized transient network failures up to three
-times after the first attempt, waiting 1, 2, then 4 seconds. This includes TLS
-EOF, connection resets/timeouts, temporary DNS failures, and HTTP 408, 429,
-500, 502, 503, and 504. Authentication, missing repositories, certificate
-validation, local filesystem errors, and unknown failures are not retried.
-Classification uses Git's English stderr diagnostics; the child locale is fixed
-to `C`. Retry logs contain the operation, attempt, delay, and error category,
-without raw upstream stderr or credentials.
-
-Retries stay inside the existing per-repository lock. Each failed clone's staging
-directory is removed before another attempt; an existing fetch mirror is kept.
-Only success updates the freshness timestamp. After retries are exhausted the
-request still fails with 502; stale refs are not served as a fallback. The retry
-budget limits attempts and adds at most seven seconds of backoff; it does not
-impose a new transfer timeout on large repositories. LFS and local upload-pack
-operations are outside this retry policy.
-
-If a client `want`s a commit by SHA that the mirror never captured - typically a
-GitHub pull-request merge commit, which lives only under the unadvertised
-`refs/pull/<n>/merge` and so is what `actions/checkout` fetches on a PR build - the
-proxy fetches that SHA from upstream on demand and serves it, instead of failing
-with `not our ref`. This relies on the upstream serving arbitrary SHAs (GitHub's
-`uploadpack.allowAnySHA1InWant`, which is on); an upstream that refuses simply
-leaves the request to fail as it would without the proxy. Ordinary branch/tag
-clones are unaffected - they pay only a cheap local object check, never an extra
-upstream call. Each fetched SHA is pinned under a reserved ref so the mirror can
-keep serving it; `--max-wants` bounds how many such pins a mirror retains, pruning
-the oldest so they cannot accumulate without bound (like the mirror-level LRU, but
-scoped to a single mirror's pins). If a single request needs more new SHAs than
-`--max-wants`, only that many are fetched and the excess wants are left to fail with
-`not our ref` (the proxy logs a `capping want-by-sha fetch` warning); such a request
-would immediately have its pins pruned anyway, so raise `--max-wants` if you expect
-that many unadvertised objects at once.
-
-### git-LFS
-
-LFS objects use a different HTTP API from the git protocol, so they are cached
-separately:
-
-```
-POST <repo>/info/lfs/objects/batch
-  -> forward to upstream, then rewrite each object's download URL back to this
-     proxy so the object fetch is cached here
-GET  <repo>/info/lfs/objects/<oid>
-  -> serve from the on-disk cache, or on a miss fetch it from upstream once
-     (verify sha256 == oid, store), then serve
-anything with operation=upload  -> 403 (read-only)
-```
-
-Objects are content-addressed and immutable, so a cached object is never stale and
-is shared across every repo that references the same oid; the first fetch across the
-fleet pays the WAN cost, the rest are served locally. The upstream LFS transfer is
-in-process over HTTPS (reqwest + rustls, no OpenSSL), so the binary stays statically
-linked. Cached objects share the `--cache-max-mb` budget and LRU eviction with the
-git mirrors. No configuration is needed: LFS is served on the same endpoints the git
-client already routes through the proxy.
-
-### Cache management
-
-The cache is self-managing. Mirrors are created on first request, and with
-`--cache-max-mb` set, least-recently-used idle ones are evicted in the background
-once the total exceeds the cap - that cap is the intended way to reclaim disk. There
-is no endpoint to delete a specific mirror, and none is needed: an evicted or missing
-mirror is transparently re-cloned on its next request, so eviction is a cache
-concern, never a correctness one.
-
-Deleting a mirror directory by hand works but is not the intended lever. The proxy
-assumes it owns the cache root, so a manual deletion reaches the cache-size metrics
-only once the background task reconciles it (within a minute) or the next restart
-rescans. Prefer `--cache-max-mb`.
-
-## Benchmark
-
-For a fleet of ephemeral clients fetching the same content, only the first fetch
-pays the WAN cost; the rest are served locally. Over an emulated 20 Mbit/s,
-60 ms-RTT link - cloning a 64 MB repo, and fetching a 32 MB git-LFS object:
-
-| Scenario                          |    Time | WAN bytes |
-| --------------------------------- | ------: | --------: |
-| Clone, direct (today)             |  28.1 s |     64 MB |
-| Clone, via proxy cold (runner 1)  |  28.5 s |     64 MB |
-| Clone, via proxy warm (2..N)      |   0.6 s |     ~0 MB |
-| LFS object, cold (runner 1)       |  12.8 s |     32 MB |
-| LFS object, warm (2..N)           |   0.2 s |     ~0 MB |
-
-The first runner sees no penalty and every subsequent runner is served in-region
-while nothing crosses the WAN; the saving scales with fleet size and link cost.
-Reproduce or retune (`TOTAL_MB`, `LFS_MB`, `RATE_MBIT`, `RTT_MS`) with
-[`bench/run.sh`](./bench/run.sh) - see [`bench/README.md`](./bench/README.md) for
-the method and its caveats.
+See **[docs/architecture.md](./docs/architecture.md)** for why a plain mirror or
+a generic HTTP cache doesn't fit, how it compares, the internals, and a benchmark.
 
 ## Install
 
@@ -186,329 +52,65 @@ The `insteadOf` rewrite is how a client transparently routes through the proxy.
 Pair it with `pushInsteadOf` back to the origin so pushes bypass the (read-only)
 proxy:
 
-```
+```sh
 git config url."http://proxy:8080/".insteadOf            "https://git.example.com/"
 git config url."https://git.example.com/".pushInsteadOf  "https://git.example.com/"
 ```
 
-### Try it
-
-The image on GHCR runs as-is against any public origin, no config file. Point it at
-GitHub and clone through it:
+Or try it against a public origin with no config - the image runs as-is:
 
 ```sh
-docker run --rm -p 8080:8080 ghcr.io/rolandjitsu/git-cache-proxy \
-  --upstream https://github.com
+docker run --rm -p 8080:8080 ghcr.io/rolandjitsu/git-cache-proxy --upstream https://github.com
 
-# in another terminal - the proxy mirrors the repo on the first request and
-# serves it from the local mirror thereafter:
+# in another terminal - mirrored on the first request, served locally after:
 git -c url."http://localhost:8080/".insteadOf="https://github.com/" \
   clone https://github.com/rolandjitsu/git-cache-proxy
 ```
 
 ## Configuration
 
-Every flag has an environment-variable equivalent.
+Every flag has an environment-variable equivalent; the full reference is in
+**[docs/configuration.md](./docs/configuration.md)**. The essentials:
 
-| Flag                     | Env                                  | Default                      | Purpose                                                                        |
-| ------------------------ | ------------------------------------ | ---------------------------- | ------------------------------------------------------------------------------ |
-| `--bind`                 | `GITCACHEPROXY_BIND`                 | `0.0.0.0:8080`               | Listen address                                                                 |
-| `--cache-root`           | `GITCACHEPROXY_CACHE_ROOT`           | `/var/cache/git-cache-proxy` | Where bare mirrors live                                                        |
-| `--upstream`             | `GITCACHEPROXY_UPSTREAM`             | - (required)                 | Origin git base URL                                                            |
-| `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
-| `--upstream-credential`  | `GITCACHEPROXY_UPSTREAM_CREDENTIAL`  | `static`                     | Which credential the proxy presents upstream: `static` (the shared `--upstream-auth-header`) or `client` (the requesting client's own, so no long-lived upstream secret). `client` requires `--auth-provider github`/`gitlab` and rejects `--upstream-auth-header` (see Auth model) |
-| `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
-| `--auth-provider`        | `GITCACHEPROXY_AUTH_PROVIDER`        | `none`                       | Client-auth mode: `none`, `shared`, `github`, `gitlab`, `custom` (see Auth model). Passing only `--serve-token` keeps the legacy shared-secret behavior |
-| `--auth-signing-key`     | `GITCACHEPROXY_AUTH_SIGNING_KEY`     | random per process           | Provider modes: HMAC key (at least 32 bytes) signing LFS download grants; every replica behind one address needs the same key |
-| `--auth-validate-url`    | `GITCACHEPROXY_AUTH_VALIDATE_URL`    | -                            | `custom` only: URL template of the validation endpoint, with `{repo}` interpolated (the token goes in `--auth-token-header`, never the URL) |
-| `--auth-token-header`    | `GITCACHEPROXY_AUTH_TOKEN_HEADER`    | `Authorization: Bearer {token}` | `custom` only: header line presenting the client token to the endpoint, with `{token}` interpolated, e.g. `PRIVATE-TOKEN: {token}` |
-| `--auth-repo-form`       | `GITCACHEPROXY_AUTH_REPO_FORM`       | `path`                       | `custom` only: repo encoding for `{repo}` - `path` (`owner/repo`) or `encoded-path` (`owner%2Frepo`, GitLab-style) |
-| `--auth-timeout-seconds` | `GITCACHEPROXY_AUTH_TIMEOUT_SECONDS` | `10`                         | Budget for one token-validation request, shared by the `--auth-max-concurrent` slot wait and the HTTP call |
-| `--auth-ttl-seconds`     | `GITCACHEPROXY_AUTH_TTL_SECONDS`     | `0`                          | Reuse a validation verdict per `(credential, repo)` for this many seconds, so the requests of one clone, or repeated submodule fetches, validate once (`0` = validate every request) |
-| `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
-| `--auth-allow-http`      | `GITCACHEPROXY_AUTH_ALLOW_HTTP`      | `false`                      | Provider modes: accept a plain `http://` validation endpoint, which sends client credentials in cleartext |
-| `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
-| `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
-| `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
-| `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
-| `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |
-| `--max-wants`            | `GITCACHEPROXY_MAX_WANTS`            | `100`                        | Cap on want-by-SHA pins retained per mirror; oldest pruned beyond it (`0` = unlimited) |
-| `--git-binary`           | `GITCACHEPROXY_GIT_BINARY`           | `git`                        | Path to git                                                                    |
-| `--big-file-threshold`   | `GITCACHEPROXY_BIG_FILE_THRESHOLD`   | `8m`                         | Stream blobs larger than this to disk during upstream clone/fetch instead of holding them in memory, bounding `index-pack` RSS so one very large repo can't OOM the proxy |
-| `--pack-threads`         | `GITCACHEPROXY_PACK_THREADS`         | -                            | git `pack.threads` when serving: delta-search threads per `pack-objects` (unset = one per CPU) |
-| `--pack-window-memory`   | `GITCACHEPROXY_PACK_WINDOW_MEMORY`   | -                            | git `pack.windowMemory` when serving: delta window memory per `pack-objects` thread, e.g. `64m` (unset = unlimited) |
-
-Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
+- `--upstream` (required): origin git base URL; requested repo paths are appended.
+- `--cache-root`: where the bare mirrors live.
+- `--upstream-auth-header` / `--upstream-credential`: how the proxy authenticates
+  to upstream.
+- `--serve-token` / `--auth-provider`: how clients authenticate to the proxy.
+- `--cache-max-mb`: cap on-disk cache size (LRU eviction; `0` = unlimited).
 
 ## Metrics
 
-`GET /metrics` serves Prometheus text-format metrics. All metrics are prefixed
-`gitcacheproxy_`:
+`GET /metrics` serves Prometheus text-format metrics - per-repo request and
+upstream counters, cache-size gauges, and `*_duration_seconds` latency
+histograms, all prefixed `gitcacheproxy_`. Full list in
+**[docs/metrics.md](./docs/metrics.md)**.
 
-| Metric                      | Type      | Labels                 | Meaning                                                                       |
-| --------------------------- | --------- | ---------------------- | ----------------------------------------------------------------------------- |
-| `requests_total`            | counter   | `kind`, `result`, `repo` | Client requests served, by endpoint and outcome                              |
-| `upstream_ops_total`        | counter   | `op`, `result`, `repo` | Upstream git operations (initial mirror clone, refresh fetch, want fetch)     |
-| `cache_bytes`               | gauge     | -                      | Total size of the on-disk mirror cache, in bytes                              |
-| `cache_mirrors`             | gauge     | -                      | Number of cached mirrors on disk                                              |
-| `cache_max_bytes`           | gauge     | -                      | Configured on-disk cache cap in bytes (`0` = unlimited)                        |
-| `fetch_ttl_seconds`         | gauge     | -                      | Configured upstream fetch TTL in seconds (`0` = always fetch)                  |
-| `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
-| `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
-| `cache_outcome_total`       | counter   | `outcome`              | info/refs operations by outcome: served locally vs. fetched from upstream     |
-| `auth_validations_total`    | counter   | `result`               | Per-request token validation calls                                            |
-| `auth_cache_hits_total`     | counter   | -                      | Token checks answered from the `--auth-ttl-seconds` verdict cache             |
-| `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
-| `serve_duration_seconds`    | histogram | `kind`, `repo`         | Time to serve a client, measured to the end of the response                   |
+## Authentication & security
 
-Label values:
+By default the proxy serves anonymously (intended for a network-restricted
+deployment) and fetches upstream with one shared credential, so **reachability is
+the trust boundary**. It can instead require a shared serve token, or validate
+each client's own credential per repo (`--auth-provider github|gitlab|custom`) -
+and optionally fetch upstream with that same client credential so no long-lived
+upstream secret is held (`--upstream-credential client`).
 
-- `kind` on `requests_total`: `info_refs`, `upload_pack`, `auth` (a request
-  that failed the `--serve-token` check or token validation), `receive_pack` (a push attempt,
-  always refused; the proxy is read-only), `lfs_batch`, `lfs_object`. On
-  `serve_duration_seconds`: `info_refs` (the buffered ref advertisement) or
-  `upload_pack` (the packfile stream, timed to EOF).
-- `result` on `requests_total`: `ok`, `error`, `upstream_error`, `unauthorized`,
-  `rejected`. On `upstream_ops_total`: `ok` or `error`. On `lfs_objects_total`:
-  `hit` (served from disk), `miss` (fetched from upstream, then cached), `error`.
-  On `auth_validations_total`: `allow`, `deny`, `unavailable` (the endpoint
-  failed, throttled, or answered something else), `saturated` (no call made: no
-  `--auth-max-concurrent` slot freed up in time).
-- `op`: `clone` (first mirror of a repo), `fetch` (refresh of an existing
-  mirror), `want_fetch` (on-demand fetch of a bare SHA the mirror lacks, e.g. a
-  PR merge commit).
-- `outcome` on `cache_outcome_total`: `cloned` (first mirror of a repo),
-  `fetched` (refresh from upstream), `cached` (served from the local mirror with
-  no upstream call). Recorded once per info/refs advertisement.
-- `repo`: the served repo path (e.g. `group/project.git`). To keep cardinality
-  bounded, the real path is emitted only on success; every failure (failed auth,
-  malformed path, upstream error) uses a `-` sentinel, so a flood of distinct
-  but doomed paths cannot inflate the series count. Aggregate across repos with
-  `sum without (repo) (...)`.
-
-Notes:
-
-- `cache_bytes` and `cache_mirrors` are maintained only when a cache cap is
-  configured (`--cache-max-mb`); without a cap they stay `0`.
-- `cache_max_bytes` and `fetch_ttl_seconds` echo the configured flags as static
-  gauges, set once at startup, so a dashboard can read cache utilization as
-  `cache_bytes / cache_max_bytes` without hardcoding the cap.
-- `lfs_objects_total` has no `repo` label: LFS objects are content-addressed
-  and shared across repos. `auth_validations_total` has none either: a flood of
-  junk credentials names arbitrary repos.
-- `cache_outcome_total` is the local-vs-upstream signal: the share of operations
-  served without touching upstream is `cached / sum without (outcome) (...)`.
-- The histograms are observed only on success and share buckets from 50ms to
-  300s, sized for anything from a cached ref advertisement to a large clone
-  over a slow WAN.
-
-## Auth model
-
-- **Upstream:** the proxy holds a single read-only credential (`--upstream-auth-header`)
-  used only to `fetch`/`clone`. It never writes upstream. The value is the full
-  header line and is passed verbatim to git as `http.extraHeader`. If it is
-  unset/blank the proxy warns at startup and contacts upstream anonymously.
-- **Clients:** anonymous by default (intended for a network-restricted
-  deployment); set `--serve-token` to require one shared bearer token, or set
-  `--auth-provider` to validate each request's own credential per repo
-  (below). The shared token is read from `Authorization: Bearer <token>`
-  (git's `http.extraHeader`). Provider mode also reads `Authorization: Basic
-  <user:token>` (git's credential helpers and tokened clone URLs), and answers
-  a 401 with a Basic challenge so git sends them.
-
-### Per-request token validation (`--auth-provider github|gitlab|custom`)
-
-With a shared serve token, anyone who can reach the proxy can read every repo
-its upstream credential can. In `github`/`gitlab`/`custom` mode the proxy
-instead checks each request's credential *for the repo that request names*,
-before any upstream or mirror work - so a client only reaches what its own
-credential could clone directly, and a CI fleet can run on short-lived per-job
-tokens. The repo that is checked is exactly the repo that is served, so a
-credential can never be checked against one repo while fetching another: repo
-names must consist of letters, digits, `-`, `.`, `_`, `~`, and `/`, since a
-`%` escape could decode to a different path upstream than at the check.
-
-The validation endpoint receives every client credential, so it must be
-`https://` unless `--auth-allow-http` is set (e.g. for an in-cluster endpoint
-on a trusted network).
-
-| Provider | Check | Notes |
-| -------- | ----- | ----- |
-| `github` | `GET {upstream}/{repo}/info/refs?service=git-upload-pack` (protocol v2) | Basic is forwarded as sent; a Bearer token goes as Basic `x-access-token:<token>` |
-| `gitlab` | same | Basic is forwarded as sent (CI job tokens need the `gitlab-ci-token` username); a Bearer token goes as Basic `oauth2:<token>` |
-| `custom` | `GET --auth-validate-url` with `--auth-token-header` | Any HTTP endpoint: 2xx allows, 401/403/404 rejects |
-
-`github` and `gitlab` ask upstream's own git endpoint rather than a REST API: a
-metadata API also answers credentials that cannot read the code (GitHub tokens
-with only the Metadata permission, GitLab Guest members, `read_api`-only
-tokens), while `info/refs` only advertises to a credential that can clone. Over
-protocol v2 the answer is a few hundred bytes of capabilities, not the ref
-list, and a 200 only counts if it is a git advertisement.
-
-A 2xx allows the request; 401/403/404 rejects it with 401. Everything else -
-5xx, 3xx (redirects are not followed, so a renamed repo needs its new path),
-429, a throttled 403 (`x-ratelimit-remaining: 0` or `retry-after`) - is *not* a
-verdict on the credential, so the request fails closed with 503: during an
-outage the proxy serves nothing rather than something unvalidated. Concurrent
-identical checks share one call.
-
-`--auth-ttl-seconds` reuses a verdict per `(credential, repo)`. The default `0`
-revalidates every request, so a protocol v2 clone costs at least three checks
-(info/refs, then an upload-pack POST each for `ls-refs` and `fetch`), and a
-checkout with submodules pays that per submodule on every fetch. For
-submodule-heavy or frequently re-fetching workloads, set a short TTL (e.g.
-`60`): that bounds how long a revoked credential keeps working.
-
-Clients route through the proxy as usual and present their credential to it;
-for GitHub Actions:
-
-```bash
-git config --global url."http://git-cache-proxy:8080/".insteadOf "https://github.com/"
-git config --global http."http://git-cache-proxy:8080/".extraHeader \
-  "Authorization: Bearer $GITHUB_TOKEN"
-```
-
-The per-run `GITHUB_TOKEN` is scoped to its repository and expires with the
-job, so a compromised runner can only clone its own repo and cannot persist
-access.
-
-git-LFS does not need a TTL. The batch request is checked like any other, and
-each rewritten download action carries a grant the proxy signs for exactly
-that repo, object, and size, valid for 15 minutes. Object GETs verify the
-grant locally instead of rechecking the credential, and a grant for one repo
-cannot fetch another repo's object from the shared object cache. Every replica
-behind one address must share `--auth-signing-key`, or a grant issued by one
-is refused by the others; the caches themselves stay independent.
-
-### Fetch upstream with the client's credential (`--upstream-credential client`)
-
-In the default `static` mode the proxy clones and fetches upstream with the one
-shared `--upstream-auth-header`, so that credential must be able to read every
-repo the fleet mirrors - a leak of it exposes all of them. In `client` mode the
-proxy instead uses the credential of the request that triggered the upstream
-work, so no long-lived upstream secret is held anywhere. It builds on provider
-validation: it requires `--auth-provider github` or `gitlab` (`custom` has no
-upstream-shaped credential), rejects `--upstream-auth-header`, and the usual
-"contacting upstream anonymously" startup warning does not apply.
-
-Validation still runs first and unchanged - a cache hit or a coalesced waiter
-never reaches upstream, and the mirror is shared - so the per-repo check, not
-the fetch, is what gates access. The credential is reshaped exactly as the
-validation probe reshapes it, so the check and the fetch cannot disagree. A
-burst of clients for one repo coalesces into a single fetch under whichever
-client won the lock; the rest, already validated for that repo, are served from
-its result.
-
-Because the credential is the client's own, an upstream auth failure on the
-fetch is answered as `401` (with the Basic challenge), not `502`, and the cached
-verdict for that `(credential, repo)` is dropped so the next request re-probes -
-e.g. a token revoked within the `--auth-ttl-seconds` window. `static` mode keeps
-the `502`.
-
-For LFS the batch request forwards the client credential like git does; an
-object GET carries only its grant, so the grant seals the credential (an AEAD
-box, see the Security model) and the object fetch unseals it to re-batch
-upstream. Grants stay valid for 15 minutes across replicas sharing
-`--auth-signing-key`, exactly as in `static` mode.
-
-### GitLab with a personal access token
-
-GitLab's git smart-HTTP endpoint authenticates a PAT via **HTTP Basic** auth
-(the PAT is the password; any non-empty username works) — not `Authorization:
-Bearer` (OAuth2 access tokens only) and not the `PRIVATE-TOKEN` header (REST API
-only). Build the header as Basic auth:
-
-```bash
-export GITCACHEPROXY_UPSTREAM_AUTH_HEADER="Authorization: Basic $(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
-```
-
-Verify it against the git endpoint before wiring up the proxy — a `200` means
-the header works, a `401` means the scheme is wrong:
-
-```bash
-curl -sS -o /dev/null -w '%{http_code}\n' \
-  -H "$GITCACHEPROXY_UPSTREAM_AUTH_HEADER" \
-  "https://gitlab.example.com/group/repo.git/info/refs?service=git-upload-pack"
-```
-
-When passing it into a container, prefer `-e GITCACHEPROXY_UPSTREAM_AUTH_HEADER`
-(no `=`) so an unset variable is dropped with a warning rather than silently
-forwarded as an empty string.
-
-## Security model
-
-The proxy is a shared, credentialed reader, so a few properties are worth making
-explicit before you expose it:
-
-- **Reachability is the trust boundary.** The proxy fetches from upstream with
-  its own single credential and serves the result to whoever asked. With
-  `--serve-token` unset it serves anonymously, and when set the token is one
-  shared secret that grants access to _everything the upstream credential can
-  read_ - including repos a given client could not read directly. Restrict who
-  can reach the proxy (private network, security group, mTLS at the ingress).
-- **Per-request validation bounds, not replaces, reachability.** In
-  `--auth-provider github/gitlab/custom` mode each request must carry a
-  credential that can clone *that repo*, so a leaked client token only exposes
-  what that token already exposed; "can reach the port" becomes "can run an
-  unauthenticated guessing attack against the validation endpoint". Validation
-  fails closed: an outage means a 503 for clients, never an allow, and the
-  proxy still fetches upstream with its own shared read credential - keep that
-  one as narrowly scoped as the fleet allows.
-- **Client upstream credential (`--upstream-credential client`).** This removes
-  the shared upstream secret entirely: there is no long-lived upstream token in
-  the secret store, the pod env, or the deployment. The trade is that the proxy
-  process and its `git` children now hold many clients' credentials in memory
-  while a fetch runs, and each LFS grant carries a sealed copy. Those credentials
-  are short-lived and repo-scoped (a CI job token), but a compromised proxy, or a
-  leaked `--auth-signing-key`, could use the ones it holds or can unseal for their
-  remaining lifetime. An upstream auth failure is reported to the client as `401`,
-  not `502`, since the credential is the client's own.
-- **Plain HTTP.** The proxy speaks HTTP, so a client bearer travels in
-  cleartext. Terminate TLS in front of it (reverse proxy / ingress) on any
-  network you do not fully trust. Upstream fetches use whatever scheme the
-  `--upstream` URL specifies - use `https://`.
-- **Defaults are open.** It binds `0.0.0.0:8080` and serves anonymously unless
-  `--serve-token` is set or a provider is configured. That is deliberate for a
-  locked-down CI network; do not place it on an untrusted one without auth and
-  TLS.
-- **DoS knobs.** `--max-concurrent-requests` caps concurrent upstream
-  clone/fetch work, `--max-concurrent-upload-packs` caps concurrent
-  `pack-objects` memory, and `--max-decoded-body-mb` bounds request-body memory
-  (defusing a decompression bomb). `--cache-max-mb` bounds on-disk growth by
-  evicting least-recently-used idle mirrors; it defaults to `0` (unlimited), so
-  set it - or isolate and monitor the cache volume - on an untrusted network.
-  Provider validation adds one round-trip per request (`3` per v2 clone
-  without a TTL), capped by `--auth-timeout-seconds`, and runs outside the
-  concurrency limit so a hung or flooded check cannot starve serving.
-  `--auth-max-concurrent` bounds the outbound calls in flight, so a flood of
-  junk credentials turns into 503s rather than unbounded load on the git host.
-  Each junk credential still costs one call, and failed logins count against
-  the proxy's egress IP at the git host: rate-limit unauthenticated clients at
-  the ingress.
-- **Read-only.** Only `git-upload-pack` (clone/fetch) is served; `git-receive-pack`
-  (push) is refused and upstream is only ever pulled from, never written.
+Read **[docs/security.md](./docs/security.md)** for the full auth and threat
+model before exposing it on anything but a trusted network.
 
 ## Deploy
 
-The `Dockerfile` builds a statically linked (musl) binary and drops it onto a
-minimal Alpine base. Because the git wire protocol is delegated to the system `git`
-binary, the runtime image must contain `git` - so it is Alpine-with-git rather than a
-fully distroless/`FROM scratch` image. (The LFS transfer is in-process, so it adds no
-runtime tool - only CA certs.) The `git` binary is a *permanent* runtime dependency,
-not a temporary one: the proxy serves clients by running `git upload-pack`, and no
-production-ready Rust library implements the upload-pack server side - so a fully
-distroless, git-free image is not on the table. See [Status / scope](#status--scope).
-
-The image runs as UID/GID 10001, which owns the default cache root. A volume or bind
-mount there must be writable by that UID: `chown -R 10001:10001` a cache written by
-an older, root-running release, or set `fsGroup: 10001` on Kubernetes (the chart's
-default).
+The container image is Alpine-with-`git` (the wire protocol is delegated to the
+system `git`, a permanent runtime dependency - see [Status](#status--scope)). It
+runs as UID/GID 10001, which must own the cache volume (`chown -R 10001:10001` a
+cache written by an older root-running release, or set `fsGroup: 10001` on
+Kubernetes - the chart's default).
 
 On Kubernetes, a Helm chart lives in [`chart/`](./chart) (single-writer
 Deployment, `/healthz`+`/readyz` probes, cache PVC, optional Ingress and
 Prometheus `ServiceMonitor`):
 
-```shell
+```sh
 helm install git-cache-proxy oci://ghcr.io/rolandjitsu/charts/git-cache-proxy \
   --set upstream=https://your-git-host.example.com
 ```
@@ -517,30 +119,25 @@ See the [chart README](./chart/README.md) for the full values reference.
 
 ## Status / scope
 
-Working and end-to-end tested against both Git wire protocol versions — the
-modern **v2** (`git-protocol` header, the default since Git 2.26) and the legacy
-**v0/v1** advertisement — covering full clone, incremental delta fetch, and
-push rejection. **git-LFS** is cached too: the batch API is proxied and objects are
-stored content-addressed on disk, covered by the LFS integration tests (miss/fetch/
-verify, cache hit, corrupted-object rejection, upload refusal).
+Working and end-to-end tested on both Git wire protocol versions - **v2**
+(default since Git 2.26) and the legacy **v0/v1** advertisement - across full
+clone, incremental fetch, and push rejection. **git-LFS** is cached too (batch
+API proxied; objects stored content-addressed and integrity-checked).
 
-This is early, single-maintainer software: no independent review or wide
-deployment yet. Pin a version and try it against your own setup before you
-rely on it.
+Early, single-maintainer software: no independent review or wide deployment yet.
+Pin a version and try it against your own setup before relying on it.
 
 Not yet implemented:
 
-- A background/scheduled refresh option (today every `info/refs` triggers an
-  on-demand, TTL-coalesced fetch).
+- A background/scheduled refresh (today every `info/refs` triggers an on-demand,
+  TTL-coalesced fetch).
 
-**Non-goal: a git-free image.** The `git` binary stays a runtime dependency. The
-proxy serves clients by running `git upload-pack`, and as of 2026 no
-production-ready Rust library implements the upload-pack *server* (ref
-advertisement, want/have negotiation, on-the-fly packfile generation): `gitoxide`
-is client-only by design, and `libgit2`/`git2` exposes only pack primitives, no
-serve protocol. Moving the plumbing in-process was investigated and shelved for
-that reason - it would mean hand-rolling the smart wire protocol, exactly the
-reimplementation this proxy avoids by delegating to `git`.
+**Non-goal: a git-free image.** The `git` binary is a permanent runtime
+dependency: the proxy serves clients by running `git upload-pack`, and no
+production-ready Rust library implements the upload-pack *server* side
+(`gitoxide` is client-only; `libgit2` exposes only pack primitives). Moving it
+in-process would mean hand-rolling the smart protocol - exactly what delegating
+to `git` avoids.
 
 Contributions welcome.
 
