@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use git_cache_proxy::config::{Config, LogFormat};
+use git_cache_proxy::config::{
+    Config, LogFormat, UpstreamCredential, validate_upstream_credential,
+};
 use git_cache_proxy::{auth, evict, git, lfs, metrics, repo, server};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -39,12 +41,23 @@ async fn main() -> Result<()> {
         .map(str::trim)
         .filter(|h| !h.is_empty())
         .map(str::to_string);
-    if upstream_auth_header.is_none() {
-        tracing::warn!(
+    // Fail fast on a mode that cannot work, before binding or touching the cache.
+    validate_upstream_credential(
+        cfg.upstream_credential,
+        cfg.auth_provider,
+        upstream_auth_header.is_some(),
+    )?;
+    match cfg.upstream_credential {
+        UpstreamCredential::Client => tracing::info!(
+            "upstream credential: forwarding each request's client credential; \
+             no shared upstream token is held"
+        ),
+        UpstreamCredential::Static if upstream_auth_header.is_none() => tracing::warn!(
             "no upstream auth header set; contacting upstream anonymously - \
              private repos will fail with an upstream 401 \
              (set --upstream-auth-header / GITCACHEPROXY_UPSTREAM_AUTH_HEADER)"
-        );
+        ),
+        UpstreamCredential::Static => {}
     }
 
     let git_cfg = git::GitConfig {
