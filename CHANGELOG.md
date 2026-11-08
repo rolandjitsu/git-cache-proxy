@@ -3,6 +3,16 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.9 (2026-11-08)
+
+### Features
+
+- validate each credential upstream
+- sign per-object download grants
+- add the custom validation endpoint
+- expose per-request token validation
+- count token auth and cache hits
+
 ## 0.2.8 (2026-10-31)
 
 ### Features
