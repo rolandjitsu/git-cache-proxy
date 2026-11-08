@@ -199,16 +199,24 @@ async fn gate(State(st): State<AppState>, mut req: Request<Body>, next: Next) ->
             );
         }
     }
-    // In `client` mode the fetch uses the request's own credential, so capture it
-    // now (reshaped as a git host accepts it) for the handler to pass upstream.
-    // Provider mode already denied an Allow without a usable credential, so this
-    // is present on any route that will reach upstream.
-    if st.upstream_credential == UpstreamCredential::Client
-        && let Some(value) = st.auth.forwarded_credential(req.headers())
-        && let Ok(value) = value.to_str()
-    {
-        req.extensions_mut()
-            .insert(ForwardedCredential(format!("Authorization: {value}")));
+    // In `client` mode the upstream fetch uses the request's own credential, so
+    // capture it now for the handler to forward. A git or batch request carries
+    // the client credential directly; an LFS object GET carries only its grant,
+    // which seals the credential the batch forwarded - unseal that instead.
+    if st.upstream_credential == UpstreamCredential::Client {
+        let line = match &route {
+            Route::LfsObject { repo, oid, size } => {
+                st.auth
+                    .lfs_object_credential(req.headers(), repo, oid, *size)
+            }
+            _ => st
+                .auth
+                .forwarded_credential(req.headers())
+                .and_then(|value| value.to_str().ok().map(|v| format!("Authorization: {v}"))),
+        };
+        if let Some(line) = line {
+            req.extensions_mut().insert(ForwardedCredential(line));
+        }
     }
     req.extensions_mut().insert(route);
     next.run(req).await
@@ -316,9 +324,9 @@ async fn handle_git(
                 Ok(b) => b,
                 Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
             };
-            lfs_batch(st, &repo, &parts.headers, body).await
+            lfs_batch(st, &repo, &parts.headers, body, cred).await
         }
-        Route::LfsObject { repo, oid, size } => lfs_object(st, repo, oid, size).await,
+        Route::LfsObject { repo, oid, size } => lfs_object(st, repo, oid, size, cred).await,
         Route::NotFound => err(StatusCode::NOT_FOUND, "not a git smart-http endpoint"),
     }
 }
@@ -326,7 +334,13 @@ async fn handle_git(
 /// Proxy an LFS batch request to upstream, rewriting each object's download URL back
 /// to this proxy so the object fetch is cached here. An `upload` batch is refused:
 /// the proxy is read-only, like `git-receive-pack`.
-async fn lfs_batch(st: AppState, name: &str, headers: &HeaderMap, body: Bytes) -> Response {
+async fn lfs_batch(
+    st: AppState,
+    name: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    cred: Option<&str>,
+) -> Response {
     if is_lfs_upload(&body) {
         st.metrics
             .record_request(RequestKind::LfsBatch, Status::Rejected, "-");
@@ -336,8 +350,10 @@ async fn lfs_batch(st: AppState, name: &str, headers: &HeaderMap, body: Bytes) -
         );
     }
     let advertise = advertise_base(headers);
-    let grant = |oid: &str, size| st.auth.lfs_grant(name, oid, size);
-    match st.lfs.batch(name, &body, &advertise, grant).await {
+    // In `client` mode the grant seals `cred` so the object GET can re-batch with
+    // it; in `static` mode `cred` is `None` and the grant carries no credential.
+    let grant = |oid: &str, size| st.auth.lfs_grant(name, oid, size, cred);
+    match st.lfs.batch(name, &body, &advertise, grant, cred).await {
         Ok(json) => {
             st.metrics
                 .record_request(RequestKind::LfsBatch, Status::Ok, name);
@@ -359,8 +375,14 @@ async fn lfs_batch(st: AppState, name: &str, headers: &HeaderMap, body: Bytes) -
 /// Serve a cached LFS object, fetching and caching it from upstream on a miss. The
 /// `repo` label is `-` because objects are content-addressed and shared across repos
 /// (the cache hit/miss is tracked separately in `lfs_objects_total`).
-async fn lfs_object(st: AppState, repo_name: String, oid: String, size: Option<u64>) -> Response {
-    match st.lfs.ensure_object(&repo_name, &oid, size).await {
+async fn lfs_object(
+    st: AppState,
+    repo_name: String,
+    oid: String,
+    size: Option<u64>,
+    cred: Option<&str>,
+) -> Response {
+    match st.lfs.ensure_object(&repo_name, &oid, size, cred).await {
         Ok((path, outcome)) => {
             st.metrics.record_lfs(match outcome {
                 Outcome::Hit => LfsResult::Hit,

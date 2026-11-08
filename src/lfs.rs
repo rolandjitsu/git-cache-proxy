@@ -116,10 +116,11 @@ impl Lfs {
         body: &[u8],
         advertise_base: &str,
         grant: impl Fn(&str, u64) -> Option<DownloadGrant>,
+        cred: Option<&str>,
     ) -> Result<Vec<u8>> {
         let url = format!("{}/{repo}/info/lfs/objects/batch", self.cfg.upstream_base);
         let resp = self
-            .post_batch(&url, body)
+            .post_batch(&url, body, cred)
             .await
             .context("upstream lfs batch")?;
         let mut json: Value = serde_json::from_slice(&resp).context("parse lfs batch response")?;
@@ -135,6 +136,7 @@ impl Lfs {
         repo: &str,
         oid: &str,
         size: Option<u64>,
+        cred: Option<&str>,
     ) -> Result<(PathBuf, Outcome)> {
         let path = repo::lfs_object_path(&self.cfg.cache_root, oid);
         if self.cached(&path).await {
@@ -149,7 +151,7 @@ impl Lfs {
             return Ok((path, Outcome::Hit));
         }
         let size = size.context("cache miss without an object size")?;
-        self.fetch_object(repo, oid, size, &path).await?;
+        self.fetch_object(repo, oid, size, &path, cred).await?;
         Ok((path, Outcome::Miss))
     }
 
@@ -173,8 +175,9 @@ impl Lfs {
         oid: &str,
         size: u64,
         final_path: &Path,
+        cred: Option<&str>,
     ) -> Result<()> {
-        let (href, headers) = self.download_action(repo, oid, size).await?;
+        let (href, headers) = self.download_action(repo, oid, size, cred).await?;
         let tmp = self.tmp_path().await?;
         if let Err(e) = self.download_to_file(&href, headers, &tmp).await {
             let _ = tokio::fs::remove_file(&tmp).await;
@@ -211,6 +214,7 @@ impl Lfs {
         repo: &str,
         oid: &str,
         size: u64,
+        cred: Option<&str>,
     ) -> Result<(String, HeaderMap)> {
         let url = format!("{}/{repo}/info/lfs/objects/batch", self.cfg.upstream_base);
         let req = serde_json::json!({
@@ -220,7 +224,7 @@ impl Lfs {
         });
         let body = serde_json::to_vec(&req).context("build lfs re-batch request")?;
         let resp = self
-            .post_batch(&url, &body)
+            .post_batch(&url, &body, cred)
             .await
             .context("upstream lfs re-batch")?;
         let json: Value = serde_json::from_slice(&resp).context("parse lfs re-batch response")?;
@@ -228,15 +232,17 @@ impl Lfs {
     }
 
     /// POST `body` to an upstream LFS batch URL with the LFS content type and (if set)
-    /// the upstream credential, and return the response bytes.
-    async fn post_batch(&self, url: &str, body: &[u8]) -> Result<Vec<u8>> {
+    /// the upstream credential, and return the response bytes. A per-request `cred`
+    /// (the `client` upstream-credential mode) takes precedence over the static
+    /// `--upstream-auth-header`; `None` falls back to the static one.
+    async fn post_batch(&self, url: &str, body: &[u8], cred: Option<&str>) -> Result<Vec<u8>> {
         let mut req = self
             .client
             .post(url)
             .header(CONTENT_TYPE, LFS_CONTENT_TYPE)
             .header(ACCEPT, LFS_CONTENT_TYPE)
             .body(body.to_vec());
-        if let Some(line) = &self.cfg.upstream_auth_header
+        if let Some(line) = cred.or(self.cfg.upstream_auth_header.as_deref())
             && let Some((name, value)) = parse_header_line(line)
         {
             req = req.header(name, value);
