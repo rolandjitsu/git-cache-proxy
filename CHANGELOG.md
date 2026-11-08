@@ -3,6 +3,16 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.10 (2026-11-08)
+
+### Features
+
+- add the --upstream-credential mode
+- fetch upstream with the request's own credential
+- map upstream auth failure to 401
+- seal the client credential into grants
+- expose --upstream-credential
+
 ## 0.2.9 (2026-11-08)
 
 ### Features
