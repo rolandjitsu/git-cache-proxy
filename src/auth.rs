@@ -280,8 +280,16 @@ impl Auth {
 
     /// The credential a rewritten LFS download action carries for one object:
     /// the shared secret in shared mode, a signed grant in provider mode, `None`
-    /// when anonymous.
-    pub fn lfs_grant(&self, repo: &str, oid: &str, size: u64) -> Option<DownloadGrant> {
+    /// when anonymous. In `client` upstream-credential mode `credential` is the
+    /// forwarded client credential, sealed into the grant so the object GET can
+    /// re-batch upstream with it; `None` yields a credential-less grant.
+    pub fn lfs_grant(
+        &self,
+        repo: &str,
+        oid: &str,
+        size: u64,
+        credential: Option<&str>,
+    ) -> Option<DownloadGrant> {
         match &self.mode {
             Mode::Anonymous => None,
             Mode::Shared { token } => Some(DownloadGrant {
@@ -289,10 +297,27 @@ impl Auth {
                 expires_in: None,
             }),
             Mode::Provider(p) => Some(DownloadGrant {
-                authorization: format!("Bearer {}", p.grants.sign(repo, oid, size)),
+                authorization: format!("Bearer {}", p.grants.sign(repo, oid, size, credential)),
                 expires_in: Some(grant::LIFETIME),
             }),
         }
+    }
+
+    /// The upstream credential sealed into an LFS object GET's grant, for `client`
+    /// mode to re-batch on a cache miss. `None` outside provider mode, when the
+    /// grant is invalid for this object, or for a credential-less (`gcp1`) grant.
+    pub fn lfs_object_credential(
+        &self,
+        headers: &HeaderMap,
+        repo: &str,
+        oid: &str,
+        size: Option<u64>,
+    ) -> Option<String> {
+        let Mode::Provider(provider) = &self.mode else {
+            return None;
+        };
+        let grant = bearer_token(headers)?;
+        provider.grants.open(grant, repo, oid, size?).flatten()
     }
 
     /// The `WWW-Authenticate` challenge of a 401. git only hands credential-helper
@@ -1216,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn lfs_objects_need_a_grant_for_exactly_that_object() {
         let auth = build(provider_config(AuthProvider::Github)).unwrap();
-        let grant = auth.lfs_grant("r.git", "oid", 7).unwrap();
+        let grant = auth.lfs_grant("r.git", "oid", 7, None).unwrap();
         let h = headers(&grant.authorization);
         let object = |repo, size| Target::LfsObject {
             repo,
@@ -1242,14 +1267,54 @@ mod tests {
 
     #[test]
     fn grants_are_issued_per_mode() {
-        assert_eq!(Auth::anonymous().lfs_grant("r", "oid", 1), None);
-        let shared = Auth::shared("s3cret").lfs_grant("r", "oid", 1).unwrap();
+        assert_eq!(Auth::anonymous().lfs_grant("r", "oid", 1, None), None);
+        let shared = Auth::shared("s3cret")
+            .lfs_grant("r", "oid", 1, None)
+            .unwrap();
         assert_eq!(shared.authorization, "Bearer s3cret");
         assert_eq!(shared.expires_in, None);
         let auth = build(provider_config(AuthProvider::Custom)).unwrap();
-        let grant = auth.lfs_grant("r", "oid", 1).unwrap();
+        // No forwarded credential (static mode): a credential-less gcp1 grant.
+        let grant = auth.lfs_grant("r", "oid", 1, None).unwrap();
         assert!(grant.authorization.starts_with("Bearer gcp1."));
         assert_eq!(grant.expires_in, Some(grant::LIFETIME));
+        // A forwarded credential (client mode) is sealed into a gcp2 grant.
+        let sealed = auth
+            .lfs_grant("r", "oid", 1, Some("Authorization: Basic x"))
+            .unwrap();
+        assert!(sealed.authorization.starts_with("Bearer gcp2."));
+        assert!(!sealed.authorization.contains("Basic"));
+    }
+
+    #[test]
+    fn a_sealed_grant_round_trips_through_lfs_object_credential() {
+        let auth = build(provider_config(AuthProvider::Github)).unwrap();
+        let cred = "Authorization: Basic eC1hY2Nlc3MtdG9rZW46dG9r";
+        let grant = auth.lfs_grant("r.git", "oid", 7, Some(cred)).unwrap();
+        // The object GET presents the grant as its Authorization.
+        let h = headers(&grant.authorization);
+        assert_eq!(
+            auth.lfs_object_credential(&h, "r.git", "oid", Some(7)),
+            Some(cred.to_string())
+        );
+        // A missing size or the wrong object yields nothing.
+        assert_eq!(auth.lfs_object_credential(&h, "r.git", "oid", None), None);
+        assert_eq!(
+            auth.lfs_object_credential(&h, "other.git", "oid", Some(7)),
+            None
+        );
+        // A credential-less gcp1 grant carries nothing to forward.
+        let plain = auth.lfs_grant("r.git", "oid", 7, None).unwrap();
+        let h = headers(&plain.authorization);
+        assert_eq!(
+            auth.lfs_object_credential(&h, "r.git", "oid", Some(7)),
+            None
+        );
+        // Nothing to unseal outside provider mode.
+        assert_eq!(
+            Auth::anonymous().lfs_object_credential(&h, "r.git", "oid", Some(7)),
+            None
+        );
     }
 
     #[test]
