@@ -21,6 +21,7 @@ use axum::{Extension, Router};
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::auth;
+use crate::config::UpstreamCredential;
 use crate::git::GitCache;
 use crate::lfs::{Lfs, Outcome};
 use crate::metrics::{LfsResult, Metrics, RequestKind, Status};
@@ -38,6 +39,9 @@ pub struct AppState {
     pub upstream_base: String,
     pub cache_root: PathBuf,
     pub auth: Arc<auth::Auth>,
+    /// Whether upstream clone/fetch uses the shared `--upstream-auth-header`
+    /// (`static`) or the requesting client's own credential (`client`).
+    pub upstream_credential: UpstreamCredential,
     /// Upper bound (bytes) on a decoded upload-pack request body. See
     /// `Config::max_decoded_body_mb`.
     pub max_decoded_body: usize,
@@ -153,6 +157,13 @@ fn is_push(path: &str, query: &str) -> bool {
         || query.contains(&format!("service={RECEIVE_PACK}"))
 }
 
+/// The client's upstream-shaped credential as the full `http.extraHeader` line,
+/// forwarded to the git/LFS fetch in `client` upstream-credential mode. Inserted
+/// as a request extension after an `Allow`; absent in `static` mode. Carries a
+/// secret, so it is never logged.
+#[derive(Clone)]
+struct ForwardedCredential(String);
+
 /// Refuse pushes, then authenticate the classified route and hand it to
 /// `handle_git`. A push, like a dumb-http `info/refs`, is refused for everyone,
 /// so validating its credential would only spend a call.
@@ -194,6 +205,17 @@ async fn gate(State(st): State<AppState>, mut req: Request<Body>, next: Next) ->
                 "token validation unavailable",
             );
         }
+    }
+    // In `client` mode the fetch uses the request's own credential, so capture it
+    // now (reshaped as a git host accepts it) for the handler to pass upstream.
+    // Provider mode already denied an Allow without a usable credential, so this
+    // is present on any route that will reach upstream.
+    if st.upstream_credential == UpstreamCredential::Client
+        && let Some(value) = st.auth.forwarded_credential(req.headers())
+        && let Ok(value) = value.to_str()
+    {
+        req.extensions_mut()
+            .insert(ForwardedCredential(format!("Authorization: {value}")));
     }
     req.extensions_mut().insert(route);
     next.run(req).await
@@ -249,6 +271,11 @@ async fn handle_git(
         .get("git-protocol")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // Present only in `client` mode (set by `gate`); the fetch forwards it upstream.
+    let cred = parts
+        .extensions
+        .get::<ForwardedCredential>()
+        .map(|c| c.0.as_str());
 
     match route {
         Route::InfoRefs { smart: false, .. } => {
@@ -260,7 +287,7 @@ async fn handle_git(
             )
         }
         Route::InfoRefs { repo, smart: true } => {
-            info_refs(st, &repo, git_protocol.as_deref()).await
+            info_refs(st, &repo, git_protocol.as_deref(), cred).await
         }
         Route::UploadPack { repo } => {
             let body = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -280,7 +307,7 @@ async fn handle_git(
                 Ok(b) => b,
                 Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
             };
-            upload_pack(st, &repo, git_protocol.as_deref(), body).await
+            upload_pack(st, &repo, git_protocol.as_deref(), body, cred).await
         }
         // git-LFS uses a different HTTP API alongside the git endpoints.
         Route::LfsBatch { repo } => {
@@ -415,7 +442,12 @@ fn advertise_base(headers: &HeaderMap) -> String {
     format!("{scheme}://{host}")
 }
 
-async fn info_refs(st: AppState, name: &str, git_protocol: Option<&str>) -> Response {
+async fn info_refs(
+    st: AppState,
+    name: &str,
+    git_protocol: Option<&str>,
+    cred: Option<&str>,
+) -> Response {
     let repo = match repo::resolve(name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
         Err(e) => {
@@ -433,7 +465,7 @@ async fn info_refs(st: AppState, name: &str, git_protocol: Option<&str>) -> Resp
     // where the clone/fetch/TTL decision is made, so it is the per-operation
     // local-vs-upstream signal (upload-pack runs with `want_fetch=false` and is
     // almost always `Cached`, which would skew the ratio).
-    match st.cache.ensure_fresh(&repo, true, &[]).await {
+    match st.cache.ensure_fresh(&repo, true, &[], cred).await {
         Ok(outcome) => st.metrics.record_cache_outcome(outcome),
         Err(e) => {
             st.metrics
@@ -470,6 +502,7 @@ async fn upload_pack(
     name: &str,
     git_protocol: Option<&str>,
     body: Bytes,
+    cred: Option<&str>,
 ) -> Response {
     let repo = match repo::resolve(name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
@@ -483,7 +516,7 @@ async fn upload_pack(
     // The preceding info/refs already refreshed; here just ensure the mirror is
     // present (a client could POST against a not-yet-cloned repo) and that any
     // want-by-SHA the body asks for is fetched and pinned before serving.
-    if let Err(e) = st.cache.ensure_fresh(&repo, false, &body).await {
+    if let Err(e) = st.cache.ensure_fresh(&repo, false, &body, cred).await {
         st.metrics
             .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
         tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");

@@ -16,6 +16,7 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use git_cache_proxy::auth::Auth;
+use git_cache_proxy::config::UpstreamCredential;
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
@@ -83,6 +84,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,
@@ -211,6 +213,7 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -347,6 +350,7 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -479,6 +483,7 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -619,7 +624,10 @@ async fn caps_want_by_sha_fetch_within_a_single_request() {
     body.extend_from_slice(&pkt(&format!("want {}\n", merge_shas[0])));
     body.extend_from_slice(&pkt(&format!("want {}\n", merge_shas[1])));
     body.extend_from_slice(b"0000");
-    gitcache.ensure_fresh(&repo, false, &body).await.unwrap();
+    gitcache
+        .ensure_fresh(&repo, false, &body, None)
+        .await
+        .unwrap();
 
     // Only one of the two wanted SHAs was pinned - the per-request cap held.
     let mirror = cache.path().join("repo.git");
@@ -711,7 +719,10 @@ async fn want_by_sha_pins_are_unlimited_when_max_wants_is_zero() {
     body.extend_from_slice(&pkt(&format!("want {}\n", merge_shas[0])));
     body.extend_from_slice(&pkt(&format!("want {}\n", merge_shas[1])));
     body.extend_from_slice(b"0000");
-    gitcache.ensure_fresh(&repo, false, &body).await.unwrap();
+    gitcache
+        .ensure_fresh(&repo, false, &body, None)
+        .await
+        .unwrap();
 
     // Both wanted SHAs were pinned - unlimited mode neither caps nor prunes.
     let mirror = cache.path().join("repo.git");
@@ -791,7 +802,10 @@ async fn want_by_sha_tolerates_object_check_failure() {
     body.extend_from_slice(&pkt(&format!("want {}\n", "a".repeat(40))));
     body.extend_from_slice(b"0000");
     // The cat-file failure is swallowed - ensure_fresh still succeeds.
-    gitcache.ensure_fresh(&repo, false, &body).await.unwrap();
+    gitcache
+        .ensure_fresh(&repo, false, &body, None)
+        .await
+        .unwrap();
 
     let mirror = cache.path().join("repo.git");
     let pins = git(
@@ -859,6 +873,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         upstream_base: format!("file://{}", up.path().display()),
         cache_root: cache.path().to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics: metrics.clone(),
@@ -1490,7 +1505,7 @@ async fn upload_pack_runs_with_pack_options() {
         &dir.path().join("cache"),
     )
     .unwrap();
-    cache.ensure_fresh(&repo, true, b"").await.unwrap();
+    cache.ensure_fresh(&repo, true, b"", None).await.unwrap();
 
     let mut request = pkt(&format!("want {head}\n"));
     request.extend_from_slice(b"0000");
@@ -1617,6 +1632,7 @@ async fn start_proxy_with_auth(
         upstream_base: format!("file://{}", up.display()),
         cache_root: cache.path().to_path_buf(),
         auth,
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,

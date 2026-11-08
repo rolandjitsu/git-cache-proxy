@@ -14,7 +14,7 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use git_cache_proxy::auth::{Auth, AuthConfig};
-use git_cache_proxy::config::{AuthProvider, RepoForm};
+use git_cache_proxy::config::{AuthProvider, RepoForm, UpstreamCredential};
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
@@ -364,6 +364,7 @@ fn state(auth: Arc<Auth>) -> AppState {
         upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
         cache_root,
         auth,
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 0,
         metrics,

@@ -137,6 +137,7 @@ async fn main() -> Result<()> {
         upstream_base,
         cache_root: cfg.cache_root.clone(),
         auth,
+        upstream_credential: cfg.upstream_credential,
         max_decoded_body: (cfg.max_decoded_body_mb as usize).saturating_mul(1024 * 1024),
         max_concurrent: cfg.max_concurrent_requests,
         metrics: metrics.clone(),

@@ -11,6 +11,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use git_cache_proxy::auth::Auth;
+use git_cache_proxy::config::UpstreamCredential;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
 use git_cache_proxy::metrics::Metrics;
@@ -207,6 +208,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         upstream_base: "file:///nonexistent/git-cache-proxy-upstream".into(),
         cache_root: cache.path().to_path_buf(),
         auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 0,
         metrics: metrics.clone(),
@@ -317,6 +319,7 @@ fn state(auth: Arc<Auth>) -> AppState {
         upstream_base: "https://upstream.invalid".into(),
         cache_root,
         auth,
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 0,
         metrics,
