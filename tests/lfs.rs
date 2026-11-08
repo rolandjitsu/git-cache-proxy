@@ -16,6 +16,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use git_cache_proxy::auth::Auth;
+use git_cache_proxy::config::UpstreamCredential;
 use git_cache_proxy::evict::CacheIndex;
 use git_cache_proxy::git::{GitCache, GitConfig};
 use git_cache_proxy::lfs::{Lfs, LfsConfig};
@@ -435,6 +436,7 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
         upstream_base: upstream,
         cache_root: cache.to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
         max_decoded_body: 512 * 1024 * 1024,
         max_concurrent: 8,
         metrics,

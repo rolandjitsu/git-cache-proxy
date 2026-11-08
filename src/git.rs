@@ -188,6 +188,7 @@ impl GitCache {
         repo: &RepoRef,
         want_fetch: bool,
         body: &[u8],
+        cred: Option<&str>,
     ) -> Result<CacheOutcome> {
         let slot = self.slot(&repo.name).await;
         // Mark the repo used on every request - a served cache hit counts as much as
@@ -201,7 +202,7 @@ impl GitCache {
         // missing, and a caller queued behind a slow fetch must see it as stale.
         let started = Instant::now();
         let outcome = if !repo.cache_dir.join("HEAD").exists() {
-            self.clone_mirror(repo).await?;
+            self.clone_mirror(repo, cred).await?;
             *last = Some(started);
             CacheOutcome::Cloned
         } else if want_fetch
@@ -210,7 +211,7 @@ impl GitCache {
                 Some(t) => self.cfg.fetch_ttl.is_zero() || t.elapsed() >= self.cfg.fetch_ttl,
             }
         {
-            self.fetch(repo).await?;
+            self.fetch(repo, cred).await?;
             *last = Some(started);
             CacheOutcome::Fetched
         } else {
@@ -219,7 +220,7 @@ impl GitCache {
 
         // Best-effort: on failure, fall through and let upload-pack surface the
         // normal "not our ref" error for any want it still cannot satisfy.
-        if let Err(e) = self.ensure_wanted_oids(repo, body).await {
+        if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
             tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
         }
         Ok(outcome)
@@ -318,7 +319,7 @@ impl GitCache {
         Ok(ReaderStream::new(timed))
     }
 
-    async fn clone_mirror(&self, repo: &RepoRef) -> Result<()> {
+    async fn clone_mirror(&self, repo: &RepoRef, cred: Option<&str>) -> Result<()> {
         if let Some(parent) = repo.cache_dir.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -341,7 +342,7 @@ impl GitCache {
         // sync. The client then negotiates whatever ref it wants via upload-pack, so
         // the mirror can serve any branch/tag/sha the origin has - never HEAD-only.
         let started = Instant::now();
-        let mut cmd = self.fetch_cmd();
+        let mut cmd = self.fetch_cmd(cred);
         cmd.arg("clone")
             .arg("--mirror")
             .arg("--quiet")
@@ -367,14 +368,14 @@ impl GitCache {
         Ok(())
     }
 
-    async fn fetch(&self, repo: &RepoRef) -> Result<()> {
+    async fn fetch(&self, repo: &RepoRef, cred: Option<&str>) -> Result<()> {
         tracing::debug!(repo = %repo.name, "fetching updates from upstream");
         // Run inside the bare mirror and fetch `origin`: `clone --mirror` above sets
         // up exactly one remote named `origin` (git's default remote name) pointing at
         // the upstream URL, with a mirror refspec that updates all refs. So `origin`
         // is not an assumption about the client - it is the remote this proxy created.
         let started = Instant::now();
-        let mut cmd = self.fetch_cmd();
+        let mut cmd = self.fetch_cmd(cred);
         cmd.current_dir(&repo.cache_dir)
             .arg("fetch")
             .arg("--prune")
@@ -405,7 +406,12 @@ impl GitCache {
     /// unless the body names a missing object, so an ordinary clone pays only a cheap
     /// `cat-file` check. Relies on the upstream serving arbitrary SHAs
     /// (`uploadpack.allowAnySHA1InWant`).
-    async fn ensure_wanted_oids(&self, repo: &RepoRef, body: &[u8]) -> Result<()> {
+    async fn ensure_wanted_oids(
+        &self,
+        repo: &RepoRef,
+        body: &[u8],
+        cred: Option<&str>,
+    ) -> Result<()> {
         let wants = parse_wants(body);
         if wants.is_empty() {
             return Ok(());
@@ -432,7 +438,7 @@ impl GitCache {
             "fetching want-by-sha objects missing from mirror (e.g. PR merge refs)"
         );
         let started = Instant::now();
-        let mut cmd = self.fetch_cmd();
+        let mut cmd = self.fetch_cmd(cred);
         cmd.current_dir(&repo.cache_dir)
             .arg("fetch")
             .arg("--no-tags")
@@ -578,14 +584,16 @@ impl GitCache {
     }
 
     /// Command for upstream operations (clone/fetch): injects the auth header via
-    /// env-based git config so the token stays out of argv.
-    fn fetch_cmd(&self) -> Command {
+    /// env-based git config so the token stays out of argv. A per-request `cred`
+    /// (the `client` upstream-credential mode) takes precedence over the static
+    /// `--upstream-auth-header`; `None` falls back to the static one.
+    fn fetch_cmd(&self, cred: Option<&str>) -> Command {
         let mut c = Command::new(&self.cfg.git_binary);
         c.env("GIT_TERMINAL_PROMPT", "0"); // fail instead of hanging on a prompt
         c.env("LC_ALL", "C"); // Retry classification relies on Git's English diagnostics.
         for (k, v) in git_config_env(
             &self.cfg.big_file_threshold,
-            self.cfg.upstream_auth_header.as_deref(),
+            cred.or(self.cfg.upstream_auth_header.as_deref()),
         ) {
             c.env(k, v);
         }
