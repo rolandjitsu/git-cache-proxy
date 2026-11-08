@@ -3,6 +3,10 @@
 //! a mock upstream `info/refs` on a live local socket, and the `github` auth
 //! config that probes it. Each suite pulls it in with `mod helpers;`.
 
+// Each suite compiles its own copy and uses a different subset, so the unused
+// rest is the sharing, not a real gap.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,9 +25,6 @@ use tokio::sync::{Mutex, Notify};
 pub const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
 
 /// What the mock answers, so each classification branch is testable.
-// Each suite builds its own copy of this module and uses a different subset
-// of variants; the sharing, not a real gap, is what dead-code analysis sees.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reply {
     /// 200 with a git advertisement: the credential is accepted.
@@ -46,8 +47,6 @@ pub enum Reply {
 }
 
 /// One observed validation request.
-// Same as `Reply`: not every suite reads every field.
-#[allow(dead_code)]
 pub struct Hit {
     pub uri: String,
     pub authorization: Option<String>,
