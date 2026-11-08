@@ -44,6 +44,12 @@ clientAuth:
   # Required when enabled: github | gitlab | custom. github and gitlab probe the
   # upstream's own info/refs with the client's credential.
   provider: ""
+  # Which credential the proxy presents upstream for clone/fetch and LFS: empty or
+  # `static` uses the shared upstreamAuth secret; `client` forwards the requesting
+  # client's own credential, so no long-lived upstream secret is held. `client`
+  # requires provider github or gitlab and must not be combined with
+  # upstreamAuth.existingSecret (which then becomes optional).
+  upstreamCredential: ""
   # custom only: URL template with {repo}, e.g.
   # http://auth.example.com/validate/{repo}. The token never goes in the URL.
   validateUrl: ""
