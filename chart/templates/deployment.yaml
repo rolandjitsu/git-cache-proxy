@@ -96,6 +96,13 @@ spec:
             {{- end }}
             - name: GITCACHEPROXY_AUTH_PROVIDER
               value: {{ required "clientAuth.provider is required when clientAuth.enabled" .provider | quote }}
+            {{- if .upstreamCredential }}
+            {{- if and (eq .upstreamCredential "client") $.Values.upstreamAuth.existingSecret }}
+            {{- fail "clientAuth.upstreamCredential=client and upstreamAuth.existingSecret are mutually exclusive" }}
+            {{- end }}
+            - name: GITCACHEPROXY_UPSTREAM_CREDENTIAL
+              value: {{ .upstreamCredential | quote }}
+            {{- end }}
             {{- if .validateUrl }}
             - name: GITCACHEPROXY_AUTH_VALIDATE_URL
               value: {{ .validateUrl | quote }}

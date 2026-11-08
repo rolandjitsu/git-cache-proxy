@@ -103,6 +103,7 @@ pointing at the Service.
 | `serveToken.key` | `token` | Key in that Secret |
 | `clientAuth.enabled` | `false` | Turn on per-request token validation (see Security) |
 | `clientAuth.provider` | `""` | `github`, `gitlab`, or `custom` |
+| `clientAuth.upstreamCredential` | `""` | Upstream credential: empty/`static` = shared `upstreamAuth` secret; `client` = the request's own credential (no shared upstream secret). `client` needs provider `github`/`gitlab` and no `upstreamAuth.existingSecret` |
 | `clientAuth.validateUrl` | `""` | `custom`: URL template with `{repo}` |
 | `clientAuth.tokenHeader` | `""` | `custom`: header line template, e.g. `PRIVATE-TOKEN: {token}`; empty = `Authorization: Bearer {token}` |
 | `clientAuth.repoForm` | `""` | `custom`: repo encoding, `path` or `encoded-path`; empty = `path` |
