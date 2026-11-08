@@ -4,6 +4,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 
 /// Log output format.
@@ -56,6 +57,41 @@ pub enum RepoForm {
     EncodedPath,
 }
 
+/// Which credential the proxy presents to upstream for clone/fetch and LFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum UpstreamCredential {
+    /// The one shared `--upstream-auth-header`, used for every repo.
+    #[default]
+    Static,
+    /// The credential of the request that triggered the upstream work, so no
+    /// long-lived upstream secret is held. Requires a `github`/`gitlab` provider.
+    Client,
+}
+
+/// Reject an `--upstream-credential client` that cannot work. `client` forwards
+/// the request's own credential upstream, so it needs a provider mode that
+/// produces an upstream-shaped one (`github`/`gitlab`; `custom` has none), and it
+/// must not be paired with a static `--upstream-auth-header`. `static` never
+/// conflicts.
+pub fn validate_upstream_credential(
+    mode: UpstreamCredential,
+    provider: AuthProvider,
+    has_auth_header: bool,
+) -> Result<()> {
+    if mode != UpstreamCredential::Client {
+        return Ok(());
+    }
+    if !matches!(provider, AuthProvider::Github | AuthProvider::Gitlab) {
+        bail!(
+            "--upstream-credential client requires --auth-provider github or gitlab, not {provider}"
+        );
+    }
+    if has_auth_header {
+        bail!("--upstream-credential client cannot be combined with --upstream-auth-header");
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "git-cache-proxy",
@@ -90,6 +126,19 @@ pub struct Config {
         hide_env_values = true
     )]
     pub upstream_auth_header: Option<String>,
+
+    /// Which credential the proxy presents to upstream. `static` (default) uses
+    /// the shared `--upstream-auth-header`. `client` forwards the requesting
+    /// client's own credential, so no long-lived upstream secret is held; it
+    /// requires `--auth-provider github` or `gitlab` and rejects
+    /// `--upstream-auth-header`.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_UPSTREAM_CREDENTIAL",
+        value_enum,
+        default_value_t = UpstreamCredential::Static
+    )]
+    pub upstream_credential: UpstreamCredential,
 
     /// Optional bearer token clients must present (`Authorization: Bearer ...`).
     /// Unset = serve anonymously (intended for a network-restricted deployment).
@@ -251,4 +300,54 @@ pub struct Config {
         default_value = "text"
     )]
     pub log_format: LogFormat,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_mode_never_conflicts() {
+        for provider in [
+            AuthProvider::None,
+            AuthProvider::Shared,
+            AuthProvider::Github,
+            AuthProvider::Custom,
+        ] {
+            assert!(
+                validate_upstream_credential(UpstreamCredential::Static, provider, true).is_ok()
+            );
+            assert!(
+                validate_upstream_credential(UpstreamCredential::Static, provider, false).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn client_mode_needs_a_github_or_gitlab_provider() {
+        for provider in [AuthProvider::Github, AuthProvider::Gitlab] {
+            assert!(
+                validate_upstream_credential(UpstreamCredential::Client, provider, false).is_ok()
+            );
+        }
+        for provider in [
+            AuthProvider::None,
+            AuthProvider::Shared,
+            AuthProvider::Custom,
+        ] {
+            let err = validate_upstream_credential(UpstreamCredential::Client, provider, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--auth-provider"), "{err}");
+        }
+    }
+
+    #[test]
+    fn client_mode_rejects_a_static_auth_header() {
+        let err =
+            validate_upstream_credential(UpstreamCredential::Client, AuthProvider::Github, true)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("--upstream-auth-header"), "{err}");
+    }
 }
