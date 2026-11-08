@@ -216,6 +216,7 @@ Every flag has an environment-variable equivalent.
 | `--cache-root`           | `GITCACHEPROXY_CACHE_ROOT`           | `/var/cache/git-cache-proxy` | Where bare mirrors live                                                        |
 | `--upstream`             | `GITCACHEPROXY_UPSTREAM`             | - (required)                 | Origin git base URL                                                            |
 | `--upstream-auth-header` | `GITCACHEPROXY_UPSTREAM_AUTH_HEADER` | -                            | Full HTTP header injected on upstream clone/fetch, e.g. `Authorization: Basic <base64>` (see Auth model); injected via env so it stays out of argv |
+| `--upstream-credential`  | `GITCACHEPROXY_UPSTREAM_CREDENTIAL`  | `static`                     | Which credential the proxy presents upstream: `static` (the shared `--upstream-auth-header`) or `client` (the requesting client's own, so no long-lived upstream secret). `client` requires `--auth-provider github`/`gitlab` and rejects `--upstream-auth-header` (see Auth model) |
 | `--serve-token`          | `GITCACHEPROXY_SERVE_TOKEN`          | -                            | If set, clients must send `Authorization: Bearer <token>`                      |
 | `--auth-provider`        | `GITCACHEPROXY_AUTH_PROVIDER`        | `none`                       | Client-auth mode: `none`, `shared`, `github`, `gitlab`, `custom` (see Auth model). Passing only `--serve-token` keeps the legacy shared-secret behavior |
 | `--auth-signing-key`     | `GITCACHEPROXY_AUTH_SIGNING_KEY`     | random per process           | Provider modes: HMAC key (at least 32 bytes) signing LFS download grants; every replica behind one address needs the same key |
@@ -379,6 +380,37 @@ cannot fetch another repo's object from the shared object cache. Every replica
 behind one address must share `--auth-signing-key`, or a grant issued by one
 is refused by the others; the caches themselves stay independent.
 
+### Fetch upstream with the client's credential (`--upstream-credential client`)
+
+In the default `static` mode the proxy clones and fetches upstream with the one
+shared `--upstream-auth-header`, so that credential must be able to read every
+repo the fleet mirrors - a leak of it exposes all of them. In `client` mode the
+proxy instead uses the credential of the request that triggered the upstream
+work, so no long-lived upstream secret is held anywhere. It builds on provider
+validation: it requires `--auth-provider github` or `gitlab` (`custom` has no
+upstream-shaped credential), rejects `--upstream-auth-header`, and the usual
+"contacting upstream anonymously" startup warning does not apply.
+
+Validation still runs first and unchanged - a cache hit or a coalesced waiter
+never reaches upstream, and the mirror is shared - so the per-repo check, not
+the fetch, is what gates access. The credential is reshaped exactly as the
+validation probe reshapes it, so the check and the fetch cannot disagree. A
+burst of clients for one repo coalesces into a single fetch under whichever
+client won the lock; the rest, already validated for that repo, are served from
+its result.
+
+Because the credential is the client's own, an upstream auth failure on the
+fetch is answered as `401` (with the Basic challenge), not `502`, and the cached
+verdict for that `(credential, repo)` is dropped so the next request re-probes -
+e.g. a token revoked within the `--auth-ttl-seconds` window. `static` mode keeps
+the `502`.
+
+For LFS the batch request forwards the client credential like git does; an
+object GET carries only its grant, so the grant seals the credential (an AEAD
+box, see the Security model) and the object fetch unseals it to re-batch
+upstream. Grants stay valid for 15 minutes across replicas sharing
+`--auth-signing-key`, exactly as in `static` mode.
+
 ### GitLab with a personal access token
 
 GitLab's git smart-HTTP endpoint authenticates a PAT via **HTTP Basic** auth
@@ -422,6 +454,15 @@ explicit before you expose it:
   fails closed: an outage means a 503 for clients, never an allow, and the
   proxy still fetches upstream with its own shared read credential - keep that
   one as narrowly scoped as the fleet allows.
+- **Client upstream credential (`--upstream-credential client`).** This removes
+  the shared upstream secret entirely: there is no long-lived upstream token in
+  the secret store, the pod env, or the deployment. The trade is that the proxy
+  process and its `git` children now hold many clients' credentials in memory
+  while a fetch runs, and each LFS grant carries a sealed copy. Those credentials
+  are short-lived and repo-scoped (a CI job token), but a compromised proxy, or a
+  leaked `--auth-signing-key`, could use the ones it holds or can unseal for their
+  remaining lifetime. An upstream auth failure is reported to the client as `401`,
+  not `502`, since the credential is the client's own.
 - **Plain HTTP.** The proxy speaks HTTP, so a client bearer travels in
   cleartext. Terminate TLS in front of it (reverse proxy / ingress) on any
   network you do not fully trust. Upstream fetches use whatever scheme the
