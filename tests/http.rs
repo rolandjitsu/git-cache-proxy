@@ -235,6 +235,56 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
 }
 
 #[tokio::test]
+async fn upload_pack_upstream_failure_returns_bad_gateway() {
+    // A POST upload-pack against a doomed upstream: the mirror does not exist, so
+    // the handler clones, the clone fails (not an auth error), and in static mode
+    // that is a 502 - not the client 401 the `client` upstream-credential mode
+    // gives on an auth failure.
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let upstream = "file:///nonexistent/git-cache-proxy-upstream";
+    let cfg = GitConfig {
+        git_binary: "git".into(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+    };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: upstream.into(),
+            cache_root: cache.path().to_path_buf(),
+            upstream_auth_header: None,
+        },
+        None,
+    ));
+    let st = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
+        upstream_base: upstream.into(),
+        cache_root: cache.path().to_path_buf(),
+        auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
+        metrics,
+    };
+
+    let resp = router(st)
+        .oneshot(
+            Request::post("/missing.git/git-upload-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
 async fn concurrency_limit_serializes_without_deadlock() {
     // The limit wraps the git-serving fallback (health/readiness/metrics are
     // exempt), and is shared across per-connection service clones. Three

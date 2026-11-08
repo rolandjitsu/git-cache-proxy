@@ -22,7 +22,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::auth;
 use crate::config::UpstreamCredential;
-use crate::git::GitCache;
+use crate::git::{GitCache, is_auth_failure};
 use crate::lfs::{Lfs, Outcome};
 use crate::metrics::{LfsResult, Metrics, RequestKind, Status};
 use crate::repo;
@@ -188,14 +188,7 @@ async fn gate(State(st): State<AppState>, mut req: Request<Body>, next: Next) ->
         auth::Verdict::Deny => {
             st.metrics
                 .record_request(RequestKind::Auth, Status::Unauthorized, "-");
-            let mut resp = err(StatusCode::UNAUTHORIZED, "missing or invalid credentials");
-            if let Some(challenge) = st.auth.challenge() {
-                resp.headers_mut().insert(
-                    header::WWW_AUTHENTICATE,
-                    HeaderValue::from_static(challenge),
-                );
-            }
-            return resp;
+            return unauthorized(&st.auth, "missing or invalid credentials");
         }
         auth::Verdict::Unavailable => {
             st.metrics
@@ -287,7 +280,7 @@ async fn handle_git(
             )
         }
         Route::InfoRefs { repo, smart: true } => {
-            info_refs(st, &repo, git_protocol.as_deref(), cred).await
+            info_refs(st, &repo, git_protocol.as_deref(), cred, &parts.headers).await
         }
         Route::UploadPack { repo } => {
             let body = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -307,7 +300,15 @@ async fn handle_git(
                 Ok(b) => b,
                 Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
             };
-            upload_pack(st, &repo, git_protocol.as_deref(), body, cred).await
+            upload_pack(
+                st,
+                &repo,
+                git_protocol.as_deref(),
+                body,
+                cred,
+                &parts.headers,
+            )
+            .await
         }
         // git-LFS uses a different HTTP API alongside the git endpoints.
         Route::LfsBatch { repo } => {
@@ -447,6 +448,7 @@ async fn info_refs(
     name: &str,
     git_protocol: Option<&str>,
     cred: Option<&str>,
+    headers: &HeaderMap,
 ) -> Response {
     let repo = match repo::resolve(name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
@@ -468,6 +470,15 @@ async fn info_refs(
     match st.cache.ensure_fresh(&repo, true, &[], cred).await {
         Ok(outcome) => st.metrics.record_cache_outcome(outcome),
         Err(e) => {
+            // In `client` mode the credential is the client's own, so an upstream
+            // rejection is the client's 401, not a 502; drop the stale verdict so
+            // the next request re-probes (a token revoked within the TTL window).
+            if st.upstream_credential == UpstreamCredential::Client && is_auth_failure(&e) {
+                st.auth.invalidate(headers, name);
+                st.metrics
+                    .record_request(RequestKind::InfoRefs, Status::Unauthorized, "-");
+                return unauthorized(&st.auth, "upstream rejected the credential");
+            }
             st.metrics
                 .record_request(RequestKind::InfoRefs, Status::UpstreamError, "-");
             tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
@@ -503,6 +514,7 @@ async fn upload_pack(
     git_protocol: Option<&str>,
     body: Bytes,
     cred: Option<&str>,
+    headers: &HeaderMap,
 ) -> Response {
     let repo = match repo::resolve(name, &st.upstream_base, &st.cache_root) {
         Ok(r) => r,
@@ -517,6 +529,12 @@ async fn upload_pack(
     // present (a client could POST against a not-yet-cloned repo) and that any
     // want-by-SHA the body asks for is fetched and pinned before serving.
     if let Err(e) = st.cache.ensure_fresh(&repo, false, &body, cred).await {
+        if st.upstream_credential == UpstreamCredential::Client && is_auth_failure(&e) {
+            st.auth.invalidate(headers, name);
+            st.metrics
+                .record_request(RequestKind::UploadPack, Status::Unauthorized, "-");
+            return unauthorized(&st.auth, "upstream rejected the credential");
+        }
         st.metrics
             .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
         tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
@@ -593,6 +611,19 @@ fn within_limit(body: Bytes, max_decoded: usize) -> std::io::Result<Bytes> {
 
 fn err(status: StatusCode, msg: &str) -> Response {
     (status, format!("{msg}\n")).into_response()
+}
+
+/// A 401 carrying the provider's `WWW-Authenticate` Basic challenge, if any, so a
+/// git client re-sends credentials rather than giving up.
+fn unauthorized(auth: &auth::Auth, msg: &str) -> Response {
+    let mut resp = err(StatusCode::UNAUTHORIZED, msg);
+    if let Some(challenge) = auth.challenge() {
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(challenge),
+        );
+    }
+    resp
 }
 
 #[cfg(test)]
