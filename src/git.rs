@@ -61,6 +61,26 @@ pub enum CacheOutcome {
     Cached,
 }
 
+/// Upstream refused the credential on a clone/fetch (an auth diagnostic, or a
+/// 401/403/404). Carried out of the fetch so a caller in `client`
+/// upstream-credential mode can answer the client a 401, not a 502: the
+/// credential is the client's own.
+#[derive(Debug)]
+pub struct UpstreamAuthFailed;
+
+impl std::fmt::Display for UpstreamAuthFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream rejected the credential")
+    }
+}
+
+impl std::error::Error for UpstreamAuthFailed {}
+
+/// Whether `err` carries an [`UpstreamAuthFailed`] anywhere in its chain.
+pub fn is_auth_failure(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<UpstreamAuthFailed>())
+}
+
 #[derive(Clone)]
 pub struct GitConfig {
     pub git_binary: String,
@@ -690,6 +710,13 @@ async fn run_upstream(
             tokio::time::sleep(*delay).await;
             continue;
         }
+        // An upstream credential rejection is carried out typed, so a `client`-mode
+        // caller can map it to a client 401 rather than a blanket 502.
+        if reason.is_none() && upstream_auth_diagnostic(&tail) {
+            return Err(anyhow::Error::new(UpstreamAuthFailed).context(format!(
+                "git {operation} failed for {repo}: upstream rejected the credential"
+            )));
+        }
         bail!(
             "git {operation} failed for {repo} after {} attempt(s) ({}, status {status})",
             attempt + 1,
@@ -705,6 +732,25 @@ async fn clean_staging(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("remove upstream clone staging directory"),
     }
+}
+
+/// Whether a non-retryable failure is upstream refusing the credential, as
+/// opposed to a proxy-side permanent error (disk, lock, local cert). GitHub and
+/// GitLab return 404 for a repo a credential cannot see, so a not-found reads as
+/// an auth failure here. Checked only after `transient_upstream_error` has ruled
+/// the error permanent.
+fn upstream_auth_diagnostic(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    [
+        "authentication failed",
+        "could not read username",
+        "repository not found",
+        "returned error: 401",
+        "returned error: 403",
+        "returned error: 404",
+    ]
+    .iter()
+    .any(|message| text.contains(message))
 }
 
 fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
@@ -1087,6 +1133,47 @@ mod tests {
             "GIT_CONFIG_VALUE_2".into(),
             "Authorization: Basic xyz".into()
         )));
+    }
+
+    #[test]
+    fn upstream_credential_rejections_are_auth_diagnostics() {
+        for stderr in [
+            "fatal: Authentication failed for 'https://host/r.git/'",
+            "fatal: could not read Username for 'https://host': terminal prompts disabled",
+            "remote: Repository not found.",
+            "The requested URL returned error: 401",
+            "The requested URL returned error: 403",
+            "The requested URL returned error: 404",
+        ] {
+            assert!(upstream_auth_diagnostic(stderr.as_bytes()), "{stderr}");
+            // All are permanent, so the typed auth error, not a retry, is returned.
+            assert_eq!(
+                transient_upstream_error(stderr.as_bytes()),
+                None,
+                "{stderr}"
+            );
+        }
+        // A proxy-side or transient failure is not a client auth failure.
+        for stderr in [
+            "fatal: write error: No space left on device",
+            "The requested URL returned error: 503",
+            "fatal: unable to access: Could not resolve host: host",
+            "error: cannot lock ref refs/heads/main",
+        ] {
+            assert!(!upstream_auth_diagnostic(stderr.as_bytes()), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn is_auth_failure_sees_the_typed_error_under_context() {
+        let typed = anyhow::Error::new(UpstreamAuthFailed).context("git clone failed for r");
+        assert!(is_auth_failure(&typed));
+        assert!(!is_auth_failure(&anyhow::anyhow!("upstream unavailable")));
+        // The error renders without leaking a URL or credential.
+        assert_eq!(
+            UpstreamAuthFailed.to_string(),
+            "upstream rejected the credential"
+        );
     }
 
     #[test]

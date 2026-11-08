@@ -335,6 +335,17 @@ impl Auth {
         };
         credential(headers)?.forwarded(*bearer_user)
     }
+
+    /// Drop any cached verdict for this request's `(credential, repo)`, so the
+    /// next request re-probes upstream. Used after an upstream auth failure in
+    /// `client` mode: a token revoked within the `--auth-ttl-seconds` window must
+    /// not keep riding a stale cached `Allow`. A no-op outside provider mode, or
+    /// when nothing is cached.
+    pub fn invalidate(&self, headers: &HeaderMap, repo: &str) {
+        if let Mode::Provider(provider) = &self.mode {
+            provider.invalidate(headers, repo);
+        }
+    }
 }
 
 /// The username a git host documents for a bare token used as the Basic
@@ -398,6 +409,15 @@ struct CacheKey {
     repo: String,
 }
 
+/// The verdict-cache key for a credential and repo: the raw `Authorization`
+/// hashed so the secret never sits at rest.
+fn cache_key(cred: &Credential<'_>, repo: &str) -> CacheKey {
+    CacheKey {
+        credential: Sha256::digest(cred.raw.as_bytes()).into(),
+        repo: repo.to_string(),
+    }
+}
+
 /// A client credential as presented on `Authorization`.
 struct Credential<'a> {
     raw: &'a HeaderValue,
@@ -445,10 +465,7 @@ impl Provider {
         if repo::validate(repo).is_err() || !url_safe(repo) {
             return Verdict::Deny;
         }
-        let key = CacheKey {
-            credential: Sha256::digest(cred.raw.as_bytes()).into(),
-            repo: repo.to_string(),
-        };
+        let key = cache_key(&cred, repo);
         if let Some(v) = self.cached(&key) {
             self.metrics.record_auth_cache_hit();
             return v;
@@ -586,6 +603,16 @@ impl Provider {
             .lock()
             .expect("verdict cache lock")
             .put(key.clone(), (verdict, Instant::now() + ttl));
+    }
+
+    fn invalidate(&self, headers: &HeaderMap, repo: &str) {
+        let Some(cred) = credential(headers) else {
+            return;
+        };
+        self.verdicts
+            .lock()
+            .expect("verdict cache lock")
+            .pop(&cache_key(&cred, repo));
     }
 
     fn join(&self, key: &CacheKey) -> Inflight<'_> {
@@ -1298,6 +1325,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn invalidate_drops_a_cached_verdict() {
+        let p = provider(AuthConfig {
+            ttl: Duration::from_secs(3600),
+            ..provider_config(AuthProvider::Github)
+        });
+        let h = headers("Bearer tok");
+        let key = cache_key(&credential(&h).unwrap(), "owner/repo.git");
+        p.remember(&key, Verdict::Allow);
+        assert_eq!(p.cached(&key), Some(Verdict::Allow));
+        // A request with no credential, a different credential, or a different
+        // repo leaves the entry untouched.
+        p.invalidate(&HeaderMap::new(), "owner/repo.git");
+        p.invalidate(&headers("Bearer other"), "owner/repo.git");
+        p.invalidate(&h, "owner/other.git");
+        assert_eq!(p.cached(&key), Some(Verdict::Allow));
+        // The matching entry is dropped, so the next request re-probes.
+        p.invalidate(&h, "owner/repo.git");
+        assert_eq!(p.cached(&key), None);
     }
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
