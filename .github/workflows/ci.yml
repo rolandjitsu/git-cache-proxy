@@ -171,4 +171,4 @@ jobs:
       # subject_length, neither of which is configurable. Exempt them (keyed on
       # PR author so maintainer re-runs stay stable); the job still runs green.
       - if: github.event.pull_request.user.login != 'dependabot[bot]'
-        uses: crate-ci/committed@v1.1.11
+        uses: crate-ci/committed@v1.1.12
