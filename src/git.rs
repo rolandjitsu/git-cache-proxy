@@ -976,10 +976,9 @@ async fn wait_upload_pack(child: &mut Child) -> std::io::Result<std::process::Ex
             let _ = kill_group(child);
             return child.wait().await;
         }
-        exits
-            .recv()
-            .await
-            .ok_or_else(|| std::io::Error::other("upload-pack exit signal closed"))?;
+        // Option is a legacy Tokio API shape; recv() guarantees Some,
+        // so a None error branch would be unreachable.
+        exits.recv().await;
     }
 }
 
@@ -1707,6 +1706,63 @@ mod tests {
         assert_eq!(error.to_string(), "upload-pack already reaped");
     }
 
+    #[tokio::test]
+    async fn upload_pack_spawn_failure_releases_the_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("missing-git");
+        let cache = upload_pack_test_cache(binary.to_str().unwrap());
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().join("mirror.git"),
+        };
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                cache.upload_pack_rpc(&repo, None, Bytes::from_static(b"0000")),
+            )
+            .await
+            .expect("a failed spawn must release the upload-pack permit");
+            let error = result
+                .err()
+                .expect("a missing git binary must fail before streaming");
+            assert_eq!(error.to_string(), "spawn git upload-pack");
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_pack_exit_observer_reports_external_reaping() {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        assert!(
+            waitid(WaitId::Pid(pid), WaitIdOptions::EXITED)
+                .unwrap()
+                .is_some()
+        );
+        let error = wait_upload_pack(&mut child).await.unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+        // Tokio still owns its bookkeeping after an external waiter reaps it.
+        assert_eq!(
+            child.wait().await.unwrap_err().raw_os_error(),
+            error.raw_os_error()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn upload_pack_request_write_has_a_deadline() {
         let (mut writer, _reader) = tokio::io::duplex(1);
@@ -1727,10 +1783,10 @@ mod tests {
             eof: false,
         });
         let (writer_alive, writer_dropped) = oneshot::channel::<()>();
-        let writer = async move {
-            let _owned = writer_alive;
-            std::future::pending::<std::io::Result<()>>().await
-        };
+        let writer = std::future::poll_fn(move |_| {
+            let _owned = &writer_alive;
+            Poll::Pending::<std::io::Result<()>>
+        });
         let started = Instant::now();
         let error = run_upload_pack(
             child,
@@ -1891,12 +1947,7 @@ mod tests {
             UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
         );
         tokio::pin!(owner);
-        let result = tokio::time::timeout(Duration::from_secs(1), &mut owner).await;
-        // Clean up the failing implementation before asserting the regression.
-        if result.is_err() {
-            drop(read_progress_tx);
-            let _ = owner.await;
-        }
+        let result = finish_upload_pack_with_timeout(owner.as_mut(), read_progress_tx).await;
         let error = result
             .expect("leader failure must not wait for descendant stdout EOF")
             .unwrap_err();
@@ -1931,11 +1982,7 @@ mod tests {
         ));
         stdin.write_all(b"go\n").await.unwrap();
         drop(stdin);
-        let result = tokio::time::timeout(Duration::from_secs(1), &mut owner).await;
-        if result.is_err() {
-            drop(read_progress_tx);
-            let _ = owner.await;
-        }
+        let result = finish_upload_pack_with_timeout(owner.as_mut(), read_progress_tx).await;
         let error = result
             .expect("exit signal must wake the owner without response reads")
             .unwrap_err();
@@ -2150,6 +2197,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_test_timeout_cancels_and_reaps_its_owner() {
+        let child = sleeping_child(true);
+        let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
+            last_read_at: Instant::now(),
+            eof: false,
+        });
+        let owner = run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        );
+        assert!(
+            finish_upload_pack_with_timeout(owner, read_progress_tx)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+            rustix::io::Errno::CHILD
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_group_refuses_a_reaped_child() {
         let mut child = Command::new("true").spawn().unwrap();
@@ -2161,6 +2234,21 @@ mod tests {
     /// against `parse_wants`.
     fn want_set<I: IntoIterator<Item = String>>(oids: I) -> HashSet<String> {
         oids.into_iter().collect()
+    }
+
+    #[cfg(unix)]
+    // Regression failures must still cancel and reap their process before panicking.
+    async fn finish_upload_pack_with_timeout(
+        owner: impl Future<Output = std::io::Result<()>>,
+        read_progress_tx: watch::Sender<ReadProgress>,
+    ) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+        tokio::pin!(owner);
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut owner).await;
+        if result.is_err() {
+            drop(read_progress_tx);
+            let _ = owner.await;
+        }
+        result
     }
 
     #[cfg(unix)]
