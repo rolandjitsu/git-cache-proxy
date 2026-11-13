@@ -1601,6 +1601,112 @@ mod tests {
         assert!(!read_progress_rx.borrow().eof);
     }
 
+    #[tokio::test]
+    async fn upload_pack_reader_reports_lifecycle_task_loss_before_and_after_eof() {
+        for stdout_eof in [false, true] {
+            let metrics = Arc::new(Metrics::new());
+            let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
+                last_read_at: Instant::now(),
+                eof: false,
+            });
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let (mut stdout_writer, stdout_reader) = tokio::io::duplex(16);
+            if stdout_eof {
+                stdout_writer.shutdown().await.unwrap();
+            }
+            let mut reader = lifecycle_reader(stdout_reader, read_progress_tx, completion_rx);
+            reader.recorder = Some((metrics.clone(), Instant::now()));
+            let mut bytes = Vec::new();
+            let read = reader.read_to_end(&mut bytes);
+            tokio::pin!(read);
+            for _ in 0..2 {
+                assert!(matches!(
+                    std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await,
+                    Poll::Pending
+                ));
+            }
+            assert_eq!(read_progress_rx.borrow().eof, stdout_eof);
+            drop(completion_tx);
+            let error = read.await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "upload-pack lifecycle task failed");
+            assert!(bytes.is_empty());
+            drop(reader);
+            assert!(read_progress_rx.has_changed().is_err());
+            assert!(metrics.gather().contains(
+                r#"gitcacheproxy_serve_duration_seconds_count{kind="upload_pack",repo="repo.git"} 1"#
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_deadlines_fail_response_and_reap_child() {
+        for request_blocked in [false, true] {
+            let child = sleeping_child(true);
+            let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+            let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
+                last_read_at: Instant::now(),
+                eof: false,
+            });
+            let (mut stdin, _stdin_reader) = tokio::io::duplex(1);
+            let writer = async move {
+                if request_blocked {
+                    write_upload_pack_request(&mut stdin, b"0000").await
+                } else {
+                    Ok(())
+                }
+            };
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let owner = tokio::spawn(async move {
+                let result = run_upload_pack(
+                    child,
+                    writer,
+                    read_progress_rx,
+                    UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+                )
+                .await;
+                let _ = completion_tx.send(result);
+            });
+            // EOF must wait for child exit; a request timeout must still reach the body.
+            let mut reader = lifecycle_reader(&b""[..], read_progress_tx, completion_rx);
+            let error = reader.read_to_end(&mut Vec::new()).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(
+                error.to_string(),
+                if request_blocked {
+                    "upload-pack request write timed out"
+                } else {
+                    "upload-pack response idle timed out"
+                }
+            );
+            owner.await.unwrap();
+            assert_eq!(
+                rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG)
+                    .unwrap_err(),
+                rustix::io::Errno::CHILD
+            );
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+        ))
+    ))]
+    #[tokio::test]
+    async fn upload_pack_exit_observer_refuses_a_reaped_child() {
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        child.wait().await.unwrap();
+        let error = wait_upload_pack(&mut child).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "upload-pack already reaped");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn upload_pack_request_write_has_a_deadline() {
         let (mut writer, _reader) = tokio::io::duplex(1);
