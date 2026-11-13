@@ -1394,20 +1394,7 @@ mod tests {
         request.extend_from_slice(b"0000");
         assert!(request.len() > 1_000_000);
 
-        let cache = GitCache::new(
-            GitConfig {
-                git_binary: "git".into(),
-                upstream_auth_header: None,
-                big_file_threshold: "8m".into(),
-                fetch_ttl: Duration::from_secs(60),
-                max_wants: 100,
-                max_upload_packs: 1,
-                pack_threads: None,
-                pack_window_memory: None,
-            },
-            Arc::new(Metrics::new()),
-            None,
-        );
+        let cache = upload_pack_test_cache("git");
         let repo = RepoRef {
             name: "test/repo.git".into(),
             upstream_url: String::new(),
@@ -1584,10 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_reader_zero_capacity_read_does_not_signal_eof() {
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let (_completion_tx, completion_rx) = oneshot::channel();
         let mut reader = lifecycle_reader(&b"pack"[..], read_progress_tx, completion_rx);
         assert_eq!(reader.read(&mut []).await.unwrap(), 0);
@@ -1604,10 +1588,7 @@ mod tests {
     async fn upload_pack_reader_reports_lifecycle_task_loss_before_and_after_eof() {
         for stdout_eof in [false, true] {
             let metrics = Arc::new(Metrics::new());
-            let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-                last_read_at: Instant::now(),
-                eof: false,
-            });
+            let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
             let (completion_tx, completion_rx) = oneshot::channel();
             let (mut stdout_writer, stdout_reader) = tokio::io::duplex(16);
             if stdout_eof {
@@ -1644,10 +1625,7 @@ mod tests {
         for request_blocked in [false, true] {
             let child = sleeping_child(true);
             let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
-            let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-                last_read_at: Instant::now(),
-                eof: false,
-            });
+            let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
             let (mut stdin, _stdin_reader) = tokio::io::duplex(1);
             let writer = async move {
                 if request_blocked {
@@ -1778,10 +1756,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn upload_pack_lifecycle_bounds_an_unconsumed_response_and_drops_writer() {
         let child = sleeping_child(true);
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let (writer_alive, writer_dropped) = oneshot::channel::<()>();
         let writer = std::future::poll_fn(move |_| {
             let _owned = &writer_alive;
@@ -1806,10 +1781,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn upload_pack_lifecycle_progress_extends_idle_deadline() {
         let child = sleeping_child(true);
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let owner = run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -1843,10 +1815,7 @@ mod tests {
     #[tokio::test]
     async fn upload_pack_lifecycle_writer_error_reaps_child_and_reaches_reader() {
         let child = sleeping_child(true);
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let lifecycle_task = tokio::spawn(run_upload_pack(
             child,
             async {
@@ -1875,10 +1844,7 @@ mod tests {
     #[tokio::test]
     async fn upload_pack_lifecycle_reader_error_cancels_even_if_reader_is_retained() {
         let child = sleeping_child(true);
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let owner = tokio::spawn(run_upload_pack(
             child,
             std::future::pending(),
@@ -1899,10 +1865,7 @@ mod tests {
     async fn upload_pack_lifecycle_cancels_after_eof_while_child_is_running() {
         // No process group: also exercises the leader-kill fallback.
         let child = sleeping_child(false);
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: true,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(true);
         let owner = tokio::spawn(run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -1936,10 +1899,7 @@ mod tests {
             .unwrap()
             .is_some()
         );
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let owner = run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -1965,10 +1925,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let owner = run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -2003,10 +1960,7 @@ mod tests {
                 .spawn()
                 .unwrap();
             let stdout = child.stdout.take().unwrap();
-            let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-                last_read_at: Instant::now(),
-                eof: false,
-            });
+            let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
             let (completion_tx, completion_rx) = oneshot::channel();
             let owner = tokio::spawn(async move {
                 let result = run_upload_pack(
@@ -2041,10 +1995,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exit 7"]).process_group(0);
         let child = cmd.spawn().unwrap();
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: true,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(true);
         let error = run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -2121,10 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn upload_pack_eof_does_not_hide_a_later_writer_error() {
         let child = Command::new("true").process_group(0).spawn().unwrap();
-        let (_read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: true,
-        });
+        let (_read_progress_tx, read_progress_rx) = read_progress_channel(true);
         let (writer_result_tx, writer_result_rx) = oneshot::channel();
         let owner = run_upload_pack(
             child,
@@ -2169,10 +2117,7 @@ mod tests {
             .read_to_string(&mut pid)
             .await
             .unwrap();
-        let (_read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: true,
-        });
+        let (_read_progress_tx, read_progress_rx) = read_progress_channel(true);
         run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -2201,10 +2146,7 @@ mod tests {
     async fn upload_pack_test_timeout_cancels_and_reaps_its_owner() {
         let child = sleeping_child(true);
         let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
-        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
-            last_read_at: Instant::now(),
-            eof: false,
-        });
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
         let owner = run_upload_pack(
             child,
             std::future::ready(Ok(())),
@@ -2259,6 +2201,15 @@ mod tests {
             cmd.process_group(0);
         }
         cmd.spawn().unwrap()
+    }
+
+    fn read_progress_channel(
+        eof: bool,
+    ) -> (watch::Sender<ReadProgress>, watch::Receiver<ReadProgress>) {
+        watch::channel(ReadProgress {
+            last_read_at: Instant::now(),
+            eof,
+        })
     }
 
     fn lifecycle_reader<R>(
