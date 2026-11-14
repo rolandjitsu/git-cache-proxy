@@ -801,10 +801,7 @@ async fn run_upstream(
         let (status, tail) = match result {
             Ok(result) => result,
             Err(error) => {
-                if kill_group(&child).is_err() {
-                    let _ = child.start_kill();
-                }
-                let _ = child.wait().await;
+                stop_upstream(&mut child).await;
                 if let Some(path) = staging {
                     clean_staging(path).await?;
                 }
@@ -848,6 +845,13 @@ async fn run_upstream(
         );
     }
     unreachable!("final attempt returns an error or succeeds")
+}
+
+async fn stop_upstream(child: &mut Child) {
+    if kill_group(child).is_err() {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
 }
 
 async fn wait_upstream_retry(
@@ -1188,6 +1192,43 @@ mod tests {
                 .expect("cat-file must not deadlock")
                 .unwrap();
         assert_eq!(missing.len(), oids.len());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_upstream_does_not_spawn_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new(dir.path().join("missing-git"));
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_secs(60),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.is::<UpstreamStopped>(),
+            "cancellation must precede spawn: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_cleanup_reaps_leader_when_process_group_is_missing() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stop_upstream(&mut child))
+            .await
+            .expect("fallback must terminate and reap the direct child");
+        assert!(
+            child.id().is_none(),
+            "child must be reaped before cleanup returns"
+        );
+        assert_eq!(child.wait().await.unwrap().signal(), Some(9));
     }
 
     #[tokio::test(start_paused = true)]
