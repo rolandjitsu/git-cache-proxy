@@ -1,3 +1,6 @@
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.config.upstreamTimeoutSeconds))) (le (int64 .Values.config.upstreamTimeoutSeconds) 0) }}
+{{- fail "config.upstreamTimeoutSeconds must be a positive integer" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -63,6 +66,8 @@ spec:
               value: {{ .Values.upstream | quote }}
             - name: GITCACHEPROXY_CACHE_ROOT
               value: /var/cache/git-cache-proxy
+            - name: GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS
+              value: {{ .Values.config.upstreamTimeoutSeconds | quote }}
             - name: GITCACHEPROXY_FETCH_TTL_SECONDS
               value: {{ .Values.config.fetchTtlSeconds | quote }}
             - name: GITCACHEPROXY_CACHE_MAX_MB

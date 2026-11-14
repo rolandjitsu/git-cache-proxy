@@ -35,6 +35,8 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
 use crate::repo::RepoRef;
@@ -114,14 +116,18 @@ struct RepoSlot {
     fetch_lock: Mutex<Option<Instant>>,
 }
 
+#[derive(Clone)]
 pub struct GitCache {
+    shutdown: CancellationToken,
+    owners: TaskTracker,
+    upstream_timeout: Duration,
     cfg: GitConfig,
     metrics: Arc<Metrics>,
     /// Map of repo name -> its serialization slot. A plain `Mutex` (not `RwLock`)
     /// because every access is a get-or-insert (`entry`), which needs a write lock
     /// anyway, and the critical section is a single O(1) map operation - far too
     /// short for reader/writer separation to pay off.
-    slots: Mutex<HashMap<String, Arc<RepoSlot>>>,
+    slots: Arc<Mutex<HashMap<String, Arc<RepoSlot>>>>,
     /// Cache-size index for LRU eviction, or `None` when no cap is configured.
     /// When present it is `touch`ed on every request and `record`ed after each
     /// clone/fetch; when absent the eviction machinery is entirely inert.
@@ -141,10 +147,32 @@ impl GitCache {
         Self {
             cfg,
             metrics,
-            slots: Mutex::new(HashMap::new()),
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
+            owners: TaskTracker::new(),
+            upstream_timeout: Duration::from_secs(3600),
             index,
             upload_packs,
         }
+    }
+
+    /// Set the total budget for each upstream operation, including retries.
+    pub fn with_upstream_timeout(mut self, timeout: Duration) -> Result<Self> {
+        validate_upstream_timeout(timeout)?;
+        self.upstream_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Reject new upstream work and cancel active operations before HTTP drain.
+    /// Local upload-pack processes continue to drain.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
+        self.owners.close();
+    }
+
+    /// Wait for upstream owners to reap children and release repository locks.
+    pub async fn wait_for_shutdown(&self) {
+        self.owners.wait().await;
     }
 
     async fn slot(&self, name: &str) -> Arc<RepoSlot> {
@@ -210,13 +238,40 @@ impl GitCache {
         body: &[u8],
         cred: Option<&str>,
     ) -> Result<CacheOutcome> {
+        let mut owner = self.clone();
+        owner.shutdown = self.shutdown.child_token();
+        let _cancel_on_drop = owner.shutdown.clone().drop_guard();
+        let repo = repo.clone();
+        let wants = parse_wants(body);
+        let cred = cred.map(str::to_owned);
+        self.owners
+            .spawn(async move {
+                owner
+                    .ensure_fresh_owned(&repo, want_fetch, &wants, cred.as_deref())
+                    .await
+            })
+            .await
+            .context("join upstream owner")?
+    }
+
+    async fn ensure_fresh_owned(
+        &self,
+        repo: &RepoRef,
+        want_fetch: bool,
+        wants: &HashSet<String>,
+        cred: Option<&str>,
+    ) -> Result<CacheOutcome> {
         let slot = self.slot(&repo.name).await;
         // Mark the repo used on every request - a served cache hit counts as much as
         // a fetch - so the eviction index keeps a truthful last-access ordering.
         if let Some(idx) = &self.index {
             idx.touch(&repo.name);
         }
-        let mut last = slot.fetch_lock.lock().await;
+        let mut last = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => bail!("upstream operation cancelled"),
+            guard = slot.fetch_lock.lock() => guard,
+        };
 
         // Stamp the start: upstream is read then, so a ref pushed mid-fetch is
         // missing, and a caller queued behind a slow fetch must see it as stale.
@@ -240,7 +295,10 @@ impl GitCache {
 
         // Best-effort: on failure, fall through and let upload-pack surface the
         // normal "not our ref" error for any want it still cannot satisfy.
-        if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
+        if let Err(e) = self.ensure_wanted_oids(repo, wants, cred).await {
+            if is_auth_failure(&e) || self.shutdown.is_cancelled() || e.is::<UpstreamStopped>() {
+                return Err(e);
+            }
             tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
         }
         Ok(outcome)
@@ -368,7 +426,16 @@ impl GitCache {
             .arg("--quiet")
             .arg(&repo.upstream_url)
             .arg(&tmp);
-        if let Err(error) = run_upstream(&mut cmd, "clone", &repo.name, Some(&tmp)).await {
+        if let Err(error) = run_upstream(
+            &mut cmd,
+            "clone",
+            &repo.name,
+            Some(&tmp),
+            self.upstream_timeout,
+            &self.shutdown,
+        )
+        .await
+        {
             // `-` not the repo name: a failed clone must not mint a per-repo series
             // for an arbitrary client-supplied path (see `metrics`). The failing
             // repo is still named in the returned error, which the caller logs.
@@ -405,7 +472,16 @@ impl GitCache {
             // otherwise drop those refs as "not on origin" (see `prune_wants`).
             .arg("+refs/*:refs/*")
             .arg(format!("^{PROXY_WANTS_NS}/*"));
-        if let Err(error) = run_upstream(&mut cmd, "fetch", &repo.name, None).await {
+        if let Err(error) = run_upstream(
+            &mut cmd,
+            "fetch",
+            &repo.name,
+            None,
+            self.upstream_timeout,
+            &self.shutdown,
+        )
+        .await
+        {
             self.metrics
                 .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
             return Err(error);
@@ -429,14 +505,13 @@ impl GitCache {
     async fn ensure_wanted_oids(
         &self,
         repo: &RepoRef,
-        body: &[u8],
+        wants: &HashSet<String>,
         cred: Option<&str>,
     ) -> Result<()> {
-        let wants = parse_wants(body);
         if wants.is_empty() {
             return Ok(());
         }
-        let mut missing = self.missing_oids(repo, &wants).await?;
+        let mut missing = self.missing_oids(repo, wants).await?;
         if missing.is_empty() {
             return Ok(());
         }
@@ -469,18 +544,19 @@ impl GitCache {
             // already exist), making the object a `want` tip safe from `git gc`.
             cmd.arg(format!("+{oid}:{PROXY_WANTS_NS}/{oid}"));
         }
-        let status = cmd
-            .status()
-            .await
-            .context("spawn git fetch (want-by-sha)")?;
-        if !status.success() {
-            // Upstream would not serve one of these SHAs (e.g. arbitrary-SHA fetches
-            // are disabled). Leave it: upload-pack will reject the want with "not
-            // our ref".
+        if let Err(error) = run_upstream(
+            &mut cmd,
+            "fetch (want-by-sha)",
+            &repo.name,
+            None,
+            self.upstream_timeout,
+            &self.shutdown,
+        )
+        .await
+        {
             self.metrics
                 .record_upstream(UpstreamOp::WantFetch, Status::Error, "-");
-            tracing::warn!(repo = %repo.name, "want-by-sha fetch from upstream failed");
-            return Ok(());
+            return Err(error);
         }
         self.metrics
             .record_upstream(UpstreamOp::WantFetch, Status::Ok, &repo.name);
@@ -652,6 +728,25 @@ impl GitCache {
     }
 }
 
+/// Validate the budget for both library configuration and CLI parsing.
+pub fn validate_upstream_timeout(timeout: Duration) -> Result<()> {
+    if timeout.is_zero() || Instant::now().checked_add(timeout).is_none() {
+        bail!("upstream timeout must be positive and fit in a monotonic deadline");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct UpstreamStopped;
+
+impl std::fmt::Display for UpstreamStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream operation cancelled or total budget exhausted")
+    }
+}
+
+impl std::error::Error for UpstreamStopped {}
+
 // The caller holds the repository lock throughout retries. Never retry local
 // upload-pack: once its response starts streaming it cannot be replayed safely.
 async fn run_upstream(
@@ -659,34 +754,63 @@ async fn run_upstream(
     operation: &str,
     repo: &str,
     staging: Option<&Path>,
+    budget: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
+    let deadline = Instant::now() + budget;
     cmd.stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
     for attempt in 0..=MAX_UPSTREAM_RETRIES {
+        if cancellation.is_cancelled() || Instant::now() >= deadline {
+            return Err(UpstreamStopped.into());
+        }
         if let Some(path) = staging {
             clean_staging(path).await?;
         }
         let mut child = cmd.spawn().context("spawn upstream git")?;
         let mut stderr = child.stderr.take().context("upstream git: no stderr")?;
-        // Drain even after the cap so a noisy child cannot block on its pipe.
-        // Only retain the tail; credentials and raw remote output are never logged.
-        let mut tail = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            let count = stderr
-                .read(&mut chunk)
-                .await
-                .context("read upstream git stderr")?;
-            if count == 0 {
-                break;
+        let operation_result = async {
+            // Drain all output but retain only a bounded diagnostic tail.
+            let mut tail = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stderr
+                    .read(&mut chunk)
+                    .await
+                    .context("read upstream git stderr")?;
+                if count == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&chunk[..count]);
+                if tail.len() > MAX_UPSTREAM_STDERR_BYTES {
+                    tail.drain(..tail.len() - MAX_UPSTREAM_STDERR_BYTES);
+                }
             }
-            tail.extend_from_slice(&chunk[..count]);
-            if tail.len() > MAX_UPSTREAM_STDERR_BYTES {
-                tail.drain(..tail.len() - MAX_UPSTREAM_STDERR_BYTES);
+            let status = child.wait().await.context("wait for upstream git")?;
+            Ok::<_, anyhow::Error>((status, tail))
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(UpstreamStopped.into()),
+            _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped.into()),
+            result = operation_result => result,
+        };
+        let (status, tail) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if kill_group(&child).is_err() {
+                    let _ = child.start_kill();
+                }
+                let _ = child.wait().await;
+                if let Some(path) = staging {
+                    clean_staging(path).await?;
+                }
+                return Err(error);
             }
-        }
-        let status = child.wait().await.context("wait for upstream git")?;
+        };
         if status.success() {
             return Ok(());
         }
@@ -707,7 +831,7 @@ async fn run_upstream(
                 reason,
                 "retrying upstream git"
             );
-            tokio::time::sleep(*delay).await;
+            wait_upstream_retry(*delay, deadline, cancellation).await?;
             continue;
         }
         // An upstream credential rejection is carried out typed, so a `client`-mode
@@ -724,6 +848,19 @@ async fn run_upstream(
         );
     }
     unreachable!("final attempt returns an error or succeeds")
+}
+
+async fn wait_upstream_retry(
+    delay: Duration,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(UpstreamStopped.into()),
+        _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped.into()),
+        _ = tokio::time::sleep(delay) => Ok(()),
+    }
 }
 
 async fn clean_staging(path: &Path) -> Result<()> {
@@ -1053,6 +1190,254 @@ mod tests {
         assert_eq!(missing.len(), oids.len());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retry_wait_obeys_shared_deadline_and_cancellation() {
+        let token = CancellationToken::new();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(3);
+        wait_upstream_retry(Duration::from_secs(2), deadline, &token)
+            .await
+            .unwrap();
+        assert!(
+            wait_upstream_retry(Duration::from_secs(2), deadline, &token)
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(20);
+        let cancel = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            token.cancel();
+        };
+        let (result, ()) = tokio::join!(
+            wait_upstream_retry(Duration::from_secs(10), deadline, &token),
+            cancel
+        );
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_repository_waiters_and_rejects_admission() {
+        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let slot = cache.slot(&repo.name).await;
+        let guard = slot.fetch_lock.lock().await;
+        let wants = HashSet::new();
+        let waiter = cache.ensure_fresh_owned(&repo, true, &wants, None);
+        let shutdown = async {
+            cache.shutdown();
+        };
+        let (result, ()) = tokio::join!(waiter, shutdown);
+        assert!(result.is_err());
+        cache.wait_for_shutdown().await;
+        drop(guard);
+        assert!(slot.fetch_lock.try_lock().is_ok());
+        assert!(cache.ensure_fresh(&repo, true, b"", None).await.is_err());
+        cache.wait_for_shutdown().await;
+        assert!(cache.owners.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_shutdown_preserves_active_upload_and_releases_its_permit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let release = root.path().join("release");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&release)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let binary = root.path().join("git-wrapper");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\ncat '{}' >/dev/null\nprintf pack\n",
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = test_config();
+        config.git_binary = binary.to_str().unwrap().into();
+        let cache = GitCache::new(config, Arc::new(Metrics::new()), None);
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 0);
+        cache.shutdown();
+        cache.wait_for_shutdown().await;
+        tokio::fs::write(&release, b"").await.unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_util::io::StreamReader::new(stream).read_to_end(&mut body),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(body, b"pack");
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            cache.upload_packs.as_ref().unwrap().acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(permit);
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+    }
+
+    #[test]
+    fn upstream_budget_rejects_zero_and_overflow() {
+        assert!(validate_upstream_timeout(Duration::ZERO).is_err());
+        assert!(validate_upstream_timeout(Duration::MAX).is_err());
+        assert!(validate_upstream_timeout(Duration::from_secs(3600)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_budget_stops_stalled_and_noisy_commands() {
+        for script in ["sleep 30", "while :; do echo private-diagnostic >&2; done"] {
+            let token = CancellationToken::new();
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            let error = run_upstream(
+                &mut cmd,
+                "test",
+                "test",
+                None,
+                Duration::from_millis(100),
+                &token,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.is::<UpstreamStopped>());
+            assert!(!error.to_string().contains("private-diagnostic"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_cancellation_reaps_child_and_stops_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let pidfile = root.path().join("pids");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pidfile)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo \"$$ $!\" > \"$1\"; wait")
+            .arg("test")
+            .arg(&pidfile);
+        let cancel = async {
+            let pids = tokio::fs::read_to_string(&pidfile).await.unwrap();
+            token.cancel();
+            pids
+        };
+        let (result, pids) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run_upstream(
+                    &mut cmd,
+                    "test",
+                    "test",
+                    None,
+                    Duration::from_secs(30),
+                    &token
+                ),
+                cancel
+            )
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().is::<UpstreamStopped>());
+        let mut pids = pids.split_whitespace();
+        let leader = pids.next().unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{leader}")).exists(),
+            "leader must be reaped"
+        );
+        for pid in pids {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Ok(stat) = tokio::fs::read_to_string(format!("/proc/{pid}/stat")).await {
+                    if stat.split_whitespace().nth(2) == Some("Z") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("descendant must stop after group kill");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_budget_is_shared_across_retry_backoff() {
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo 'Recv failure: Connection reset by peer' >&2; exit 128",
+        ]);
+        let started = Instant::now();
+        let error = run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_millis(100),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<UpstreamStopped>());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_success_within_budget_and_typed_auth_error() {
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 0.1"]);
+        run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_secs(2),
+            &token,
+        )
+        .await
+        .unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'fatal: Authentication failed' >&2; exit 128"]);
+        let error = run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::from_secs(2),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_auth_failure(&error));
+    }
+
     #[test]
     fn upstream_retry_classifies_transient_diagnostics() {
         for message in [
@@ -1330,6 +1715,18 @@ mod tests {
             repo: "group/foo.git".into(),
             recorder: Some((Arc::new(Metrics::new()), Instant::now())),
             served: Some(served),
+        }
+    }
+    fn test_config() -> GitConfig {
+        GitConfig {
+            git_binary: "git".into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(60),
+            max_wants: 0,
+            max_upload_packs: 1,
+            pack_threads: None,
+            pack_window_memory: None,
         }
     }
 }

@@ -209,6 +209,12 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_AUTH_TTL_SECONDS", default_value_t = 0)]
     pub auth_ttl_seconds: u64,
 
+    /// Total seconds per upstream clone, full-ref fetch or SHA backfill,
+    /// including all attempts and retry delays. Must be positive.
+    #[arg(long, env = "GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS", default_value = "3600",
+        value_parser = parse_upstream_timeout)]
+    pub upstream_timeout_seconds: u64,
+
     /// Skip the upstream fetch on `info/refs` if the last fetch started within
     /// this many seconds. Coalesces bursts of clones for the same repo. `0` =
     /// always fetch (freshest, more upstream load).
@@ -302,9 +308,24 @@ pub struct Config {
     pub log_format: LogFormat,
 }
 
+fn parse_upstream_timeout(value: &str) -> Result<u64, String> {
+    let seconds = value.parse::<u64>().map_err(|e| e.to_string())?;
+    crate::git::validate_upstream_timeout(std::time::Duration::from_secs(seconds))
+        .map_err(|e| e.to_string())?;
+    Ok(seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_timeout_parser_matches_library_validation() {
+        assert_eq!(parse_upstream_timeout("3600").unwrap(), 3600);
+        for value in ["0", "-1", "18446744073709551615", "18446744073709551616"] {
+            assert!(parse_upstream_timeout(value).is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn static_mode_never_conflicts() {

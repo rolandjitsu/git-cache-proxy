@@ -81,6 +81,8 @@ config:
   # Skip the upstream fetch on info/refs if the mirror was refreshed within this
   # many seconds; coalesces bursts of clones for one repo. 0 = always fetch.
   fetchTtlSeconds: 10
+  # Total upstream command budget, including retries (positive seconds).
+  upstreamTimeoutSeconds: 3600
   # Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle
   # mirrors when exceeded. 0 = unlimited (no eviction). Set this whenever the
   # cache volume is bounded.
