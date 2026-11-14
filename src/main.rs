@@ -89,7 +89,14 @@ async fn main() -> Result<()> {
         )
     });
 
-    let cache = Arc::new(git::GitCache::new(git_cfg, metrics.clone(), index.clone()));
+    let cache = Arc::new(
+        git::GitCache::new(git_cfg, metrics.clone(), index.clone())
+            .with_stale(
+                Duration::from_secs(cfg.max_stale_seconds),
+                cfg.max_background_fetches,
+            )
+            .with_request_limit(cfg.max_concurrent_requests),
+    );
 
     let upstream_base = cfg.upstream.trim_end_matches('/').to_string();
 
@@ -172,6 +179,7 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
     }
+    cache.shutdown().await;
 
     tracing::info!("shutdown complete");
     Ok(())

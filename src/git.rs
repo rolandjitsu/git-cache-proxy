@@ -12,8 +12,8 @@
 //!
 //! It is strictly read-only: only `git-upload-pack` (clone/fetch) is served, and
 //! upstream is only ever *pulled* from - nothing is pushed or replicated
-//! proactively. A miss transparently pulls from upstream, so the cache is never
-//! stale for the ref the client actually asked for.
+//! proactively. A miss transparently pulls from upstream; optional stale serving
+//! can return older refs while a refresh runs.
 //!
 //! Want-by-SHA: a client can `want` a commit that lives only under an unadvertised
 //! upstream ref (e.g. a GitHub PR merge commit), which `clone --mirror` never
@@ -24,15 +24,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 
@@ -49,6 +50,20 @@ const UPSTREAM_RETRY_DELAYS: [Duration; 3] = [
 ];
 const MAX_UPSTREAM_RETRIES: usize = UPSTREAM_RETRY_DELAYS.len();
 const MAX_UPSTREAM_STDERR_BYTES: usize = 64 * 1024;
+const FRESHNESS_FILE: &str = "proxy-refresh.json";
+const MAX_FRESHNESS_BYTES: u64 = 4096;
+
+/// A bounded stale-serving admission lane has no capacity.
+#[derive(Debug)]
+pub struct CacheBusy;
+
+impl std::fmt::Display for CacheBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cache request capacity exhausted")
+    }
+}
+
+impl std::error::Error for CacheBusy {}
 
 /// What `ensure_fresh` did - for metrics.
 #[derive(Debug, Clone, Copy)]
@@ -104,16 +119,29 @@ pub struct GitConfig {
     pub pack_window_memory: Option<String>,
 }
 
-/// Per-repo serialization point. `fetch_lock` is a `Mutex`, not an `RwLock`, on
-/// purpose: it does double duty as (1) the mutual-exclusion point that collapses a
-/// burst of concurrent clones for one repo into a single upstream pull, and (2) the
-/// guard for the start `Instant` of the last upstream pull. Both uses need *exclusive* access
-/// while a fetch runs - there is no read-only fast path to share - so an `RwLock`
-/// would only add overhead and never grant a concurrent reader.
+/// Serialize mutations independently of readers and protect the mirror from eviction.
 struct RepoSlot {
-    fetch_lock: Mutex<Option<Instant>>,
+    fetch_lock: Arc<Mutex<Option<Instant>>>,
+    lifecycle: Arc<RwLock<()>>,
+    refresh: Mutex<RefreshState>,
 }
 
+#[derive(Default)]
+struct RefreshState {
+    last_success: Option<Instant>,
+    next_attempt: Option<Instant>,
+    in_flight: bool,
+    record: Option<String>,
+    identity: Option<String>,
+}
+
+/// Holds a request's mirror guard and setup permit.
+pub struct RequestLease {
+    guard: OwnedRwLockReadGuard<()>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
 pub struct GitCache {
     cfg: GitConfig,
     metrics: Arc<Metrics>,
@@ -121,13 +149,20 @@ pub struct GitCache {
     /// because every access is a get-or-insert (`entry`), which needs a write lock
     /// anyway, and the critical section is a single O(1) map operation - far too
     /// short for reader/writer separation to pay off.
-    slots: Mutex<HashMap<String, Arc<RepoSlot>>>,
+    slots: Arc<Mutex<HashMap<String, Arc<RepoSlot>>>>,
     /// Cache-size index for LRU eviction, or `None` when no cap is configured.
     /// When present it is `touch`ed on every request and `record`ed after each
     /// clone/fetch; when absent the eviction machinery is entirely inert.
     index: Option<Arc<crate::evict::CacheIndex>>,
     /// `None` when `max_upload_packs` is `0` (unlimited).
     upload_packs: Option<Arc<Semaphore>>,
+    max_stale: Duration,
+    background: Arc<Semaphore>,
+    request_setups: Option<Arc<Semaphore>>,
+    bodies: Option<Arc<Semaphore>>,
+    preflights: Option<Arc<Semaphore>>,
+    upstream: Arc<Semaphore>,
+    tasks: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl GitCache {
@@ -141,10 +176,155 @@ impl GitCache {
         Self {
             cfg,
             metrics,
-            slots: Mutex::new(HashMap::new()),
+            slots: Arc::new(Mutex::new(HashMap::new())),
             index,
             upload_packs,
+            max_stale: Duration::ZERO,
+            background: Arc::new(Semaphore::new(1)),
+            request_setups: None,
+            bodies: None,
+            preflights: None,
+            upstream: Arc::new(Semaphore::new(1)),
+            tasks: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    /// Enable bounded request-triggered background refreshes.
+    pub fn with_stale(mut self, max_stale: Duration, max_background: usize) -> Self {
+        self.max_stale = max_stale;
+        self.background = Arc::new(Semaphore::new(max_background));
+        if self.request_setups.is_none() {
+            self.upstream = Arc::new(Semaphore::new(max_background));
+        }
+        self
+    }
+
+    /// Bound request setup tasks, including those whose clients disconnected.
+    pub fn with_request_limit(mut self, limit: usize) -> Self {
+        self.request_setups = (limit > 0).then(|| Arc::new(Semaphore::new(limit)));
+        self.bodies = (limit > 0).then(|| Arc::new(Semaphore::new(limit)));
+        self.preflights = (limit > 0).then(|| Arc::new(Semaphore::new(limit)));
+        let upstream_limit = if limit == 0 {
+            self.background.available_permits().max(1)
+        } else {
+            limit.saturating_sub(1).max(1)
+        };
+        self.upstream = Arc::new(Semaphore::new(upstream_limit));
+        self
+    }
+
+    /// Wait for admitted background refreshes after the HTTP server drains.
+    pub async fn shutdown(&self) {
+        loop {
+            let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+            if tasks.is_empty() {
+                break;
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+
+    /// Prepare a request and keep the mirror protected if its client disconnects.
+    pub async fn prepare(
+        &self,
+        repo: RepoRef,
+        want_fetch: bool,
+        body: Bytes,
+        cred: Option<&str>,
+    ) -> Result<(CacheOutcome, RequestLease)> {
+        let permit = if self.stale_enabled() {
+            None
+        } else {
+            self.request_permit().await?
+        };
+        let preflight = self.preflight_permit()?;
+        let cache = self.clone();
+        let cred = cred.map(str::to_owned);
+        self.spawn_tracked(async move {
+            let guard = if cache.stale_enabled() {
+                cache
+                    .slot(&repo.name)
+                    .await
+                    .lifecycle
+                    .clone()
+                    .try_read_owned()
+                    .map_err(|_| CacheBusy)?
+            } else {
+                cache.read_guard(&repo).await
+            };
+            let outcome = cache
+                .ensure_fresh_inner(&repo, want_fetch, &body, cred.as_deref(), preflight)
+                .await?;
+            let permit = if cache.stale_enabled() {
+                cache
+                    .request_setups
+                    .as_ref()
+                    .map(|s| s.clone().try_acquire_owned())
+                    .transpose()
+                    .map_err(|_| CacheBusy)?
+            } else {
+                permit
+            };
+            Ok((outcome, RequestLease { guard, permit }))
+        })
+        .await
+        .context("request preparation task")?
+    }
+
+    /// Whether request-triggered stale serving is enabled.
+    pub fn stale_enabled(&self) -> bool {
+        !self.max_stale.is_zero()
+    }
+
+    /// Bound request decoding independently of slow upstream preparation.
+    pub fn body_permit(&self) -> Result<Option<OwnedSemaphorePermit>> {
+        Ok(self
+            .bodies
+            .as_ref()
+            .map(|s| s.clone().try_acquire_owned())
+            .transpose()
+            .map_err(|_| CacheBusy)?)
+    }
+
+    fn preflight_permit(&self) -> Result<Option<OwnedSemaphorePermit>> {
+        if !self.stale_enabled() {
+            return Ok(None);
+        }
+        Ok(self
+            .preflights
+            .as_ref()
+            .map(|s| s.clone().try_acquire_owned())
+            .transpose()
+            .map_err(|_| CacheBusy)?)
+    }
+
+    async fn request_permit(&self) -> Result<Option<OwnedSemaphorePermit>> {
+        let permit = match &self.request_setups {
+            Some(limit) => Some(
+                limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("request setup cap")?,
+            ),
+            None => None,
+        };
+        Ok(permit)
+    }
+
+    fn spawn_tracked<T: Send + 'static>(
+        &self,
+        task: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> oneshot::Receiver<T> {
+        let (tx, rx) = oneshot::channel();
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(tokio::spawn(async move {
+            let _ = tx.send(task.await);
+        }));
+        rx
     }
 
     async fn slot(&self, name: &str) -> Arc<RepoSlot> {
@@ -154,10 +334,22 @@ impl GitCache {
             .entry(name.to_string())
             .or_insert_with(|| {
                 Arc::new(RepoSlot {
-                    fetch_lock: Mutex::new(None),
+                    fetch_lock: Arc::new(Mutex::new(None)),
+                    lifecycle: Arc::new(RwLock::new(())),
+                    refresh: Mutex::new(RefreshState::default()),
                 })
             })
             .clone()
+    }
+
+    /// Protect a mirror from eviction for the duration of a request.
+    pub async fn read_guard(&self, repo: &RepoRef) -> OwnedRwLockReadGuard<()> {
+        self.slot(&repo.name)
+            .await
+            .lifecycle
+            .clone()
+            .read_owned()
+            .await
     }
 
     /// Flag a mirror as changed after a clone/fetch so the background evictor
@@ -175,10 +367,10 @@ impl GitCache {
     /// that populates the mirror. The rename is atomic and fast; the (possibly slow)
     /// removal runs after the lock is released. `ensure_fresh` keys off
     /// `HEAD.exists()`, so the next request for an evicted repo transparently
-    /// re-clones. An `upload-pack` already streaming from the old directory keeps
-    /// its open file descriptors and drains cleanly (POSIX unlink semantics).
+    /// re-clones. Active HTTP requests hold a read guard until Git exits.
     pub async fn evict(&self, name: &str, cache_dir: &Path) -> Result<()> {
         let slot = self.slot(name).await;
+        let lifecycle = slot.lifecycle.write().await;
         let guard = slot.fetch_lock.lock().await;
         if !cache_dir.join("HEAD").exists() {
             return Ok(()); // already gone (raced a prior eviction or manual removal)
@@ -194,6 +386,7 @@ impl GitCache {
             .await
             .with_context(|| format!("rename mirror for eviction: {name}"))?;
         drop(guard); // the mirror is gone from its path; free the slot before the slow delete
+        drop(lifecycle);
         let _ = tokio::fs::remove_dir_all(&trash).await;
         Ok(())
     }
@@ -210,11 +403,28 @@ impl GitCache {
         body: &[u8],
         cred: Option<&str>,
     ) -> Result<CacheOutcome> {
+        self.ensure_fresh_inner(repo, want_fetch, body, cred, self.preflight_permit()?)
+            .await
+    }
+
+    async fn ensure_fresh_inner(
+        &self,
+        repo: &RepoRef,
+        want_fetch: bool,
+        body: &[u8],
+        cred: Option<&str>,
+        preflight: Option<OwnedSemaphorePermit>,
+    ) -> Result<CacheOutcome> {
         let slot = self.slot(&repo.name).await;
         // Mark the repo used on every request - a served cache hit counts as much as
         // a fetch - so the eviction index keeps a truthful last-access ordering.
         if let Some(idx) = &self.index {
             idx.touch(&repo.name);
+        }
+        if !self.max_stale.is_zero() {
+            return self
+                .ensure_fresh_stale(repo, &slot, body, cred, preflight)
+                .await;
         }
         let mut last = slot.fetch_lock.lock().await;
 
@@ -246,6 +456,205 @@ impl GitCache {
         Ok(outcome)
     }
 
+    async fn ensure_fresh_stale(
+        &self,
+        repo: &RepoRef,
+        slot: &Arc<RepoSlot>,
+        body: &[u8],
+        cred: Option<&str>,
+        preflight: Option<OwnedSemaphorePermit>,
+    ) -> Result<CacheOutcome> {
+        self.restore_freshness(repo, slot).await;
+        let exists = repo.cache_dir.join("HEAD").exists();
+        let mut state = slot.refresh.lock().await;
+        let usable = exists
+            && state
+                .last_success
+                .is_some_and(|t| t.elapsed() <= self.max_stale);
+        if usable {
+            let stale = state
+                .last_success
+                .is_some_and(|t| self.cfg.fetch_ttl.is_zero() || t.elapsed() >= self.cfg.fetch_ttl);
+            let ready = state.next_attempt.is_none_or(|t| Instant::now() >= t);
+            if stale
+                && ready
+                && !state.in_flight
+                && let Ok(permit) = self.background.clone().try_acquire_owned()
+                && let Ok(lifecycle) = slot.lifecycle.clone().try_read_owned()
+                && let Ok(fetch_guard) = slot.fetch_lock.clone().try_lock_owned()
+            {
+                state.in_flight = true;
+                let cache = self.clone();
+                let repo = repo.clone();
+                let slot = slot.clone();
+                let cred = cred.map(str::to_owned);
+                let mut tasks = self.tasks.lock().unwrap();
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    let _fetch_guard = fetch_guard;
+                    let _lifecycle = lifecycle;
+                    let started = Instant::now();
+                    let result = if repo.cache_dir.join("HEAD").exists() {
+                        cache.fetch(&repo, cred.as_deref()).await
+                    } else {
+                        Err(anyhow::anyhow!("mirror was evicted before refresh"))
+                    };
+                    cache.restore_freshness(&repo, &slot).await;
+                    let mut state = slot.refresh.lock().await;
+                    if result.is_ok() {
+                        state.last_success = Some(started);
+                    } else {
+                        tracing::warn!(repo = %repo.name, error = ?result, "background refresh failed");
+                    }
+                    state.next_attempt = Some(Instant::now() + cache.cooldown());
+                    state.in_flight = false;
+                }));
+            }
+            drop(state);
+            self.ensure_wants_stale(repo, slot, body, cred, preflight)
+                .await?;
+            self.check_age(slot).await?;
+            return Ok(CacheOutcome::Cached);
+        }
+        drop(state);
+
+        let _upstream = self
+            .upstream
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CacheBusy)?;
+        drop(preflight);
+        let mut last = slot.fetch_lock.try_lock().map_err(|_| CacheBusy)?;
+        self.restore_freshness(repo, slot).await;
+        let mut state = slot.refresh.lock().await;
+        let exists = repo.cache_dir.join("HEAD").exists();
+        if exists
+            && state
+                .last_success
+                .is_some_and(|t| t.elapsed() <= self.max_stale)
+        {
+            drop(state);
+            if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
+                tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
+            }
+            drop(last);
+            self.check_age(slot).await?;
+            return Ok(CacheOutcome::Cached);
+        }
+        if state.next_attempt.is_some_and(|t| Instant::now() < t) {
+            bail!("upstream refresh is in cooldown");
+        }
+        drop(state);
+        let started = Instant::now();
+        let result = if exists {
+            self.fetch(repo, cred).await
+        } else {
+            self.clone_mirror(repo, cred).await
+        };
+        self.restore_freshness(repo, slot).await;
+        state = slot.refresh.lock().await;
+        state.next_attempt = Some(Instant::now() + self.cooldown());
+        if result.is_ok() {
+            state.last_success = Some(started);
+            *last = Some(started);
+        }
+        drop(state);
+        result?;
+        if started.elapsed() > self.max_stale {
+            bail!("refreshed mirror exceeds maximum stale age");
+        }
+        if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
+            tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
+        }
+        drop(last);
+        self.check_age(slot).await?;
+        Ok(if exists {
+            CacheOutcome::Fetched
+        } else {
+            CacheOutcome::Cloned
+        })
+    }
+
+    async fn restore_freshness(&self, repo: &RepoRef, slot: &RepoSlot) {
+        let record = read_freshness(repo).await.ok();
+        let identity = format!(
+            "{}:{}",
+            repository_identity(repo),
+            directory_identity(&repo.cache_dir)
+                .await
+                .unwrap_or_default()
+        );
+        let mut state = slot.refresh.lock().await;
+        if state.identity.as_ref() != Some(&identity) {
+            state.last_success = None;
+            state.record = None;
+            state.next_attempt = None;
+            state.identity = Some(identity);
+        }
+        let text = record.as_ref().map(|(text, _)| text.clone());
+        if state.record != text || text.is_none() {
+            state.last_success =
+                record.and_then(|(_, started)| Instant::now().checked_sub(started));
+            state.record = text;
+        }
+    }
+
+    async fn check_age(&self, slot: &RepoSlot) -> Result<()> {
+        if slot
+            .refresh
+            .lock()
+            .await
+            .last_success
+            .is_none_or(|t| t.elapsed() > self.max_stale)
+        {
+            bail!("mirror exceeds maximum stale age");
+        }
+        Ok(())
+    }
+
+    fn cooldown(&self) -> Duration {
+        self.cfg.fetch_ttl.max(Duration::from_secs(1))
+    }
+
+    async fn ensure_wants_stale(
+        &self,
+        repo: &RepoRef,
+        slot: &RepoSlot,
+        body: &[u8],
+        cred: Option<&str>,
+        preflight: Option<OwnedSemaphorePermit>,
+    ) -> Result<()> {
+        let wants = parse_wants(body);
+        if wants.is_empty() {
+            return Ok(());
+        }
+        match self.missing_oids(repo, &wants).await {
+            Ok(missing) if missing.is_empty() => return Ok(()),
+            _ => {}
+        }
+        let _permit = self
+            .upstream
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CacheBusy)?;
+        drop(preflight);
+        let _lock = slot.fetch_lock.try_lock().map_err(|_| CacheBusy)?;
+        if let Err(e) = self.ensure_wanted_oids(repo, body, cred).await {
+            tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
+        }
+        Ok(())
+    }
+
+    async fn check_serving_age(&self, repo: &RepoRef) -> Result<()> {
+        if self.stale_enabled() {
+            let slot = self.slot(&repo.name).await;
+            self.restore_freshness(repo, &slot).await;
+            self.check_age(&slot).await?;
+        }
+        Ok(())
+    }
+
     /// `git upload-pack --advertise-refs`, wrapped with the smart-HTTP service
     /// header - i.e. the `GET .../info/refs?service=git-upload-pack` body.
     pub async fn advertise_refs(
@@ -253,15 +662,35 @@ impl GitCache {
         repo: &RepoRef,
         git_protocol: Option<&str>,
     ) -> Result<Bytes> {
+        let permit = self.request_permit().await?;
+        let guard = self.read_guard(repo).await;
+        self.advertise_refs_guarded(repo, git_protocol, RequestLease { guard, permit })
+            .await
+    }
+
+    /// Advertise while retaining the request's eviction guard until Git exits.
+    pub async fn advertise_refs_guarded(
+        &self,
+        repo: &RepoRef,
+        git_protocol: Option<&str>,
+        lease: RequestLease,
+    ) -> Result<Bytes> {
         let mut cmd = self.local_cmd(git_protocol);
         cmd.arg("upload-pack")
             .arg("--stateless-rpc")
             .arg("--advertise-refs")
             .arg(&repo.cache_dir);
         let started = Instant::now();
-        let out = cmd
-            .output()
+        let cache = self.clone();
+        let owned_repo = repo.clone();
+        let out = self
+            .spawn_tracked(async move {
+                let _lease = lease;
+                cache.check_serving_age(&owned_repo).await?;
+                cmd.output().await.context("spawn git advertisement")
+            })
             .await
+            .context("advertise-refs task")?
             .context("spawn git upload-pack --advertise-refs")?;
         if !out.status.success() {
             bail!(
@@ -291,6 +720,36 @@ impl GitCache {
         git_protocol: Option<&str>,
         body: Bytes,
     ) -> Result<ReaderStream<TimedReader<ChildStdout>>> {
+        let guard = self.read_guard(repo).await;
+        self.upload_pack_rpc_guarded(
+            repo,
+            git_protocol,
+            body,
+            RequestLease {
+                guard,
+                permit: None,
+            },
+        )
+        .await
+    }
+
+    /// Start an upload-pack while retaining the request's eviction guard.
+    pub async fn upload_pack_rpc_guarded(
+        &self,
+        repo: &RepoRef,
+        git_protocol: Option<&str>,
+        body: Bytes,
+        lease: RequestLease,
+    ) -> Result<ReaderStream<TimedReader<ChildStdout>>> {
+        let RequestLease {
+            guard,
+            permit: mut setup_permit,
+        } = lease;
+        let _strict_setup = if self.stale_enabled() {
+            None
+        } else {
+            setup_permit.take()
+        };
         let permit = match &self.upload_packs {
             Some(s) => Some(s.clone().acquire_owned().await.context("upload-pack cap")?),
             None => None,
@@ -309,6 +768,7 @@ impl GitCache {
         // nothing while it counts and compresses and so never gets SIGPIPE.
         #[cfg(unix)]
         cmd.process_group(0);
+        self.check_serving_age(repo).await?;
         let mut child = cmd.spawn().context("spawn git upload-pack")?;
         let mut stdin = child.stdin.take().context("upload-pack: no stdin")?;
         let stdout = child.stdout.take().context("upload-pack: no stdout")?;
@@ -317,12 +777,16 @@ impl GitCache {
         // wait for exit without buffering the whole pack. Spawned before the stdin
         // write, so even a request dropped mid-write still kills and reaps the child.
         let (served_tx, served_rx) = oneshot::channel();
-        tokio::spawn(reap_upload_pack(
+        drop(self.spawn_tracked(reap_upload_pack(
             child,
             served_rx,
             permit,
             repo.name.clone(),
-        ));
+            Some(RequestLease {
+                guard,
+                permit: setup_permit,
+            }),
+        )));
 
         stdin
             .write_all(&body)
@@ -362,6 +826,7 @@ impl GitCache {
         // sync. The client then negotiates whatever ref it wants via upload-pack, so
         // the mirror can serve any branch/tag/sha the origin has - never HEAD-only.
         let started = Instant::now();
+        let observed = self.stale_enabled().then(unix_millis).transpose()?;
         let mut cmd = self.fetch_cmd(cred);
         cmd.arg("clone")
             .arg("--mirror")
@@ -377,6 +842,9 @@ impl GitCache {
             return Err(error);
         }
         let elapsed = started.elapsed().as_secs_f64();
+        if let Some(observed) = observed {
+            write_freshness(repo, &tmp, observed).await?;
+        }
         tokio::fs::rename(&tmp, &repo.cache_dir)
             .await
             .context("rename mirror into place")?;
@@ -390,17 +858,27 @@ impl GitCache {
 
     async fn fetch(&self, repo: &RepoRef, cred: Option<&str>) -> Result<()> {
         tracing::debug!(repo = %repo.name, "fetching updates from upstream");
-        // Run inside the bare mirror and fetch `origin`: `clone --mirror` above sets
-        // up exactly one remote named `origin` (git's default remote name) pointing at
-        // the upstream URL, with a mirror refspec that updates all refs. So `origin`
-        // is not an assumption about the client - it is the remote this proxy created.
+        // Stale records bind the configured upstream, which may differ from a
+        // reused mirror's origin. Strict mode keeps its existing origin behavior.
         let started = Instant::now();
+        let observed = self.stale_enabled().then(unix_millis).transpose()?;
+        let directory = if self.stale_enabled() {
+            Some(directory_identity(&repo.cache_dir).await?)
+        } else {
+            None
+        };
         let mut cmd = self.fetch_cmd(cred);
-        cmd.current_dir(&repo.cache_dir)
-            .arg("fetch")
-            .arg("--prune")
+        cmd.current_dir(&repo.cache_dir).arg("fetch");
+        if !self.max_stale.is_zero() {
+            cmd.arg("--atomic");
+        }
+        cmd.arg("--prune")
             .arg("--quiet")
-            .arg("origin")
+            .arg(if self.stale_enabled() {
+                &repo.upstream_url
+            } else {
+                "origin"
+            })
             // Mirror refspec, minus the local-only pin namespace: `--prune` would
             // otherwise drop those refs as "not on origin" (see `prune_wants`).
             .arg("+refs/*:refs/*")
@@ -409,6 +887,13 @@ impl GitCache {
             self.metrics
                 .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
             return Err(error);
+        }
+        if let Some(observed) = observed {
+            anyhow::ensure!(
+                Some(directory_identity(&repo.cache_dir).await?) == directory,
+                "mirror replaced during refresh"
+            );
+            write_freshness(repo, &repo.cache_dir, observed).await?;
         }
         self.metrics
             .record_upstream(UpstreamOp::Fetch, Status::Ok, &repo.name);
@@ -463,7 +948,11 @@ impl GitCache {
             .arg("fetch")
             .arg("--no-tags")
             .arg("--quiet")
-            .arg("origin");
+            .arg(if self.stale_enabled() {
+                &repo.upstream_url
+            } else {
+                "origin"
+            });
         for oid in &missing {
             // Pin under a reserved ref (force: the ref name is the SHA and may
             // already exist), making the object a `want` tip safe from `git gc`.
@@ -611,6 +1100,11 @@ impl GitCache {
         let mut c = Command::new(&self.cfg.git_binary);
         c.env("GIT_TERMINAL_PROMPT", "0"); // fail instead of hanging on a prompt
         c.env("LC_ALL", "C"); // Retry classification relies on Git's English diagnostics.
+        if !self.max_stale.is_zero() {
+            // Keep objects advertised before a refresh available to clients.
+            c.arg("-c").arg("gc.auto=0");
+            c.arg("-c").arg("maintenance.auto=false");
+        }
         for (k, v) in git_config_env(
             &self.cfg.big_file_threshold,
             cred.or(self.cfg.upstream_auth_header.as_deref()),
@@ -635,6 +1129,10 @@ impl GitCache {
     fn local_cmd(&self, git_protocol: Option<&str>) -> Command {
         let mut c = Command::new(&self.cfg.git_binary);
         c.arg("-c").arg("uploadpack.allowFilter=true");
+        if !self.max_stale.is_zero() {
+            // A client may request an object whose advertised ref was removed.
+            c.arg("-c").arg("uploadpack.allowAnySHA1InWant=true");
+        }
         // Hide the pin namespace from the advertisement so it never leaks into a
         // client's ref list; a hidden ref is still honored as a `want` tip.
         c.arg("-c")
@@ -654,6 +1152,88 @@ impl GitCache {
 
 // The caller holds the repository lock throughout retries. Never retry local
 // upload-pack: once its response starts streaming it cannot be replayed safely.
+fn unix_millis() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("clock predates Unix epoch")?
+        .as_millis()
+        .try_into()?)
+}
+
+fn repository_identity(repo: &RepoRef) -> String {
+    let upstream = match reqwest::Url::parse(&repo.upstream_url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => repo.upstream_url.clone(),
+    };
+    Sha256::digest(format!("{}\n{upstream}", repo.name))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn directory_identity(path: &Path) -> Result<String> {
+    let metadata = tokio::fs::metadata(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!("{:?}", metadata.created()?))
+    }
+}
+
+async fn write_freshness(repo: &RepoRef, directory: &Path, observed: u64) -> Result<()> {
+    let record = serde_json::json!({
+        "version": 1,
+        "directory": directory_identity(directory).await?,
+        "repository": repository_identity(repo),
+        "observed_ms": observed,
+    });
+    let temporary = directory.join("proxy-refresh.tmp");
+    let mut file = tokio::fs::File::create(&temporary).await?;
+    file.write_all(record.to_string().as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(temporary, directory.join(FRESHNESS_FILE)).await?;
+    #[cfg(unix)]
+    tokio::fs::File::open(directory).await?.sync_all().await?;
+    Ok(())
+}
+
+async fn read_freshness(repo: &RepoRef) -> Result<(String, Duration)> {
+    let file = tokio::fs::File::open(repo.cache_dir.join(FRESHNESS_FILE)).await?;
+    let mut text = String::new();
+    file.take(MAX_FRESHNESS_BYTES + 1)
+        .read_to_string(&mut text)
+        .await?;
+    anyhow::ensure!(
+        text.len() <= MAX_FRESHNESS_BYTES as usize,
+        "oversized freshness record"
+    );
+    let record: serde_json::Value = serde_json::from_str(&text)?;
+    anyhow::ensure!(
+        record["version"] == 1
+            && record["directory"] == directory_identity(&repo.cache_dir).await?
+            && record["repository"] == repository_identity(repo),
+        "freshness identity mismatch"
+    );
+    let observed = record["observed_ms"]
+        .as_u64()
+        .context("invalid freshness time")?;
+    let age = unix_millis()?
+        .checked_sub(observed)
+        .context("future freshness time")?;
+    Ok((text, Duration::from_millis(age)))
+}
+
 async fn run_upstream(
     cmd: &mut Command,
     operation: &str,
@@ -839,6 +1419,7 @@ async fn reap_upload_pack(
     served: oneshot::Receiver<()>,
     _permit: Option<OwnedSemaphorePermit>,
     repo: String,
+    _lease: Option<RequestLease>,
 ) {
     let status = tokio::select! {
         biased;
@@ -1015,6 +1596,648 @@ fn parse_wants(body: &[u8]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_setup_retains_permit_in_lease() {
+        for stale in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mirror = dir.path().join("mirror.git");
+            std::fs::create_dir(&mirror).unwrap();
+            std::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            let cache = GitCache::new(
+                GitConfig {
+                    git_binary: "git".into(),
+                    upstream_auth_header: None,
+                    big_file_threshold: "8m".into(),
+                    fetch_ttl: Duration::from_secs(60),
+                    max_wants: 100,
+                    max_upload_packs: 0,
+                    pack_threads: None,
+                    pack_window_memory: None,
+                },
+                Arc::new(Metrics::new()),
+                None,
+            )
+            .with_stale(Duration::from_secs(if stale { 60 } else { 0 }), 1)
+            .with_request_limit(1);
+            let repo = RepoRef {
+                name: "repo.git".into(),
+                upstream_url: String::new(),
+                cache_dir: mirror,
+            };
+            let slot = cache.slot(&repo.name).await;
+            *slot.fetch_lock.lock().await = Some(Instant::now());
+            if stale {
+                write_freshness(&repo, &repo.cache_dir, unix_millis().unwrap())
+                    .await
+                    .unwrap();
+            }
+            slot.refresh.lock().await.last_success = Some(Instant::now());
+            let (_, lease) = cache.prepare(repo, true, Bytes::new(), None).await.unwrap();
+            assert_eq!(
+                cache.request_setups.as_ref().unwrap().available_permits(),
+                0
+            );
+            drop(lease);
+            assert_eq!(
+                cache.request_setups.as_ref().unwrap().available_permits(),
+                1
+            );
+            cache.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_setup_waits_for_a_permit_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: "false".into(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(10),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .with_request_limit(1);
+        let permit = cache
+            .request_setups
+            .as_ref()
+            .unwrap()
+            .acquire()
+            .await
+            .unwrap();
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().join("mirror.git"),
+        };
+        let setup = cache.prepare(repo, true, Bytes::new(), None);
+        tokio::pin!(setup);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut setup)
+                .await
+                .is_err()
+        );
+        assert!(cache.tasks.lock().unwrap().is_empty());
+        drop(permit);
+        assert!(setup.await.is_err());
+        cache.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_advertisement_holds_mirror_until_child_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = dir.path().join("mirror.git");
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let marker = dir.path().join("started");
+        let gate = dir.path().join("gate");
+        for fifo in [&marker, &gate] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let wrapper = dir.path().join("git-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\necho started > '{}'\nread gate < '{}'\n",
+                marker.display(),
+                gate.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: wrapper.to_string_lossy().into_owned(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(10),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .with_request_limit(1);
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: mirror.clone(),
+        };
+        let started = tokio::spawn(async move { tokio::fs::read_to_string(marker).await.unwrap() });
+        let request = tokio::spawn({
+            let cache = cache.clone();
+            let repo = repo.clone();
+            async move { cache.advertise_refs(&repo, None).await }
+        });
+        assert_eq!(started.await.unwrap().trim(), "started");
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            0
+        );
+        let eviction = cache.evict(&repo.name, &mirror);
+        tokio::pin!(eviction);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut eviction)
+                .await
+                .is_err()
+        );
+        assert!(mirror.exists());
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(gate)
+            .await
+            .unwrap();
+        writer.write_all(b"go\n").await.unwrap();
+        drop(writer);
+        eviction.await.unwrap();
+        cache.shutdown().await;
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            1
+        );
+        assert!(!mirror.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn failed_refresh_cools_down_and_expired_mirror_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = dir.path().join("mirror.git");
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let log = dir.path().join("attempts");
+        let wrapper = dir.path().join("git-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\necho fetch >> '{}'\nexit 1\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: wrapper.to_string_lossy().into_owned(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(10),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .with_stale(Duration::from_secs(12), 1);
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: mirror,
+        };
+        write_freshness(&repo, &repo.cache_dir, unix_millis().unwrap())
+            .await
+            .unwrap();
+        cache
+            .restore_freshness(&repo, cache.slot(&repo.name).await.as_ref())
+            .await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
+            CacheOutcome::Cached
+        ));
+        cache.shutdown().await;
+        for _ in 0..3 {
+            assert!(matches!(
+                cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
+                CacheOutcome::Cached
+            ));
+        }
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(cache.ensure_fresh(&repo, true, &[], None).await.is_err());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+        tokio::time::advance(Duration::from_secs(7)).await;
+        assert!(cache.ensure_fresh(&repo, true, &[], None).await.is_err());
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        tokio::fs::remove_file(repo.cache_dir.join(FRESHNESS_FILE))
+            .await
+            .unwrap();
+        let restarted = GitCache::new(cache.cfg.clone(), Arc::new(Metrics::new()), None)
+            .with_stale(Duration::from_secs(12), 1);
+        assert!(
+            restarted
+                .ensure_fresh(&repo, false, &[], None)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn stale_reads_share_a_background_fetch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet", "-b", "main"])
+                .arg(&work)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&work)
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "initial"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = std::process::Command::new("git")
+            .current_dir(&work)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["clone", "--quiet", "--mirror"])
+                .arg(&work)
+                .arg(&origin)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let marker = dir.path().join("started");
+        let gate = dir.path().join("gate");
+        for fifo in [&marker, &gate] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let wrapper = dir.path().join("git-wrapper");
+        let script = format!(
+            "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = fetch ]; then\n    echo started > '{}'\n    read gate < '{}'\n    break\n  fi\ndone\nexec git \"$@\"\n",
+            marker.display(),
+            gate.display()
+        );
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: wrapper.to_string_lossy().into_owned(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(10),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .with_stale(Duration::from_secs(100), 1);
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: origin.to_string_lossy().into_owned(),
+            cache_dir: dir.path().join("mirror.git"),
+        };
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
+            CacheOutcome::Cloned
+        ));
+        let other = RepoRef {
+            name: "other.git".into(),
+            upstream_url: origin.to_string_lossy().into_owned(),
+            cache_dir: dir.path().join("other.git"),
+        };
+        assert!(matches!(
+            cache.ensure_fresh(&other, true, &[], None).await.unwrap(),
+            CacheOutcome::Cloned
+        ));
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let started = tokio::spawn({
+            let marker = marker.clone();
+            async move { tokio::fs::read_to_string(marker).await.unwrap() }
+        });
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let trigger = tokio::spawn({
+            let cache = cache.clone();
+            let repo = repo.clone();
+            async move {
+                let (outcome, _guard) =
+                    cache.prepare(repo, true, Bytes::new(), None).await.unwrap();
+                assert!(matches!(outcome, CacheOutcome::Cached));
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        ready_rx.await.unwrap();
+        assert_eq!(started.await.unwrap().trim(), "started");
+        trigger.abort();
+        let _ = trigger.await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(matches!(
+            cache.ensure_fresh(&other, true, &[], None).await.unwrap(),
+            CacheOutcome::Cached
+        ));
+        assert!(!cache.slot(&other.name).await.refresh.lock().await.in_flight);
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
+            CacheOutcome::Cached
+        ));
+        assert!(!cache.advertise_refs(&repo, None).await.unwrap().is_empty());
+        let mut request = pkt_line(&format!("want {}\n", head.trim()));
+        request.extend_from_slice(b"0000");
+        request.extend(pkt_line("done\n"));
+        let request = Bytes::from(request);
+        let (_, guard) = cache
+            .prepare(repo.clone(), false, request.clone(), None)
+            .await
+            .unwrap();
+        let stream = cache
+            .upload_pack_rpc_guarded(&repo, None, request, guard)
+            .await
+            .unwrap();
+        let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
+            .await
+            .unwrap();
+        assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
+        let tree = std::process::Command::new("git")
+            .current_dir(&work)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let replacement = std::process::Command::new("git")
+            .current_dir(&work)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit-tree",
+                tree.trim(),
+                "-m",
+                "replacement",
+            ])
+            .output()
+            .unwrap();
+        assert!(replacement.status.success());
+        let replacement = String::from_utf8(replacement.stdout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&work)
+                .args([
+                    "push",
+                    "--quiet",
+                    "--force",
+                    origin.to_str().unwrap(),
+                    &format!("{}:refs/heads/main", replacement.trim())
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::advance(Duration::from_secs(70)).await;
+        let expired = cache.prepare(repo.clone(), true, Bytes::new(), None).await;
+        assert!(expired.err().unwrap().is::<CacheBusy>());
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&gate)
+            .await
+            .unwrap();
+        writer.write_all(b"go\n").await.unwrap();
+        drop(writer);
+        cache.shutdown().await;
+        let (outcome, guard) = cache
+            .prepare(repo.clone(), true, Bytes::new(), None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CacheOutcome::Cached));
+        drop(guard);
+        assert!(!cache.slot(&repo.name).await.refresh.lock().await.in_flight);
+        let current = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repo.cache_dir)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(current.stdout).unwrap().trim(),
+            replacement.trim()
+        );
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
+            CacheOutcome::Cached
+        ));
+        assert!(!cache.slot(&repo.name).await.refresh.lock().await.in_flight);
+        let mut request = pkt_line(&format!("want {}\n", head.trim()));
+        request.extend_from_slice(b"0000");
+        request.extend(pkt_line("done\n"));
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::from(request))
+            .await
+            .unwrap();
+        let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
+            .await
+            .unwrap();
+        assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
+        assert!(
+            std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&origin)
+                .args(["update-ref", "-d", "refs/heads/main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let started = tokio::spawn(async move { tokio::fs::read_to_string(marker).await.unwrap() });
+        let fetch = tokio::spawn({
+            let cache = cache.clone();
+            let repo = repo.clone();
+            async move { cache.fetch(&repo, None).await.unwrap() }
+        });
+        assert_eq!(started.await.unwrap().trim(), "started");
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&gate)
+            .await
+            .unwrap();
+        writer.write_all(b"go\n").await.unwrap();
+        drop(writer);
+        fetch.await.unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&repo.cache_dir)
+                .args(["cat-file", "-e", head.trim()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut request = pkt_line(&format!("want {}\n", head.trim()));
+        request.extend_from_slice(b"0000");
+        request.extend(pkt_line("done\n"));
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::from(request))
+            .await
+            .unwrap();
+        let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
+            .await
+            .unwrap();
+        assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
+        let missing = "f".repeat(40);
+        let mut request = pkt_line(&format!("want {missing}\n"));
+        request.extend_from_slice(b"0000");
+        request.extend(pkt_line("done\n"));
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::from(request))
+            .await
+            .unwrap();
+        let rejected = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!rejected.windows(4).any(|bytes| bytes == b"PACK"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_waits_for_active_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = dir.path().join("repo.git");
+        tokio::fs::create_dir(&mirror).await.unwrap();
+        tokio::fs::write(mirror.join("HEAD"), "ref: refs/heads/main\n")
+            .await
+            .unwrap();
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: "git".into(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(60),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        );
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: mirror.clone(),
+        };
+        let guard = cache.read_guard(&repo).await;
+        let eviction = cache.evict(&repo.name, &mirror);
+        tokio::pin!(eviction);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut eviction)
+                .await
+                .is_err()
+        );
+        assert!(mirror.join("HEAD").exists());
+        drop(guard);
+        eviction.await.unwrap();
+        assert!(!mirror.exists());
+    }
+
+    #[tokio::test]
+    async fn upstream_commands_disable_automatic_maintenance() {
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: "git".into(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(60),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        );
+        let args: Vec<_> = cache
+            .local_cmd(None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_owned())
+            .collect();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "uploadpack.allowAnySHA1InWant=true")
+        );
+        let args: Vec<_> = cache
+            .fetch_cmd(None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_owned())
+            .collect();
+        assert!(!args.iter().any(|arg| arg == "gc.auto=0"));
+        let cache = cache.with_stale(Duration::from_secs(60), 1);
+        let args: Vec<_> = cache
+            .local_cmd(None)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .any(|arg| arg == "uploadpack.allowAnySHA1InWant=true")
+        );
+        for (key, expected) in [("gc.auto", "0"), ("maintenance.auto", "false")] {
+            let output = cache
+                .fetch_cmd(None)
+                .args(["config", "--get", key])
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+        }
+    }
 
     #[tokio::test]
     async fn missing_oids_drains_more_than_a_pipe_buffer() {
@@ -1283,7 +2506,7 @@ mod tests {
         drop(tx);
         tokio::time::timeout(
             Duration::from_secs(10),
-            reap_upload_pack(child, rx, None, "repo.git".into()),
+            reap_upload_pack(child, rx, None, "repo.git".into(), None),
         )
         .await
         .expect("reaper should kill the leader and return");
@@ -1304,7 +2527,7 @@ mod tests {
         tx.send(()).unwrap();
         let reaped = tokio::time::timeout(
             Duration::from_millis(200),
-            reap_upload_pack(child, rx, None, "repo.git".into()),
+            reap_upload_pack(child, rx, None, "repo.git".into(), None),
         )
         .await;
         assert!(reaped.is_err(), "EOF must not kill upload-pack");
@@ -1316,6 +2539,698 @@ mod tests {
         let mut child = Command::new("true").spawn().unwrap();
         child.wait().await.unwrap();
         assert!(kill_group(&child).is_err());
+    }
+
+    #[tokio::test]
+    async fn freshness_survives_restart_and_rejects_invalid_or_replaced_mirrors() {
+        let (dir, repo, cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        let marker = repo.cache_dir.join(FRESHNESS_FILE);
+        let original = tokio::fs::read_to_string(&marker).await.unwrap();
+        let mut offline = cache.cfg.clone();
+        offline.git_binary = "false".into();
+        let restarted = || {
+            GitCache::new(offline.clone(), Arc::new(Metrics::new()), None)
+                .with_stale(Duration::from_secs(60), 1)
+        };
+        assert!(matches!(
+            restarted()
+                .ensure_fresh(&repo, true, &[], None)
+                .await
+                .unwrap(),
+            CacheOutcome::Cached
+        ));
+        let mut other = repo.clone();
+        other.upstream_url.push_str("-different");
+        assert!(
+            restarted()
+                .ensure_fresh(&other, true, &[], None)
+                .await
+                .is_err()
+        );
+        other = repo.clone();
+        other.name.push_str("-different");
+        assert!(
+            restarted()
+                .ensure_fresh(&other, true, &[], None)
+                .await
+                .is_err()
+        );
+        for (key, value) in [
+            ("version", serde_json::json!(2)),
+            ("directory", serde_json::json!("replacement")),
+            ("repository", serde_json::json!("other")),
+            (
+                "observed_ms",
+                serde_json::json!(unix_millis().unwrap() + 60_000),
+            ),
+            ("observed_ms", serde_json::json!("invalid")),
+            (
+                "observed_ms",
+                serde_json::json!(unix_millis().unwrap() - 61_000),
+            ),
+        ] {
+            let mut record: serde_json::Value = serde_json::from_str(&original).unwrap();
+            record[key] = value;
+            tokio::fs::write(&marker, record.to_string()).await.unwrap();
+            assert!(
+                restarted()
+                    .ensure_fresh(&repo, false, &[], None)
+                    .await
+                    .is_err(),
+                "{key}"
+            );
+        }
+        for invalid in ["{".to_owned(), "x".repeat(MAX_FRESHNESS_BYTES as usize + 1)] {
+            tokio::fs::write(&marker, invalid).await.unwrap();
+            assert!(
+                restarted()
+                    .ensure_fresh(&repo, true, &[], None)
+                    .await
+                    .is_err()
+            );
+        }
+        tokio::fs::remove_file(&marker).await.unwrap();
+        tokio::fs::write(repo.cache_dir.join("unrelated"), "changed directory mtime")
+            .await
+            .unwrap();
+        assert!(
+            restarted()
+                .ensure_fresh(&repo, true, &[], None)
+                .await
+                .is_err()
+        );
+        tokio::fs::rename(&repo.cache_dir, dir.path().join("old.git"))
+            .await
+            .unwrap();
+        fixture_git(
+            dir.path(),
+            &[
+                "clone",
+                "--mirror",
+                &repo.upstream_url,
+                repo.cache_dir.to_str().unwrap(),
+            ],
+        );
+        tokio::fs::write(&marker, original).await.unwrap();
+        assert!(
+            restarted()
+                .ensure_fresh(&repo, true, &[], None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_refs_renew_freshness_but_sha_and_failed_metadata_do_not() {
+        let (dir, repo, cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        let marker = repo.cache_dir.join(FRESHNESS_FILE);
+        let original = tokio::fs::read_to_string(&marker).await.unwrap();
+        let origin = Path::new(&repo.upstream_url);
+        let tree = fixture_git(origin, &["rev-parse", "HEAD^{tree}"]);
+        let oid = fixture_git(
+            origin,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                "HEAD",
+                "-m",
+                "unadvertised",
+            ],
+        );
+        let body = pkt_line(&format!("want {}\n", oid.trim()));
+        cache.ensure_wanted_oids(&repo, &body, None).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&marker).await.unwrap(), original);
+        assert_eq!(
+            fixture_git(
+                &repo.cache_dir,
+                &["rev-parse", &format!("{PROXY_WANTS_NS}/{}", oid.trim())]
+            )
+            .trim(),
+            oid.trim()
+        );
+        fixture_git(origin, &["update-ref", "refs/heads/second", oid.trim()]);
+        fixture_git(origin, &["update-ref", "refs/tags/new", oid.trim()]);
+        fixture_git(origin, &["update-ref", "-d", "refs/heads/main"]);
+        tokio::fs::create_dir(repo.cache_dir.join("proxy-refresh.tmp"))
+            .await
+            .unwrap();
+        assert!(cache.fetch(&repo, None).await.is_err());
+        assert_eq!(tokio::fs::read_to_string(&marker).await.unwrap(), original);
+        tokio::fs::remove_dir(repo.cache_dir.join("proxy-refresh.tmp"))
+            .await
+            .unwrap();
+        cache.fetch(&repo, None).await.unwrap();
+        assert_eq!(
+            fixture_git(&repo.cache_dir, &["rev-parse", "refs/heads/second"]).trim(),
+            oid.trim()
+        );
+        assert_eq!(
+            fixture_git(&repo.cache_dir, &["rev-parse", "refs/tags/new"]).trim(),
+            oid.trim()
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .current_dir(&repo.cache_dir)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let record = read_freshness(&repo).await.unwrap();
+        assert!(record.1 < Duration::from_secs(60));
+        let _ = dir;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn slow_successful_cold_clone_cannot_exceed_stale_bound() {
+        tokio::time::resume();
+        let (dir, repo, mut cache) = freshness_fixture();
+        let ready = dir.path().join("ready");
+        let gate = dir.path().join("gate");
+        for path in [&ready, &gate] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        cache.cfg.git_binary = fixture_script(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\ngit \"$@\" || exit $?\necho ready > '{}'\nread gate < '{}'\n",
+                ready.display(),
+                gate.display()
+            ),
+        );
+        let owner = tokio::spawn({
+            let cache = cache.clone();
+            let repo = repo.clone();
+            async move { cache.ensure_fresh(&repo, true, &[], None).await }
+        });
+        tokio::fs::read_to_string(ready).await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(gate)
+            .await
+            .unwrap();
+        writer.write_all(b"go\n").await.unwrap();
+        drop(writer);
+        assert!(
+            owner
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("maximum stale age")
+        );
+        assert!(repo.cache_dir.join(FRESHNESS_FILE).exists());
+        cache.shutdown().await;
+    }
+
+    #[test]
+    fn repository_identity_redacts_transport_secrets() {
+        let mut repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: "https://user:secret@example.invalid/repo.git?token=secret#fragment"
+                .into(),
+            cache_dir: "/unused".into(),
+        };
+        let identity = repository_identity(&repo);
+        repo.upstream_url = "https://example.invalid/repo.git".into();
+        assert_eq!(identity, repository_identity(&repo));
+        assert!(!identity.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn refresh_uses_configured_upstream_after_identity_changes() {
+        let (dir, mut repo, cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        let origin = dir.path().join("new-origin.git");
+        fixture_git(
+            dir.path(),
+            &[
+                "clone",
+                "--mirror",
+                &repo.upstream_url,
+                origin.to_str().unwrap(),
+            ],
+        );
+        let tree = fixture_git(&origin, &["rev-parse", "HEAD^{tree}"]);
+        let head = fixture_git(
+            &origin,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                "HEAD",
+                "-m",
+                "new upstream",
+            ],
+        );
+        fixture_git(&origin, &["update-ref", "refs/heads/main", head.trim()]);
+        repo.upstream_url = origin.to_string_lossy().into_owned();
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, &[], None).await.unwrap(),
+            CacheOutcome::Fetched
+        ));
+        assert_eq!(
+            fixture_git(&repo.cache_dir, &["rev-parse", "HEAD"]).trim(),
+            head.trim()
+        );
+        assert!(read_freshness(&repo).await.is_ok());
+        let next = fixture_git(
+            &origin,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                head.trim(),
+                "-m",
+                "sha upstream",
+            ],
+        );
+        cache
+            .ensure_wanted_oids(&repo, &pkt_line(&format!("want {}\n", next.trim())), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture_git(
+                &repo.cache_dir,
+                &["rev-parse", &format!("{PROXY_WANTS_NS}/{}", next.trim())]
+            )
+            .trim(),
+            next.trim()
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_admission_rejects_unknown_or_changed_identity_after_prepare() {
+        for invalid in ["missing", "directory", "repository"] {
+            let (_dir, repo, cache) = freshness_fixture();
+            let cache = cache.with_request_limit(1);
+            let (_, lease) = cache
+                .prepare(repo.clone(), true, Bytes::new(), None)
+                .await
+                .unwrap();
+            let marker = repo.cache_dir.join(FRESHNESS_FILE);
+            if invalid == "missing" {
+                tokio::fs::remove_file(marker).await.unwrap();
+            } else {
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&tokio::fs::read(&marker).await.unwrap()).unwrap();
+                record[invalid] = serde_json::json!("changed");
+                tokio::fs::write(marker, record.to_string()).await.unwrap();
+            }
+            let result = cache
+                .upload_pack_rpc_guarded(&repo, None, Bytes::new(), lease)
+                .await;
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "mirror exceeds maximum stale age"
+            );
+            assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+            assert_eq!(
+                cache.request_setups.as_ref().unwrap().available_permits(),
+                1
+            );
+            assert!(cache.slot(&repo.name).await.lifecycle.try_write().is_ok());
+            cache.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_upload_rechecks_age_before_spawning_and_releases_leases() {
+        let (_dir, repo, cache) = freshness_fixture();
+        let mut cache = cache.with_request_limit(1);
+        let (_, lease) = cache
+            .prepare(repo.clone(), true, Bytes::new(), None)
+            .await
+            .unwrap();
+        cache.cfg.git_binary = "missing-upload-pack-binary".into();
+        let blocked = cache
+            .upload_packs
+            .as_ref()
+            .unwrap()
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut upload = Box::pin(cache.upload_pack_rpc_guarded(&repo, None, Bytes::new(), lease));
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(upload.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        drop(blocked);
+        assert_eq!(
+            upload.await.err().unwrap().to_string(),
+            "mirror exceeds maximum stale age"
+        );
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            1
+        );
+        assert!(cache.slot(&repo.name).await.lifecycle.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn admitted_pack_can_finish_after_its_refs_expire() {
+        let (_dir, repo, cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        let oid = fixture_git(&repo.cache_dir, &["rev-parse", "HEAD"]);
+        let mut request = pkt_line(&format!("want {}\n", oid.trim()));
+        request.extend_from_slice(b"0000");
+        request.extend(pkt_line("done\n"));
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::from(request))
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        let pack = axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX)
+            .await
+            .unwrap();
+        assert!(pack.windows(4).any(|bytes| bytes == b"PACK"));
+        cache.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_upstream_does_not_take_local_capacity_or_lose_client_credentials() {
+        let (dir, repo, mut cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        let ready = dir.path().join("ready");
+        let gate = dir.path().join("gate");
+        let header = dir.path().join("header");
+        for fifo in [&ready, &gate] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        cache.cfg.git_binary = fixture_script(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nfor arg do\n if [ \"$arg\" = clone ]; then\n  printf '%s' \"$GIT_CONFIG_VALUE_2\" > '{}'\n  echo ready > '{}'\n  read gate < '{}'\n fi\ndone\nexec git \"$@\"\n",
+                header.display(),
+                ready.display(),
+                gate.display()
+            ),
+        );
+        let cache = cache.with_request_limit(1);
+        let mut cold = repo.clone();
+        cold.name = "cold.git".into();
+        cold.cache_dir = dir.path().join("cold.git");
+        let request = tokio::spawn({
+            let cache = cache.clone();
+            let cold = cold.clone();
+            async move {
+                cache
+                    .prepare(
+                        cold,
+                        true,
+                        Bytes::new(),
+                        Some("Authorization: Bearer fixture-client"),
+                    )
+                    .await
+            }
+        });
+        assert_eq!(
+            tokio::fs::read_to_string(ready).await.unwrap().trim(),
+            "ready"
+        );
+        request.abort();
+        assert!(request.await.err().unwrap().is_cancelled());
+        let busy = cache
+            .prepare(cold.clone(), true, Bytes::new(), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(busy.is::<CacheBusy>());
+        let (_, lease) = cache
+            .prepare(repo.clone(), true, Bytes::new(), None)
+            .await
+            .unwrap();
+        assert!(
+            !cache
+                .advertise_refs_guarded(&repo, None, lease)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let metrics = Arc::new(Metrics::new());
+        let cache_root = dir.path().join("cache");
+        let upstream_base = dir.path().join("upstream").to_string_lossy().into_owned();
+        let state = crate::server::AppState {
+            cache: Arc::new(cache.clone()),
+            lfs: Arc::new(crate::lfs::Lfs::new(
+                crate::lfs::LfsConfig {
+                    upstream_base: upstream_base.clone(),
+                    cache_root: cache_root.clone(),
+                    upstream_auth_header: None,
+                },
+                None,
+            )),
+            upstream_base,
+            cache_root,
+            auth: Arc::new(crate::auth::Auth::anonymous()),
+            upstream_credential: crate::config::UpstreamCredential::Static,
+            max_decoded_body: 1024,
+            max_concurrent: 1,
+            metrics,
+        };
+        use tower::ServiceExt;
+        let blocked_body = cache.body_permit().unwrap();
+        let app = crate::server::router(state);
+        let healthy = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/repo.git/info/refs?service=git-upload-pack")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(healthy.status(), axum::http::StatusCode::OK);
+        let overloaded = app
+            .oneshot(
+                axum::http::Request::post("/repo.git/git-upload-pack")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            overloaded.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(blocked_body);
+        assert_eq!(cache.upstream.available_permits(), 0);
+        assert_eq!(
+            tokio::fs::read_to_string(header).await.unwrap(),
+            "Authorization: Bearer fixture-client"
+        );
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(gate)
+            .await
+            .unwrap();
+        writer.write_all(b"go\n").await.unwrap();
+        drop(writer);
+        cache.shutdown().await;
+        assert_eq!(cache.upstream.available_permits(), 1);
+        assert!(cold.cache_dir.join("HEAD").exists());
+        assert!(cache.slot(&cold.name).await.lifecycle.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_mode_does_not_write_freshness_records() {
+        let (_dir, repo, cache) = freshness_fixture();
+        let cache = cache.with_stale(Duration::ZERO, 1);
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        assert!(!repo.cache_dir.join(FRESHNESS_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_refresh_keeps_the_triggering_client_credential() {
+        let (dir, repo, mut cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        cache.cfg.fetch_ttl = Duration::ZERO;
+        cache
+            .slot(&repo.name)
+            .await
+            .refresh
+            .lock()
+            .await
+            .next_attempt = None;
+        let header = dir.path().join("header");
+        cache.cfg.git_binary = fixture_script(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$GIT_CONFIG_VALUE_2\" > '{}'\nexec git \"$@\"\n",
+                header.display()
+            ),
+        );
+        let credential = String::from("Authorization: Bearer background-fixture");
+        assert!(matches!(
+            cache
+                .ensure_fresh(&repo, true, &[], Some(&credential))
+                .await
+                .unwrap(),
+            CacheOutcome::Cached
+        ));
+        drop(credential);
+        cache.shutdown().await;
+        assert_eq!(
+            tokio::fs::read_to_string(header).await.unwrap(),
+            "Authorization: Bearer background-fixture"
+        );
+        let record = tokio::fs::read_to_string(repo.cache_dir.join(FRESHNESS_FILE))
+            .await
+            .unwrap();
+        assert!(!record.contains("background-fixture"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_preparation_preserves_typed_upstream_auth_failure() {
+        let (dir, repo, mut cache) = freshness_fixture();
+        cache.cfg.git_binary = fixture_script(
+            dir.path(),
+            "#!/bin/sh\necho 'fatal: Authentication failed' >&2\nexit 1\n",
+        );
+        let error = cache
+            .prepare(
+                repo,
+                true,
+                Bytes::new(),
+                Some("Authorization: Bearer rejected"),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(is_auth_failure(&error));
+        assert!(!error.is::<CacheBusy>());
+        cache.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_upload_holds_local_capacity_until_cancelled_child_is_reaped() {
+        let (dir, repo, mut cache) = freshness_fixture();
+        cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+        cache.cfg.git_binary = fixture_script(dir.path(), "#!/bin/sh\nexec sleep 300\n");
+        let cache = cache.with_request_limit(1);
+        let (_, lease) = cache
+            .prepare(repo.clone(), false, Bytes::new(), None)
+            .await
+            .unwrap();
+        let stream = cache
+            .upload_pack_rpc_guarded(&repo, None, Bytes::new(), lease)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            0
+        );
+        assert!(cache.slot(&repo.name).await.lifecycle.try_write().is_err());
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), cache.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.request_setups.as_ref().unwrap().available_permits(),
+            1
+        );
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+        assert!(cache.slot(&repo.name).await.lifecycle.try_write().is_ok());
+    }
+
+    fn freshness_fixture() -> (tempfile::TempDir, RepoRef, GitCache) {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir(&upstream).unwrap();
+        let origin = upstream.join("repo.git");
+        fixture_git(
+            dir.path(),
+            &[
+                "init",
+                "--bare",
+                "-q",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+        let tree = fixture_git(&origin, &["hash-object", "-t", "tree", "--stdin", "-w"]);
+        let head = fixture_git(&origin, &["commit-tree", tree.trim(), "-m", "initial"]);
+        fixture_git(&origin, &["update-ref", "refs/heads/main", head.trim()]);
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: origin.to_string_lossy().into_owned(),
+            cache_dir: dir.path().join("cache/repo.git"),
+        };
+        let cache = GitCache::new(
+            GitConfig {
+                git_binary: "git".into(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(60),
+                max_wants: 10,
+                max_upload_packs: 1,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        )
+        .with_stale(Duration::from_secs(60), 1);
+        (dir, repo, cache)
+    }
+
+    fn fixture_git(directory: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(directory)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn fixture_script(directory: &Path, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("git-wrapper");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
     }
 
     /// Collect an iterator of oids into a `HashSet` for order-insensitive assertions

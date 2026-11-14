@@ -81,12 +81,16 @@ config:
   # Skip the upstream fetch on info/refs if the mirror was refreshed within this
   # many seconds; coalesces bursts of clones for one repo. 0 = always fetch.
   fetchTtlSeconds: 10
+  # Serve cached refs for at most this age while refreshing. 0 disables it.
+  maxStaleSeconds: 0
+  # Maximum simultaneous background refreshes, at least 1.
+  maxBackgroundFetches: 4
   # Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle
   # mirrors when exceeded. 0 = unlimited (no eviction). Set this whenever the
   # cache volume is bounded.
   cacheMaxMb: 0
-  # Max concurrent in-flight requests; excess queue. Bounds the upstream
-  # clone/fetch a burst can trigger. 0 = unlimited.
+  # Request capacity: strict mode queues; stale mode isolates local and
+  # upstream work and rejects overload. See the README for zero-limit behavior.
   maxConcurrentRequests: 64
   # Cap on a decoded upload-pack request body, in MiB (bounds memory, defuses a
   # gzip bomb). Caps only the negotiation request, never the streamed packfile.

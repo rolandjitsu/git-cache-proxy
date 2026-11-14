@@ -408,6 +408,15 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
 /// the reserved namespace never accumulates beyond the cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn want_by_sha_pins_are_capped_per_mirror() {
+    check_want_by_sha_pins_are_capped(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_mode_want_by_sha_pins_are_capped_per_mirror() {
+    check_want_by_sha_pins_are_capped(true).await;
+}
+
+async fn check_want_by_sha_pins_are_capped(stale: bool) {
     let work = tempfile::tempdir().unwrap();
     git(work.path(), &["init", "-q", "-b", "main", "."]);
     std::fs::write(work.path().join("README.md"), "base\n").unwrap();
@@ -471,7 +480,10 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
         pack_window_memory: None,
     };
     let state = AppState {
-        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        cache: Arc::new(
+            GitCache::new(cfg, metrics.clone(), None)
+                .with_stale(Duration::from_secs(if stale { 60 } else { 0 }), 1),
+        ),
         lfs: Arc::new(Lfs::new(
             LfsConfig {
                 upstream_base: format!("file://{}", up.path().display()),
@@ -1529,6 +1541,115 @@ async fn upload_pack_runs_with_pack_options() {
         .unwrap_or_else(|| panic!("no upload-pack rpc in {argv}"));
     assert!(rpc.contains("-c pack.threads=2"), "{rpc}");
     assert!(rpc.contains("-c pack.windowMemory=64m"), "{rpc}");
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn clone_completes_while_background_fetch_is_blocked() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = tempfile::tempdir().unwrap();
+    git(work.path(), &["init", "-q", "-b", "main", "."]);
+    std::fs::write(work.path().join("README.md"), "cached content\n").unwrap();
+    git(work.path(), &["add", "."]);
+    git(work.path(), &["commit", "-q", "-m", "initial"]);
+    let up = tempfile::tempdir().unwrap();
+    git(
+        work.path(),
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            ".",
+            up.path().join("repo.git").to_str().unwrap(),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("started");
+    let gate = dir.path().join("gate");
+    for fifo in [&marker, &gate] {
+        assert!(Command::new("mkfifo").arg(fifo).status().unwrap().success());
+    }
+    let wrapper = dir.path().join("git-wrapper");
+    std::fs::write(&wrapper, format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = fetch ]; then\n    echo started > '{}'\n    read gate < '{}'\n    break\n  fi\ndone\nexec git \"$@\"\n", marker.display(), gate.display())).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = dir.path().join("cache");
+    let upstream = format!("file://{}", up.path().display());
+    let metrics = Arc::new(Metrics::new());
+    let cache = Arc::new(
+        GitCache::new(
+            GitConfig {
+                git_binary: wrapper.to_string_lossy().into_owned(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(0),
+                max_wants: 100,
+                max_upload_packs: 0,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            metrics.clone(),
+            None,
+        )
+        .with_stale(Duration::from_secs(60), 1),
+    );
+    let repo = resolve("repo.git", &upstream, &root).unwrap();
+    cache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+    let state = AppState {
+        cache: cache.clone(),
+        lfs: Arc::new(Lfs::new(
+            LfsConfig {
+                upstream_base: upstream.clone(),
+                cache_root: root.clone(),
+                upstream_auth_header: None,
+            },
+            None,
+        )),
+        upstream_base: upstream,
+        cache_root: root,
+        auth: Arc::new(Auth::anonymous()),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 8,
+        metrics,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let started = tokio::spawn(async move { tokio::fs::read_to_string(marker).await.unwrap() });
+    let checkout = dir.path().join("checkout");
+    let clone = tokio::spawn({
+        let checkout = checkout.clone();
+        async move {
+            tokio::process::Command::new("git")
+                .args(["clone", "--quiet", &format!("http://{addr}/repo.git")])
+                .arg(checkout)
+                .output()
+                .await
+                .unwrap()
+        }
+    });
+    assert_eq!(started.await.unwrap().trim(), "started");
+    let output = clone.await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("README.md")).unwrap(),
+        "cached content\n"
+    );
+    let mut writer = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(gate)
+        .await
+        .unwrap();
+    writer.write_all(b"go\n").await.unwrap();
+    drop(writer);
+    cache.shutdown().await;
+    server.abort();
 }
 
 // --- Test helpers ---------------------------------------------------------

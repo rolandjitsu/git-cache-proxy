@@ -79,6 +79,37 @@ Every flag has an environment-variable equivalent; the full reference is in
 - `--serve-token` / `--auth-provider`: how clients authenticate to the proxy.
 - `--cache-max-mb`: cap on-disk cache size (LRU eviction; `0` = unlimited).
 
+With a positive `--max-stale-seconds`, an existing mirror can serve cached refs
+while one background fetch updates it. Age is measured from the start of the last
+successful clone or fetch. When its age exceeds the limit, a request waits for a
+refresh or fails. Successful full-ref refreshes persist their start time in
+`proxy-refresh.json` inside the mirror. Restart restores age only from a valid
+record bound to the repository, upstream and directory identity. Missing, invalid
+or future-dated records require a refresh; directory mtime is not evidence of
+success. This assumes a correct wall clock across downtime and one proxy process
+per cache root. Background attempts are limited globally and retried no sooner
+than the fetch TTL, or one second, after the previous attempt completes.
+
+Stale mode isolates mandatory upstream work from local cache delivery. The
+request limit bounds body decoding, freshness inspection and local serving in
+separate lanes. Mandatory upstream preparation has at most `max(1, N - 1)` slots
+for request limit `N`; with `N = 0`, only that upstream lane remains bounded by
+`--max-background-fetches`. Saturated lanes return 503 instead of queueing.
+The strict default mode keeps its existing queueing behavior. Waiting for an
+upload slot does not extend freshness: identity and age are checked again before
+Git starts. Already started uploads continue if the refs expire while streaming.
+
+Fetch-triggered automatic Git maintenance is disabled in this mode so a refresh
+does not delete objects just advertised to a client. Active requests are protected
+from proxy eviction until their Git process exits. There is no fixed limit between
+advertisement and upload-pack, so eviction or external Git maintenance between
+requests can remove an old object. A missing SHA is fetched on demand when the
+upstream permits it; this is best effort. In this mode a client with access to a
+mirror can request any object already present in that mirror by SHA, including an
+object no longer reachable from an advertised ref.
+
+Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](#metrics)).
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text-format metrics - per-repo request and
@@ -129,8 +160,7 @@ Pin a version and try it against your own setup before relying on it.
 
 Not yet implemented:
 
-- A background/scheduled refresh (today every `info/refs` triggers an on-demand,
-  TTL-coalesced fetch).
+- Scheduled refresh. Background refresh is triggered by requests.
 
 **Non-goal: a git-free image.** The `git` binary is a permanent runtime
 dependency: the proxy serves clients by running `git upload-pack`, and no
