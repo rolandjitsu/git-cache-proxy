@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.11 (2026-11-14)
+
+### Fixes
+
+- fetch from the configured upstream URL
+
 ## 0.2.10 (2026-11-08)
 
 ### Features
