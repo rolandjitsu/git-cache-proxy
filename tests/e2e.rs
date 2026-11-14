@@ -28,6 +28,103 @@ use tower::ServiceExt; // for `oneshot`
 
 mod helpers;
 
+/// A retained mirror must fetch configured B even while origin still points to A.
+#[tokio::test]
+async fn reused_mirror_fetches_configured_upstream_for_refs_and_missing_sha() {
+    let old = tempfile::tempdir().unwrap();
+    git(old.path(), &["init", "-q", "-b", "main", "."]);
+    git(old.path(), &["commit", "-q", "--allow-empty", "-m", "old"]);
+    let old_sha = git(old.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    git(old.path(), &["branch", "old-only"]);
+
+    let new = tempfile::tempdir().unwrap();
+    git(new.path(), &["init", "-q", "-b", "main", "."]);
+    git(new.path(), &["commit", "-q", "--allow-empty", "-m", "new"]);
+    let new_sha = git(new.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    git(new.path(), &["tag", "new-tag"]);
+    git(new.path(), &["checkout", "-q", "-b", "hidden"]);
+    git(
+        new.path(),
+        &["commit", "-q", "--allow-empty", "-m", "hidden"],
+    );
+    let hidden_sha = git(new.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        new.path(),
+        &["config", "uploadpack.hideRefs", "refs/heads/hidden"],
+    );
+    git(
+        new.path(),
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let gitcache = GitCache::new(
+        GitConfig {
+            git_binary: "git".into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::ZERO,
+            max_wants: 100,
+            max_upload_packs: 0,
+            pack_threads: None,
+            pack_window_memory: None,
+        },
+        metrics.clone(),
+        None,
+    );
+    let mut repo = git_cache_proxy::repo::RepoRef {
+        name: "repo.git".into(),
+        upstream_url: format!("file://{}", old.path().display()),
+        cache_dir: cache.path().join("repo.git"),
+    };
+    gitcache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+    let pin = format!("refs/proxy-wants/{old_sha}");
+    git(&repo.cache_dir, &["update-ref", &pin, &old_sha]);
+    let origin = git(&repo.cache_dir, &["config", "remote.origin.url"]);
+    repo.upstream_url = format!("file://{}", new.path().display());
+
+    gitcache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+    assert_eq!(git(&repo.cache_dir, &["rev-parse", "main"]).trim(), new_sha);
+    assert_eq!(
+        git(&repo.cache_dir, &["rev-parse", "new-tag"]).trim(),
+        new_sha
+    );
+    assert_eq!(git(&repo.cache_dir, &["rev-parse", &pin]).trim(), old_sha);
+    let refs = git(&repo.cache_dir, &["for-each-ref", "--format=%(refname)"]);
+    assert!(!refs.contains("refs/heads/old-only"), "{refs}");
+    assert!(!refs.contains("refs/heads/hidden"), "{refs}");
+    let missing = Command::new("git")
+        .current_dir(&repo.cache_dir)
+        .args(["cat-file", "-e", &hidden_sha])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+
+    // Skip full-ref refresh so only the SHA backfill can supply this object.
+    let mut body = pkt(&format!("want {hidden_sha}\n"));
+    body.extend_from_slice(b"0000");
+    gitcache
+        .ensure_fresh(&repo, false, &body, None)
+        .await
+        .unwrap();
+    let hidden_pin = format!("refs/proxy-wants/{hidden_sha}");
+    assert_eq!(
+        git(&repo.cache_dir, &["rev-parse", &hidden_pin]).trim(),
+        hidden_sha
+    );
+    gitcache.ensure_fresh(&repo, true, &[], None).await.unwrap();
+    assert_eq!(
+        git(&repo.cache_dir, &["rev-parse", &hidden_pin]).trim(),
+        hidden_sha
+    );
+    assert_eq!(
+        git(&repo.cache_dir, &["config", "remote.origin.url"]),
+        origin
+    );
+    assert_eq!(want_fetch_ok_count(&metrics.gather()), 1);
+}
+
 /// Regression test for the gzip transport bug: git's smart-HTTP client
 /// compresses the `git-upload-pack` request body and sends `Content-Encoding:
 /// gzip`. The proxy must decode it before handing the bytes to `git

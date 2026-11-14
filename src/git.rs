@@ -390,19 +390,16 @@ impl GitCache {
 
     async fn fetch(&self, repo: &RepoRef, cred: Option<&str>) -> Result<()> {
         tracing::debug!(repo = %repo.name, "fetching updates from upstream");
-        // Run inside the bare mirror and fetch `origin`: `clone --mirror` above sets
-        // up exactly one remote named `origin` (git's default remote name) pointing at
-        // the upstream URL, with a mirror refspec that updates all refs. So `origin`
-        // is not an assumption about the client - it is the remote this proxy created.
+        // A reused mirror can still record an older upstream in origin.
         let started = Instant::now();
         let mut cmd = self.fetch_cmd(cred);
         cmd.current_dir(&repo.cache_dir)
             .arg("fetch")
             .arg("--prune")
             .arg("--quiet")
-            .arg("origin")
+            .arg(&repo.upstream_url)
             // Mirror refspec, minus the local-only pin namespace: `--prune` would
-            // otherwise drop those refs as "not on origin" (see `prune_wants`).
+            // otherwise drop those refs as "not on upstream" (see `prune_wants`).
             .arg("+refs/*:refs/*")
             .arg(format!("^{PROXY_WANTS_NS}/*"));
         if let Err(error) = run_upstream(&mut cmd, "fetch", &repo.name, None).await {
@@ -463,7 +460,7 @@ impl GitCache {
             .arg("fetch")
             .arg("--no-tags")
             .arg("--quiet")
-            .arg("origin");
+            .arg(&repo.upstream_url);
         for oid in &missing {
             // Pin under a reserved ref (force: the ref name is the SHA and may
             // already exist), making the object a `want` tip safe from `git gc`.
