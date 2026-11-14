@@ -1352,6 +1352,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clone_parent_creation_failure_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, b"keep this file").unwrap();
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: parent.join("mirror.git"),
+        };
+        let cache = upload_pack_test_cache("git");
+        let error = cache.clone_mirror(&repo, None).await.unwrap_err();
+        assert_eq!(error.to_string(), "create cache parent for repo.git");
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&parent).unwrap(), b"keep this file");
+        assert!(!repo.cache_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eviction_rename_failure_preserves_mirror_and_releases_lock() {
+        let (_dir, repo, _oids) = wanted_oids_fixture();
+        let head = std::fs::read(repo.cache_dir.join("HEAD")).unwrap();
+        let mut trash = repo.cache_dir.as_os_str().to_owned();
+        trash.push(crate::repo::EVICTING_SUFFIX);
+        let trash = std::path::PathBuf::from(trash);
+        std::fs::write(&trash, b"keep this file").unwrap();
+        let cache = upload_pack_test_cache("git");
+        let error = cache.evict(&repo.name, &repo.cache_dir).await.unwrap_err();
+        assert_eq!(error.to_string(), "rename mirror for eviction: repo.git");
+        assert_eq!(std::fs::read(repo.cache_dir.join("HEAD")).unwrap(), head);
+        assert_eq!(std::fs::read(&trash).unwrap(), b"keep this file");
+        std::fs::remove_file(&trash).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            cache.evict(&repo.name, &repo.cache_dir),
+        )
+        .await
+        .expect("failed eviction must release its repository lock")
+        .unwrap();
+        assert!(!repo.cache_dir.exists());
+        assert!(!trash.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn advertisement_failure_preserves_repository_and_git_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = write_failing_git(
+            dir.path(),
+            "printf 'advertisement refused\\n' >&2\nexit 7\n",
+        );
+        let cache = upload_pack_test_cache(binary.to_str().unwrap());
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().to_owned(),
+        };
+        for protocol in [None, Some("version=2")] {
+            let error = cache.advertise_refs(&repo, protocol).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("advertise-refs failed for repo.git")
+            );
+            assert!(error.to_string().contains("advertisement refused"));
+        }
+        assert!(!cache.metrics.gather().contains("kind=\"info_refs\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_wants_command_failures_preserve_all_pins() {
+        let (dir, repo, oids) = wanted_oids_fixture();
+        for oid in &oids {
+            git_test_command(&repo.cache_dir, &["fetch", "-q", "origin", oid]);
+            git_test_command(
+                &repo.cache_dir,
+                &["update-ref", &format!("{PROXY_WANTS_NS}/{oid}"), oid],
+            );
+        }
+        let before = git_test_command(&repo.cache_dir, &["show-ref"]);
+        for (command, diagnostic) in [
+            ("for-each-ref", "git for-each-ref failed"),
+            ("update-ref", "git update-ref --stdin failed"),
+        ] {
+            let binary = write_failing_git(
+                dir.path(),
+                &format!(
+                    "if [ \"$1\" = '{command}' ]; then\n  cat >/dev/null\n  exit 7\nfi\nexec git \"$@\"\n"
+                ),
+            );
+            let mut cache = upload_pack_test_cache(binary.to_str().unwrap());
+            cache.cfg.max_wants = 1;
+            let error = cache.prune_wants(&repo).await.unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert!(error.to_string().contains(&repo.name), "{error}");
+            assert_eq!(git_test_command(&repo.cache_dir, &["show-ref"]), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wanted_fetch_survives_prune_failure_and_reports_the_cap() {
+        use tracing::instrument::WithSubscriber;
+
+        let (dir, repo, oids) = wanted_oids_fixture();
+        let binary = write_failing_git(
+            dir.path(),
+            "if [ \"$1\" = for-each-ref ]; then exit 7; fi\nexec git \"$@\"\n",
+        );
+        let mut cache = upload_pack_test_cache(binary.to_str().unwrap());
+        cache.cfg.max_wants = 1;
+        let mut request = Vec::new();
+        for oid in &oids {
+            request.extend(pkt_line(&format!("want {oid}\n")));
+        }
+        request.extend_from_slice(b"0000");
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        cache
+            .ensure_wanted_oids(&repo, &request, None)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let refs = git_test_command(
+            &repo.cache_dir,
+            &["for-each-ref", "--format=%(objectname)", PROXY_WANTS_NS],
+        );
+        let pinned: Vec<_> = refs.lines().collect();
+        assert_eq!(pinned.len(), 1);
+        assert!(oids.iter().any(|oid| oid == pinned[0]));
+        git_test_command(&repo.cache_dir, &["cat-file", "-e", pinned[0]]);
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(logs.contains("capping want-by-sha fetch"), "{logs}");
+        assert!(logs.contains("requested=2"), "{logs}");
+        assert!(logs.contains("cap=1"), "{logs}");
+        assert!(logs.contains("pruning want-by-sha pins failed"), "{logs}");
+        assert!(logs.contains("git for-each-ref failed"), "{logs}");
+        assert!(cache.metrics.gather().contains(
+            r#"gitcacheproxy_upstream_ops_total{op="want_fetch",repo="repo.git",result="ok"} 1"#
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_wants_retains_cap_and_other_refs_and_reports_deletion() {
+        use tracing::instrument::WithSubscriber;
+
+        let (_dir, repo, oids) = wanted_oids_fixture();
+        for oid in &oids {
+            git_test_command(&repo.cache_dir, &["fetch", "-q", "origin", oid]);
+            git_test_command(
+                &repo.cache_dir,
+                &["update-ref", &format!("{PROXY_WANTS_NS}/{oid}"), oid],
+            );
+        }
+        git_test_command(
+            &repo.cache_dir,
+            &["update-ref", "refs/heads/keep", &oids[0]],
+        );
+        let sorted = git_test_command(
+            &repo.cache_dir,
+            &[
+                "for-each-ref",
+                "--sort=-creatordate",
+                "--format=%(refname)",
+                PROXY_WANTS_NS,
+            ],
+        );
+        assert_eq!(sorted.lines().count(), 2);
+        let mut cache = upload_pack_test_cache("git");
+        cache.cfg.max_wants = 1;
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        cache
+            .prune_wants(&repo)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let refs = git_test_command(
+            &repo.cache_dir,
+            &["for-each-ref", "--format=%(refname)", PROXY_WANTS_NS],
+        );
+        assert_eq!(refs.trim(), sorted.lines().next().unwrap());
+        assert_eq!(
+            git_test_command(&repo.cache_dir, &["rev-parse", "refs/heads/keep"]).trim(),
+            oids[0]
+        );
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(
+            logs.contains("pruned oldest want-by-sha pins over cap"),
+            "{logs}"
+        );
+        assert!(logs.contains("pruned=1"), "{logs}");
+        assert!(logs.contains("repo.git"), "{logs}");
+    }
+
+    #[tokio::test]
     async fn upload_pack_large_v0_negotiation_drains_both_pipes() {
         let dir = tempfile::tempdir().unwrap();
         for args in [
@@ -2201,6 +2412,56 @@ mod tests {
             cmd.process_group(0);
         }
         cmd.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_failing_git(dir: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = dir.join("git-wrapper");
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary
+    }
+
+    #[cfg(unix)]
+    fn git_test_command(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wanted_oids_fixture() -> (tempfile::TempDir, RepoRef, [String; 2]) {
+        let dir = tempfile::tempdir().unwrap();
+        git_test_command(dir.path(), &["init", "-q", "source"]);
+        let source = dir.path().join("source");
+        let oids = ["first", "second"].map(|message| {
+            git_test_command(&source, &["commit", "-q", "--allow-empty", "-m", message]);
+            git_test_command(&source, &["rev-parse", "HEAD"])
+                .trim()
+                .to_owned()
+        });
+        git_test_command(dir.path(), &["init", "-q", "--bare", "mirror.git"]);
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().join("mirror.git"),
+        };
+        git_test_command(
+            &repo.cache_dir,
+            &["remote", "add", "origin", source.to_str().unwrap()],
+        );
+        (dir, repo, oids)
     }
 
     fn read_progress_channel(
