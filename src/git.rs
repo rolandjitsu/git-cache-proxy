@@ -21,6 +21,7 @@
 //! `PROXY_WANTS_NS` so the mirror can serve them.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -32,7 +33,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 
@@ -49,6 +50,11 @@ const UPSTREAM_RETRY_DELAYS: [Duration; 3] = [
 ];
 const MAX_UPSTREAM_RETRIES: usize = UPSTREAM_RETRY_DELAYS.len();
 const MAX_UPSTREAM_STDERR_BYTES: usize = 64 * 1024;
+
+// Negotiation is bounded independently of pack size. Once input is written,
+// only inactivity is bounded: active downloads have no total duration limit.
+const UPLOAD_PACK_REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// What `ensure_fresh` did - for metrics.
 #[derive(Debug, Clone, Copy)]
@@ -283,7 +289,7 @@ impl GitCache {
 
     /// Stream `git upload-pack --stateless-rpc` - i.e. the
     /// `POST .../git-upload-pack` response (the packfile). The request `body`
-    /// (the client's want/have negotiation) is small and buffered; the response
+    /// (the client's want/have negotiation) is buffered; the response
     /// can be gigabytes, so it is streamed straight from the child's stdout.
     pub async fn upload_pack_rpc(
         &self,
@@ -304,7 +310,8 @@ impl GitCache {
             .arg(&repo.cache_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
         // Own process group, so a kill also reaches `pack-objects`, which writes
         // nothing while it counts and compresses and so never gets SIGPIPE.
         #[cfg(unix)]
@@ -313,28 +320,43 @@ impl GitCache {
         let mut stdin = child.stdin.take().context("upload-pack: no stdin")?;
         let stdout = child.stdout.take().context("upload-pack: no stdout")?;
 
-        // Reap in a detached task: the caller streams stdout, so this method cannot
-        // wait for exit without buffering the whole pack. Spawned before the stdin
-        // write, so even a request dropped mid-write still kills and reaps the child.
-        let (served_tx, served_rx) = oneshot::channel();
-        tokio::spawn(reap_upload_pack(
-            child,
-            served_rx,
-            permit,
-            repo.name.clone(),
-        ));
-
-        stdin
-            .write_all(&body)
-            .await
-            .context("write upload-pack request")?;
-        drop(stdin); // EOF so upload-pack starts producing the pack
-
+        let (read_progress_tx, read_progress_rx) = watch::channel(ReadProgress {
+            last_read_at: started,
+            eof: false,
+        });
+        tracing::debug!(repo = %repo.name, pid = child.id(), request_bytes = body.len(), "start upload-pack");
+        let writer = async move { write_upload_pack_request(&mut stdin, &body).await };
+        // One owner polls the writer and retains the permit until wait.
+        // Stdout goes directly to the response, including during negotiation.
+        let name = repo.name.clone();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = run_upload_pack(
+                child,
+                writer,
+                read_progress_rx,
+                UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+            )
+            .await;
+            if let Err(error) = &result {
+                if error.kind() == std::io::ErrorKind::ConnectionAborted {
+                    tracing::debug!(repo = %name, %error, "upload-pack lifecycle ended");
+                } else {
+                    tracing::warn!(repo = %name, %error, "upload-pack lifecycle failed");
+                }
+            }
+            let _ = completion_tx.send(result);
+        });
         let timed = TimedReader {
             inner: stdout,
             repo: repo.name.clone(),
             recorder: Some((self.metrics.clone(), started)),
-            served: Some(served_tx),
+            lifecycle: Some(ResponseLifecycle {
+                read_progress_tx,
+                completion_rx,
+            }),
+            eof: false,
         };
         Ok(ReaderStream::new(timed))
     }
@@ -831,37 +853,146 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Client gone before EOF (`served` closed unsent): kill the process group, so
-/// `pack-objects` stops packing for nobody.
-/// Holds `_permit` until the child is reaped, so the cap covers the whole pack.
-async fn reap_upload_pack(
+async fn write_upload_pack_request(
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
+    body: &[u8],
+) -> std::io::Result<()> {
+    tokio::time::timeout(UPLOAD_PACK_REQUEST_WRITE_TIMEOUT, stdin.write_all(body))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upload-pack request write timed out",
+            )
+        })?
+}
+
+#[derive(Clone, Copy)]
+struct ReadProgress {
+    last_read_at: Instant,
+    eof: bool,
+}
+
+/// Own the writer future and child until cancellation or complete delivery.
+async fn run_upload_pack(
     mut child: Child,
-    served: oneshot::Receiver<()>,
-    _permit: Option<OwnedSemaphorePermit>,
-    repo: String,
-) {
-    let status = tokio::select! {
-        biased;
-        status = child.wait() => status,
-        result = served => {
-            if result.is_err() {
-                tracing::debug!(repo = %repo, "client gone before end of pack; killing upload-pack");
-                if let Err(e) = kill_group(&child) {
-                    // Still stop the leader, so the wait below cannot hang.
-                    tracing::warn!(repo = %repo, "kill upload-pack process group failed: {e}");
-                    let _ = child.start_kill();
-                }
-                let _ = child.wait().await;
-                return;
+    writer: impl Future<Output = std::io::Result<()>>,
+    mut read_progress_rx: watch::Receiver<ReadProgress>,
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::pin!(writer);
+    let mut request_written = false;
+    let result = async {
+        let exit = wait_upload_pack(&mut child);
+        tokio::pin!(exit);
+        let mut exited = false;
+        loop {
+            let read_progress = *read_progress_rx.borrow_and_update();
+            if exited && request_written && read_progress.eof {
+                return Ok(());
             }
-            child.wait().await
+            tokio::select! {
+                biased;
+                status = &mut exit, if !exited && (UPLOAD_PACK_CAN_OBSERVE_EXIT_BEFORE_EOF || (request_written && read_progress.eof)) => {
+                    let status = status?;
+                    if !status.success() {
+                        return Err(std::io::Error::other(format!("git upload-pack exited: {status}")));
+                    }
+                    // A successful leader can exit with valid stdout still in
+                    // the pipe. Drain it before reporting successful delivery.
+                    exited = true;
+                }
+                result = &mut writer, if !request_written => {
+                    result?;
+                    request_written = true;
+                }
+                changed = read_progress_rx.changed() => {
+                    changed.map_err(|_| std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "upload-pack response dropped",
+                    ))?;
+                }
+                _ = tokio::time::sleep_until(read_progress.last_read_at + idle_timeout) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upload-pack response idle timed out",
+                    ));
+                }
+            }
         }
-    };
-    match status {
-        Ok(s) if !s.success() => tracing::warn!(repo = %repo, "git upload-pack exited: {s}"),
-        Err(e) => tracing::warn!(repo = %repo, "git upload-pack wait failed: {e}"),
-        _ => {}
     }
+    .await;
+    // Drop cancels the writer future before the leases are released. There is
+    // no separate writer task that can outlive this owner.
+    if result.is_err() && child.id().is_some() {
+        if let Err(error) = kill_group(&child) {
+            tracing::warn!("kill upload-pack process group failed: {error}");
+            let _ = child.start_kill();
+        }
+        child.wait().await?;
+    }
+    result
+}
+
+// Targets without waitid(NOWAIT) retain EOF-first waiting: reaping early
+// there would lose the process-group identity needed for safe cancellation.
+const UPLOAD_PACK_CAN_OBSERVE_EXIT_BEFORE_EOF: bool = cfg!(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+));
+
+// Subscribe before probing so an exit between waitid and recv is not missed.
+// Keep the leader unreaped until its descendants have been stopped.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+))]
+async fn wait_upload_pack(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let pid = child
+        .id()
+        .and_then(|id| Pid::from_raw(id as i32))
+        .ok_or_else(|| std::io::Error::other("upload-pack already reaped"))?;
+    let mut exits = signal(SignalKind::child())?;
+    loop {
+        if waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )?
+        .is_some()
+        {
+            let _ = kill_group(child);
+            return child.wait().await;
+        }
+        // Option is a legacy Tokio API shape; recv() guarantees Some,
+        // so a None error branch would be unreachable.
+        exits.recv().await;
+    }
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+    ))
+)))]
+async fn wait_upload_pack(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    child.wait().await
 }
 
 /// Call before reaping: an unreaped child still owns its group ID, so the
@@ -892,18 +1023,16 @@ pub struct TimedReader<R> {
     inner: R,
     repo: String,
     recorder: Option<(Arc<Metrics>, Instant)>,
-    /// Sent at EOF. Dropped unsent, it makes `reap_upload_pack` kill the child.
-    served: Option<oneshot::Sender<()>>,
+    lifecycle: Option<ResponseLifecycle>,
+    eof: bool,
+}
+
+struct ResponseLifecycle {
+    read_progress_tx: watch::Sender<ReadProgress>,
+    completion_rx: oneshot::Receiver<std::io::Result<()>>,
 }
 
 impl<R> TimedReader<R> {
-    fn finish(&mut self) {
-        if let Some(tx) = self.served.take() {
-            let _ = tx.send(());
-        }
-        self.record();
-    }
-
     fn record(&mut self) {
         if let Some((metrics, started)) = self.recorder.take() {
             metrics.observe_serve(
@@ -922,15 +1051,61 @@ impl<R: AsyncRead + Unpin> AsyncRead for TimedReader<R> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let before = buf.filled().len();
-        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-        // A ready read that produced no bytes is EOF: the packfile is fully served.
-        if let Poll::Ready(Ok(())) = &poll
-            && buf.filled().len() == before
-        {
-            this.finish();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
         }
-        poll
+        if let Some(lifecycle) = &mut this.lifecycle {
+            match Pin::new(&mut lifecycle.completion_rx).poll(cx) {
+                Poll::Ready(result) => {
+                    let result = result.unwrap_or_else(|_| {
+                        Err(std::io::Error::other("upload-pack lifecycle task failed"))
+                    });
+                    this.lifecycle = None;
+                    if let Err(error) = result {
+                        this.eof = true;
+                        this.record();
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Poll::Pending => {}
+            }
+        }
+        if this.eof {
+            return if this.lifecycle.is_some() {
+                Poll::Pending
+            } else {
+                this.record();
+                Poll::Ready(Ok(()))
+            };
+        }
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                this.eof = buf.filled().len() == before;
+                if let Some(lifecycle) = &this.lifecycle {
+                    lifecycle.read_progress_tx.send_replace(ReadProgress {
+                        last_read_at: Instant::now(),
+                        eof: this.eof,
+                    });
+                }
+                if this.eof {
+                    // EOF is successful only after stdin and child exit succeed.
+                    cx.waker().wake_by_ref();
+                    if this.lifecycle.is_some() {
+                        return Poll::Pending;
+                    }
+                    this.record();
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                this.lifecycle = None;
+                this.eof = true;
+                this.record();
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -1176,6 +1351,358 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn clone_parent_creation_failure_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, b"keep this file").unwrap();
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: parent.join("mirror.git"),
+        };
+        let cache = upload_pack_test_cache("git");
+        let error = cache.clone_mirror(&repo, None).await.unwrap_err();
+        assert_eq!(error.to_string(), "create cache parent for repo.git");
+        assert!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&parent).unwrap(), b"keep this file");
+        assert!(!repo.cache_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eviction_rename_failure_preserves_mirror_and_releases_lock() {
+        let (_dir, repo, _oids) = wanted_oids_fixture();
+        let head = std::fs::read(repo.cache_dir.join("HEAD")).unwrap();
+        let mut trash = repo.cache_dir.as_os_str().to_owned();
+        trash.push(crate::repo::EVICTING_SUFFIX);
+        let trash = std::path::PathBuf::from(trash);
+        std::fs::write(&trash, b"keep this file").unwrap();
+        let cache = upload_pack_test_cache("git");
+        let error = cache.evict(&repo.name, &repo.cache_dir).await.unwrap_err();
+        assert_eq!(error.to_string(), "rename mirror for eviction: repo.git");
+        assert_eq!(std::fs::read(repo.cache_dir.join("HEAD")).unwrap(), head);
+        assert_eq!(std::fs::read(&trash).unwrap(), b"keep this file");
+        std::fs::remove_file(&trash).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            cache.evict(&repo.name, &repo.cache_dir),
+        )
+        .await
+        .expect("failed eviction must release its repository lock")
+        .unwrap();
+        assert!(!repo.cache_dir.exists());
+        assert!(!trash.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn advertisement_failure_preserves_repository_and_git_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = write_failing_git(
+            dir.path(),
+            "printf 'advertisement refused\\n' >&2\nexit 7\n",
+        );
+        let cache = upload_pack_test_cache(binary.to_str().unwrap());
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().to_owned(),
+        };
+        for protocol in [None, Some("version=2")] {
+            let error = cache.advertise_refs(&repo, protocol).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("advertise-refs failed for repo.git")
+            );
+            assert!(error.to_string().contains("advertisement refused"));
+        }
+        assert!(!cache.metrics.gather().contains("kind=\"info_refs\""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_wants_command_failures_preserve_all_pins() {
+        let (dir, repo, oids) = wanted_oids_fixture();
+        for oid in &oids {
+            git_test_command(&repo.cache_dir, &["fetch", "-q", "origin", oid]);
+            git_test_command(
+                &repo.cache_dir,
+                &["update-ref", &format!("{PROXY_WANTS_NS}/{oid}"), oid],
+            );
+        }
+        let before = git_test_command(&repo.cache_dir, &["show-ref"]);
+        for (command, diagnostic) in [
+            ("for-each-ref", "git for-each-ref failed"),
+            ("update-ref", "git update-ref --stdin failed"),
+        ] {
+            let binary = write_failing_git(
+                dir.path(),
+                &format!(
+                    "if [ \"$1\" = '{command}' ]; then\n  cat >/dev/null\n  exit 7\nfi\nexec git \"$@\"\n"
+                ),
+            );
+            let mut cache = upload_pack_test_cache(binary.to_str().unwrap());
+            cache.cfg.max_wants = 1;
+            let error = cache.prune_wants(&repo).await.unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert!(error.to_string().contains(&repo.name), "{error}");
+            assert_eq!(git_test_command(&repo.cache_dir, &["show-ref"]), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wanted_fetch_survives_prune_failure_and_reports_the_cap() {
+        use tracing::instrument::WithSubscriber;
+
+        let (dir, repo, oids) = wanted_oids_fixture();
+        let binary = write_failing_git(
+            dir.path(),
+            "if [ \"$1\" = for-each-ref ]; then exit 7; fi\nexec git \"$@\"\n",
+        );
+        let mut cache = upload_pack_test_cache(binary.to_str().unwrap());
+        cache.cfg.max_wants = 1;
+        let mut request = Vec::new();
+        for oid in &oids {
+            request.extend(pkt_line(&format!("want {oid}\n")));
+        }
+        request.extend_from_slice(b"0000");
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        cache
+            .ensure_wanted_oids(&repo, &request, None)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let refs = git_test_command(
+            &repo.cache_dir,
+            &["for-each-ref", "--format=%(objectname)", PROXY_WANTS_NS],
+        );
+        let pinned: Vec<_> = refs.lines().collect();
+        assert_eq!(pinned.len(), 1);
+        assert!(oids.iter().any(|oid| oid == pinned[0]));
+        git_test_command(&repo.cache_dir, &["cat-file", "-e", pinned[0]]);
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(logs.contains("capping want-by-sha fetch"), "{logs}");
+        assert!(logs.contains("requested=2"), "{logs}");
+        assert!(logs.contains("cap=1"), "{logs}");
+        assert!(logs.contains("pruning want-by-sha pins failed"), "{logs}");
+        assert!(logs.contains("git for-each-ref failed"), "{logs}");
+        assert!(cache.metrics.gather().contains(
+            r#"gitcacheproxy_upstream_ops_total{op="want_fetch",repo="repo.git",result="ok"} 1"#
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_wants_retains_cap_and_other_refs_and_reports_deletion() {
+        use tracing::instrument::WithSubscriber;
+
+        let (_dir, repo, oids) = wanted_oids_fixture();
+        for oid in &oids {
+            git_test_command(&repo.cache_dir, &["fetch", "-q", "origin", oid]);
+            git_test_command(
+                &repo.cache_dir,
+                &["update-ref", &format!("{PROXY_WANTS_NS}/{oid}"), oid],
+            );
+        }
+        git_test_command(
+            &repo.cache_dir,
+            &["update-ref", "refs/heads/keep", &oids[0]],
+        );
+        let sorted = git_test_command(
+            &repo.cache_dir,
+            &[
+                "for-each-ref",
+                "--sort=-creatordate",
+                "--format=%(refname)",
+                PROXY_WANTS_NS,
+            ],
+        );
+        assert_eq!(sorted.lines().count(), 2);
+        let mut cache = upload_pack_test_cache("git");
+        cache.cfg.max_wants = 1;
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        cache
+            .prune_wants(&repo)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        let refs = git_test_command(
+            &repo.cache_dir,
+            &["for-each-ref", "--format=%(refname)", PROXY_WANTS_NS],
+        );
+        assert_eq!(refs.trim(), sorted.lines().next().unwrap());
+        assert_eq!(
+            git_test_command(&repo.cache_dir, &["rev-parse", "refs/heads/keep"]).trim(),
+            oids[0]
+        );
+        let logs = std::fs::read_to_string(logs.path()).unwrap();
+        assert!(
+            logs.contains("pruned oldest want-by-sha pins over cap"),
+            "{logs}"
+        );
+        assert!(logs.contains("pruned=1"), "{logs}");
+        assert!(logs.contains("repo.git"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn upload_pack_large_v0_negotiation_drains_both_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@localhost",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(dir.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let head = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let oid = String::from_utf8(head.stdout).unwrap();
+        let oid = oid.trim();
+        let mut request = pkt_line(&format!("want {oid} multi_ack_detailed\n"));
+        request.extend_from_slice(b"0000");
+        // Known haves make Git emit ACKs before it has consumed all input.
+        for _ in 0..30_000 {
+            request.extend(pkt_line(&format!("have {oid}\n")));
+        }
+        request.extend_from_slice(b"0000");
+        assert!(request.len() > 1_000_000);
+
+        let cache = upload_pack_test_cache("git");
+        let repo = RepoRef {
+            name: "test/repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().to_path_buf(),
+        };
+        let mut expected = Vec::new();
+        let ack = pkt_line(&format!("ACK {oid} common\n"));
+        for _ in 0..30_000 {
+            expected.extend_from_slice(&ack);
+        }
+        expected.extend(pkt_line(&format!("ACK {oid} ready\n")));
+        expected.extend_from_slice(b"0008NAK\n");
+
+        // The same request completes when both pipes are driven concurrently.
+        let mut child = cache
+            .local_cmd(Some("version=0"))
+            .arg("upload-pack")
+            .arg("--stateless-rpc")
+            .arg(dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let (_, output) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                async {
+                    stdin.write_all(&request).await.unwrap();
+                    drop(stdin);
+                },
+                child.wait_with_output(),
+            )
+        })
+        .await
+        .expect("concurrent Git control must complete");
+        let output = output.unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, expected);
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let stream = cache
+                .upload_pack_rpc(&repo, Some("version=0"), Bytes::from(request))
+                .await
+                .unwrap();
+            axum::body::to_bytes(axum::body::Body::from_stream(stream), 2_000_000)
+                .await
+                .unwrap()
+        })
+        .await;
+
+        // Wait for cleanup even on timeout before unwinding the runtime.
+        let permit = tokio::time::timeout(
+            Duration::from_secs(10),
+            cache.upload_packs.as_ref().unwrap().clone().acquire_owned(),
+        )
+        .await
+        .expect("upload-pack must release its permit")
+        .unwrap();
+        drop(permit);
+        let response = result.expect("upload-pack must drain stdout while writing stdin");
+        assert_eq!(response, expected);
+
+        let mut small = pkt_line(&format!("want {oid} multi_ack_detailed\n"));
+        small.extend_from_slice(b"0000");
+        small.extend(pkt_line(&format!("have {oid}\n")));
+        small.extend_from_slice(b"0000");
+        let mut expected_small = ack;
+        expected_small.extend(pkt_line(&format!("ACK {oid} ready\n")));
+        expected_small.extend_from_slice(b"0008NAK\n");
+        let stream = cache
+            .upload_pack_rpc(&repo, Some("version=0"), Bytes::from(small))
+            .await
+            .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(axum::body::Body::from_stream(stream), 4096)
+                .await
+                .unwrap(),
+            expected_small
+        );
+
+        let mut v2 = pkt_line("command=ls-refs\n");
+        v2.extend_from_slice(b"00010000");
+        let stream = cache
+            .upload_pack_rpc(&repo, Some("version=2"), Bytes::from(v2))
+            .await
+            .unwrap();
+        let refs = axum::body::to_bytes(axum::body::Body::from_stream(stream), 4096)
+            .await
+            .unwrap();
+        assert!(
+            refs.windows(oid.len() + 5)
+                .any(|bytes| bytes == format!("{oid} HEAD").as_bytes())
+        );
+        assert!(refs.ends_with(b"0000"));
+    }
+
     #[test]
     fn pkt_line_encodes_length() {
         assert_eq!(pkt_line("a"), b"0005a");
@@ -1242,7 +1769,8 @@ mod tests {
             inner: &b"packfile bytes"[..],
             repo: "group/foo.git".into(),
             recorder: Some((metrics.clone(), Instant::now())),
-            served: None,
+            lifecycle: None,
+            eof: false,
         };
         // Reading to EOF drives the final zero-byte read, which records once.
         let mut sink = Vec::new();
@@ -1253,61 +1781,598 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_reader_signals_served_only_at_eof() {
-        use tokio::io::AsyncReadExt;
+    async fn timed_reader_zero_capacity_read_does_not_signal_eof() {
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let (_completion_tx, completion_rx) = oneshot::channel();
+        let mut reader = lifecycle_reader(&b"pack"[..], read_progress_tx, completion_rx);
+        assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+        assert!(!reader.eof);
+        assert!(!read_progress_rx.borrow().eof);
+        assert!(!read_progress_rx.has_changed().unwrap());
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"pack");
+        assert!(!read_progress_rx.borrow().eof);
+    }
 
-        let (tx, rx) = oneshot::channel();
-        let mut reader = timed_reader(tx);
-        reader.read_to_end(&mut Vec::new()).await.unwrap();
-        drop(reader);
-        assert!(rx.await.is_ok(), "EOF must tell the reaper not to kill");
+    #[tokio::test]
+    async fn upload_pack_reader_reports_lifecycle_task_loss_before_and_after_eof() {
+        for stdout_eof in [false, true] {
+            let metrics = Arc::new(Metrics::new());
+            let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let (mut stdout_writer, stdout_reader) = tokio::io::duplex(16);
+            if stdout_eof {
+                stdout_writer.shutdown().await.unwrap();
+            }
+            let mut reader = lifecycle_reader(stdout_reader, read_progress_tx, completion_rx);
+            reader.recorder = Some((metrics.clone(), Instant::now()));
+            let mut bytes = Vec::new();
+            let read = reader.read_to_end(&mut bytes);
+            tokio::pin!(read);
+            for _ in 0..2 {
+                assert!(matches!(
+                    std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx))).await,
+                    Poll::Pending
+                ));
+            }
+            assert_eq!(read_progress_rx.borrow().eof, stdout_eof);
+            drop(completion_tx);
+            let error = read.await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "upload-pack lifecycle task failed");
+            assert!(bytes.is_empty());
+            drop(reader);
+            assert!(read_progress_rx.has_changed().is_err());
+            assert!(metrics.gather().contains(
+                r#"gitcacheproxy_serve_duration_seconds_count{kind="upload_pack",repo="repo.git"} 1"#
+            ));
+        }
+    }
 
-        let (tx, rx) = oneshot::channel();
-        let mut reader = timed_reader(tx);
-        let mut first = [0u8; 4];
-        reader.read_exact(&mut first).await.unwrap();
-        drop(reader);
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_deadlines_fail_response_and_reap_child() {
+        for request_blocked in [false, true] {
+            let child = sleeping_child(true);
+            let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+            let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+            let (mut stdin, _stdin_reader) = tokio::io::duplex(1);
+            let writer = async move {
+                if request_blocked {
+                    write_upload_pack_request(&mut stdin, b"0000").await
+                } else {
+                    Ok(())
+                }
+            };
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let owner = tokio::spawn(async move {
+                let result = run_upload_pack(
+                    child,
+                    writer,
+                    read_progress_rx,
+                    UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+                )
+                .await;
+                let _ = completion_tx.send(result);
+            });
+            // EOF must wait for child exit; a request timeout must still reach the body.
+            let mut reader = lifecycle_reader(&b""[..], read_progress_tx, completion_rx);
+            let error = reader.read_to_end(&mut Vec::new()).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(
+                error.to_string(),
+                if request_blocked {
+                    "upload-pack request write timed out"
+                } else {
+                    "upload-pack response idle timed out"
+                }
+            );
+            owner.await.unwrap();
+            assert_eq!(
+                rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG)
+                    .unwrap_err(),
+                rustix::io::Errno::CHILD
+            );
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+        ))
+    ))]
+    #[tokio::test]
+    async fn upload_pack_exit_observer_refuses_a_reaped_child() {
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        child.wait().await.unwrap();
+        let error = wait_upload_pack(&mut child).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "upload-pack already reaped");
+    }
+
+    #[tokio::test]
+    async fn upload_pack_spawn_failure_releases_the_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("missing-git");
+        let cache = upload_pack_test_cache(binary.to_str().unwrap());
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().join("mirror.git"),
+        };
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                cache.upload_pack_rpc(&repo, None, Bytes::from_static(b"0000")),
+            )
+            .await
+            .expect("a failed spawn must release the upload-pack permit");
+            let error = result
+                .err()
+                .expect("a missing git binary must fail before streaming");
+            assert_eq!(error.to_string(), "spawn git upload-pack");
+            assert_eq!(
+                error
+                    .root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_pack_exit_observer_reports_external_reaping() {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
         assert!(
-            rx.await.is_err(),
-            "drop before EOF must tell the reaper to kill"
+            waitid(WaitId::Pid(pid), WaitIdOptions::EXITED)
+                .unwrap()
+                .is_some()
+        );
+        let error = wait_upload_pack(&mut child).await.unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+        // Tokio still owns its bookkeeping after an external waiter reaps it.
+        assert_eq!(
+            child.wait().await.unwrap_err().raw_os_error(),
+            error.raw_os_error()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_request_write_has_a_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let started = Instant::now();
+        let error = write_upload_pack_request(&mut writer, b"0000")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), UPLOAD_PACK_REQUEST_WRITE_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_lifecycle_bounds_an_unconsumed_response_and_drops_writer() {
+        let child = sleeping_child(true);
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let (writer_alive, writer_dropped) = oneshot::channel::<()>();
+        let writer = std::future::poll_fn(move |_| {
+            let _owned = &writer_alive;
+            Poll::Pending::<std::io::Result<()>>
+        });
+        let started = Instant::now();
+        let error = run_upload_pack(
+            child,
+            writer,
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT);
+        assert!(writer_dropped.await.is_err());
+        drop(read_progress_tx);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_lifecycle_progress_extends_idle_deadline() {
+        let child = sleeping_child(true);
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let owner = run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        );
+        tokio::pin!(owner);
+        for _ in 0..3 {
+            assert!(matches!(
+                std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx))).await,
+                Poll::Pending
+            ));
+            tokio::time::advance(UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT / 2).await;
+            read_progress_tx.send_replace(ReadProgress {
+                last_read_at: Instant::now(),
+                eof: false,
+            });
+        }
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        drop(read_progress_tx);
+        assert_eq!(
+            owner.await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reaper_kills_leader_when_group_kill_fails() {
-        // Without `process_group(0)` no group has the child's ID, so `killpg`
-        // fails and only the leader fallback can end the wait.
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
-        let (tx, rx) = oneshot::channel();
-        drop(tx);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            reap_upload_pack(child, rx, None, "repo.git".into()),
-        )
-        .await
-        .expect("reaper should kill the leader and return");
+    async fn upload_pack_lifecycle_writer_error_reaps_child_and_reaches_reader() {
+        let child = sleeping_child(true);
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let lifecycle_task = tokio::spawn(run_upload_pack(
+            child,
+            async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "write failed",
+                ))
+            },
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        ));
+        let (completion_tx, completion_rx) = oneshot::channel();
+        completion_tx.send(lifecycle_task.await.unwrap()).unwrap();
+        let mut reader = lifecycle_reader(&b""[..], read_progress_tx, completion_rx);
+        assert_eq!(
+            reader
+                .read_to_end(&mut Vec::new())
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reaper_leaves_a_fully_served_child_running() {
-        // `read` blocks until stdin closes. The test holds stdin, because
-        // `Child::wait` closes a stdin the child still owns.
-        let mut child = Command::new("sh")
-            .args(["-c", "read _"])
-            .stdin(Stdio::piped())
+    async fn upload_pack_lifecycle_reader_error_cancels_even_if_reader_is_retained() {
+        let child = sleeping_child(true);
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let owner = tokio::spawn(run_upload_pack(
+            child,
+            std::future::pending(),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        ));
+        let (_completion_tx, completion_rx) = oneshot::channel();
+        let mut reader = lifecycle_reader(FailingReader, read_progress_tx, completion_rx);
+        assert!(reader.read_to_end(&mut Vec::new()).await.is_err());
+        assert_eq!(
+            owner.await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_pack_lifecycle_cancels_after_eof_while_child_is_running() {
+        // No process group: also exercises the leader-kill fallback.
+        let child = sleeping_child(false);
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(true);
+        let owner = tokio::spawn(run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        ));
+        drop(read_progress_tx);
+        assert_eq!(
+            owner.await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_pack_failed_leader_is_observed_before_descendant_stdout_eof() {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        let child = Command::new("sh")
+            .args(["-c", "sleep 300 & exit 7"])
+            .process_group(0)
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let _stdin = child.stdin.take();
-        let (tx, rx) = oneshot::channel();
-        tx.send(()).unwrap();
-        let reaped = tokio::time::timeout(
-            Duration::from_millis(200),
-            reap_upload_pack(child, rx, None, "repo.git".into()),
+        let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        assert!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT
+            )
+            .unwrap()
+            .is_some()
+        );
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let owner = run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        );
+        tokio::pin!(owner);
+        let result = finish_upload_pack_with_timeout(owner.as_mut(), read_progress_tx).await;
+        let error = result
+            .expect("leader failure must not wait for descendant stdout EOF")
+            .unwrap_err();
+        assert!(error.to_string().contains("exit status: 7"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_pack_leader_exit_signal_wakes_owner_before_stdout_eof() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read gate; sleep 300 & exit 7"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let owner = run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        );
+        tokio::pin!(owner);
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        stdin.write_all(b"go\n").await.unwrap();
+        drop(stdin);
+        let result = finish_upload_pack_with_timeout(owner.as_mut(), read_progress_tx).await;
+        let error = result
+            .expect("exit signal must wake the owner without response reads")
+            .unwrap_err();
+        assert!(error.to_string().contains("exit status: 7"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_pack_leader_exit_preserves_successful_stdout_and_fails_error_stream() {
+        for status in [0, 7] {
+            let mut child = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!("printf 'buffered output'; sleep 300 & exit {status}"),
+                ])
+                .process_group(0)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let owner = tokio::spawn(async move {
+                let result = run_upload_pack(
+                    child,
+                    std::future::ready(Ok(())),
+                    read_progress_rx,
+                    UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+                )
+                .await;
+                let _ = completion_tx.send(result);
+            });
+            let mut reader = lifecycle_reader(stdout, read_progress_tx, completion_rx);
+            let mut body = Vec::new();
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut body)).await;
+            drop(reader);
+            owner.await.unwrap();
+            let result = result
+                .expect("leader exit must close descendant stdout without losing buffered bytes");
+            if status == 0 {
+                result.unwrap();
+                assert_eq!(body, b"buffered output");
+            } else {
+                assert!(result.unwrap_err().to_string().contains("exit status: 7"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_pack_lifecycle_reports_nonzero_child_exit_after_stdout_eof() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 7"]).process_group(0);
+        let child = cmd.spawn().unwrap();
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(true);
+        let error = run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
         )
-        .await;
-        assert!(reaped.is_err(), "EOF must not kill upload-pack");
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exit status: 7"));
+        drop(read_progress_tx);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_upload_pack_response_releases_permit_after_reaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("git");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = upload_pack_test_cache(script.to_str().unwrap());
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().to_owned(),
+        };
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::from(vec![0; 1024 * 1024]))
+            .await
+            .unwrap();
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 0);
+        drop(stream);
+        let permit = tokio::time::timeout(
+            Duration::from_secs(10),
+            cache.upload_packs.as_ref().unwrap().clone().acquire_owned(),
+        )
+        .await
+        .expect("cancelled upload-pack must release permit")
+        .unwrap();
+        drop(permit);
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_pack_stream_surfaces_real_stdin_broken_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("git");
+        std::fs::write(&script, "#!/bin/sh\nexec 0<&-\nexec sleep 300\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = upload_pack_test_cache(script.to_str().unwrap());
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().to_owned(),
+        };
+        let stream = cache
+            .upload_pack_rpc(&repo, None, Bytes::from(vec![0; 1024 * 1024]))
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            axum::body::to_bytes(axum::body::Body::from_stream(stream), usize::MAX),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("Broken pipe"), "{error}");
+        assert_eq!(cache.upload_packs.as_ref().unwrap().available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_pack_eof_does_not_hide_a_later_writer_error() {
+        let child = Command::new("true").process_group(0).spawn().unwrap();
+        let (_read_progress_tx, read_progress_rx) = read_progress_channel(true);
+        let (writer_result_tx, writer_result_rx) = oneshot::channel();
+        let owner = run_upload_pack(
+            child,
+            async { writer_result_rx.await.unwrap() },
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        );
+        tokio::pin!(owner);
+        assert!(matches!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx))).await,
+            Poll::Pending
+        ));
+        writer_result_tx
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "late writer error",
+            )))
+            .unwrap();
+        assert_eq!(
+            owner.await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_pack_normal_eof_cleans_descendants_before_reaping_leader() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "sleep 300 </dev/null >/dev/null 2>&1 & echo $!; exit 0",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pid = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut pid)
+            .await
+            .unwrap();
+        let (_read_progress_tx, read_progress_rx) = read_progress_channel(true);
+        run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        // An orphan may be a zombie until PID 1 reaps it; it must stop running.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = tokio::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).await;
+                match status {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Ok(status) if status.split(") ").nth(1).unwrap().starts_with('Z') => break,
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("descendant must stop after leader exits");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn upload_pack_test_timeout_cancels_and_reaps_its_owner() {
+        let child = sleeping_child(true);
+        let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        let (read_progress_tx, read_progress_rx) = read_progress_channel(false);
+        let owner = run_upload_pack(
+            child,
+            std::future::ready(Ok(())),
+            read_progress_rx,
+            UPLOAD_PACK_RESPONSE_IDLE_TIMEOUT,
+        );
+        assert!(
+            finish_upload_pack_with_timeout(owner, read_progress_tx)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+            rustix::io::Errno::CHILD
+        );
     }
 
     #[cfg(unix)]
@@ -1324,12 +2389,133 @@ mod tests {
         oids.into_iter().collect()
     }
 
-    fn timed_reader(served: oneshot::Sender<()>) -> TimedReader<&'static [u8]> {
-        TimedReader {
-            inner: b"packfile bytes",
-            repo: "group/foo.git".into(),
-            recorder: Some((Arc::new(Metrics::new()), Instant::now())),
-            served: Some(served),
+    #[cfg(unix)]
+    // Regression failures must still cancel and reap their process before panicking.
+    async fn finish_upload_pack_with_timeout(
+        owner: impl Future<Output = std::io::Result<()>>,
+        read_progress_tx: watch::Sender<ReadProgress>,
+    ) -> Result<std::io::Result<()>, tokio::time::error::Elapsed> {
+        tokio::pin!(owner);
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut owner).await;
+        if result.is_err() {
+            drop(read_progress_tx);
+            let _ = owner.await;
         }
+        result
+    }
+
+    #[cfg(unix)]
+    fn sleeping_child(group: bool) -> Child {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("300");
+        if group {
+            cmd.process_group(0);
+        }
+        cmd.spawn().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_failing_git(dir: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = dir.join("git-wrapper");
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary
+    }
+
+    #[cfg(unix)]
+    fn git_test_command(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wanted_oids_fixture() -> (tempfile::TempDir, RepoRef, [String; 2]) {
+        let dir = tempfile::tempdir().unwrap();
+        git_test_command(dir.path(), &["init", "-q", "source"]);
+        let source = dir.path().join("source");
+        let oids = ["first", "second"].map(|message| {
+            git_test_command(&source, &["commit", "-q", "--allow-empty", "-m", message]);
+            git_test_command(&source, &["rev-parse", "HEAD"])
+                .trim()
+                .to_owned()
+        });
+        git_test_command(dir.path(), &["init", "-q", "--bare", "mirror.git"]);
+        let repo = RepoRef {
+            name: "repo.git".into(),
+            upstream_url: String::new(),
+            cache_dir: dir.path().join("mirror.git"),
+        };
+        git_test_command(
+            &repo.cache_dir,
+            &["remote", "add", "origin", source.to_str().unwrap()],
+        );
+        (dir, repo, oids)
+    }
+
+    fn read_progress_channel(
+        eof: bool,
+    ) -> (watch::Sender<ReadProgress>, watch::Receiver<ReadProgress>) {
+        watch::channel(ReadProgress {
+            last_read_at: Instant::now(),
+            eof,
+        })
+    }
+
+    fn lifecycle_reader<R>(
+        inner: R,
+        read_progress_tx: watch::Sender<ReadProgress>,
+        completion_rx: oneshot::Receiver<std::io::Result<()>>,
+    ) -> TimedReader<R> {
+        TimedReader {
+            inner,
+            repo: "repo.git".into(),
+            recorder: None,
+            lifecycle: Some(ResponseLifecycle {
+                read_progress_tx,
+                completion_rx,
+            }),
+            eof: false,
+        }
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("read failed")))
+        }
+    }
+
+    fn upload_pack_test_cache(binary: &str) -> GitCache {
+        GitCache::new(
+            GitConfig {
+                git_binary: binary.into(),
+                upstream_auth_header: None,
+                big_file_threshold: "8m".into(),
+                fetch_ttl: Duration::from_secs(60),
+                max_wants: 100,
+                max_upload_packs: 1,
+                pack_threads: None,
+                pack_window_memory: None,
+            },
+            Arc::new(Metrics::new()),
+            None,
+        )
     }
 }
