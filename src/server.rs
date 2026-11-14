@@ -22,7 +22,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::auth;
 use crate::config::UpstreamCredential;
-use crate::git::{GitCache, is_auth_failure};
+use crate::git::{CacheBusy, GitCache, is_auth_failure};
 use crate::lfs::{Lfs, Outcome};
 use crate::metrics::{LfsResult, Metrics, RequestKind, Status};
 use crate::repo;
@@ -72,9 +72,11 @@ pub fn router(state: AppState) -> Router {
     // fallback as the merged fallback, while the observability routes above are
     // matched first and bypass it. The gate runs outside the limit, so a slow or
     // flooded token-validation endpoint cannot hold the permits serving needs;
-    // validation is bounded by its own `--auth-max-concurrent` instead.
+    // validation is bounded by its own `--auth-max-concurrent` instead. Stale
+    // mode isolates admission inside the cache so upstream work cannot consume
+    // the capacity needed to serve mature mirrors.
     let mut git = Router::new().fallback(handle_git);
-    if max_concurrent != 0 {
+    if max_concurrent != 0 && !state.cache.stale_enabled() {
         git = git.layer(GlobalConcurrencyLimitLayer::new(max_concurrent));
     }
     let git = git
@@ -266,6 +268,15 @@ async fn handle_git(
     Extension(route): Extension<Route>,
     req: Request<Body>,
 ) -> Response {
+    let admission =
+        if st.cache.stale_enabled() && !matches!(route, Route::InfoRefs { .. } | Route::NotFound) {
+            match st.cache.body_permit() {
+                Ok(permit) => permit,
+                Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "request admission full"),
+            }
+        } else {
+            None
+        };
     let (parts, body) = req.into_parts();
     let git_protocol = parts
         .headers
@@ -288,6 +299,7 @@ async fn handle_git(
             )
         }
         Route::InfoRefs { repo, smart: true } => {
+            drop(admission);
             info_refs(st, &repo, git_protocol.as_deref(), cred, &parts.headers).await
         }
         Route::UploadPack { repo } => {
@@ -308,6 +320,7 @@ async fn handle_git(
                 Ok(b) => b,
                 Err(_) => return err(StatusCode::BAD_REQUEST, "failed to decode request body"),
             };
+            drop(admission);
             upload_pack(
                 st,
                 &repo,
@@ -499,6 +512,9 @@ async fn info_refs(
             guard
         }
         Err(e) => {
+            if e.is::<CacheBusy>() {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "request admission full");
+            }
             // In `client` mode the credential is the client's own, so an upstream
             // rejection is the client's 401, not a 502; drop the stale verdict so
             // the next request re-probes (a token revoked within the TTL window).
@@ -568,6 +584,9 @@ async fn upload_pack(
     {
         Ok((_, guard)) => guard,
         Err(e) => {
+            if e.is::<CacheBusy>() {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "request admission full");
+            }
             if st.upstream_credential == UpstreamCredential::Client && is_auth_failure(&e) {
                 st.auth.invalidate(headers, name);
                 st.metrics

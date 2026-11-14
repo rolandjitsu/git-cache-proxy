@@ -82,9 +82,22 @@ Every flag has an environment-variable equivalent; the full reference is in
 With a positive `--max-stale-seconds`, an existing mirror can serve cached refs
 while one background fetch updates it. Age is measured from the start of the last
 successful clone or fetch. When its age exceeds the limit, a request waits for a
-refresh or fails. After restart, a mirror's age is unknown and it must refresh
-before serving. Background attempts are limited globally and retried no sooner
+refresh or fails. Successful full-ref refreshes persist their start time in
+`proxy-refresh.json` inside the mirror. Restart restores age only from a valid
+record bound to the repository, upstream and directory identity. Missing, invalid
+or future-dated records require a refresh; directory mtime is not evidence of
+success. This assumes a correct wall clock across downtime and one proxy process
+per cache root. Background attempts are limited globally and retried no sooner
 than the fetch TTL, or one second, after the previous attempt completes.
+
+Stale mode isolates mandatory upstream work from local cache delivery. The
+request limit bounds body decoding, freshness inspection and local serving in
+separate lanes. Mandatory upstream preparation has at most `max(1, N - 1)` slots
+for request limit `N`; with `N = 0`, only that upstream lane remains bounded by
+`--max-background-fetches`. Saturated lanes return 503 instead of queueing.
+The strict default mode keeps its existing queueing behavior. Waiting for an
+upload slot does not extend freshness: identity and age are checked again before
+Git starts. Already started uploads continue if the refs expire while streaming.
 
 Fetch-triggered automatic Git maintenance is disabled in this mode so a refresh
 does not delete objects just advertised to a client. Active requests are protected

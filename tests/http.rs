@@ -522,6 +522,26 @@ async fn check_cancelled_advertisements(stale: bool) {
     let app = router(st);
 
     for attempt in 1..=3 {
+        if stale && attempt > 1 {
+            let rejected = app
+                .clone()
+                .oneshot(
+                    Request::get("/repo.git/info/refs?service=git-upload-pack")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let mut writer = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&gate)
+                .await
+                .unwrap();
+            writer.write_all(b"go\n").await.unwrap();
+            drop(writer);
+            cache.shutdown().await;
+        }
         let started = tokio::spawn({
             let marker = marker.clone();
             async move { tokio::fs::read_to_string(marker).await.unwrap() }
@@ -537,7 +557,7 @@ async fn check_cancelled_advertisements(stale: bool) {
                 .await
             }
         });
-        if attempt > 1 {
+        if !stale && attempt > 1 {
             tokio::time::advance(Duration::from_secs(1)).await;
             assert!(!request.is_finished());
             assert_eq!(

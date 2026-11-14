@@ -22,7 +22,7 @@ Every flag has an environment-variable equivalent.
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
 | `--max-stale-seconds` | `GITCACHEPROXY_MAX_STALE_SECONDS` | `0` | Maximum age of cached refs served during background refresh (`0` = disabled) |
 | `--max-background-fetches` | `GITCACHEPROXY_MAX_BACKGROUND_FETCHES` | `4` | Maximum concurrent background refreshes (at least `1`) |
-| `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
+| `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Request capacity: strict mode queues; stale mode isolates local and upstream work and rejects overload (see README for `0`)              |
 | `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
 | `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |

@@ -89,8 +89,8 @@ config:
   # mirrors when exceeded. 0 = unlimited (no eviction). Set this whenever the
   # cache volume is bounded.
   cacheMaxMb: 0
-  # Max concurrent in-flight requests; excess queue. Bounds the upstream
-  # clone/fetch a burst can trigger. 0 = unlimited.
+  # Request capacity: strict mode queues; stale mode isolates local and
+  # upstream work and rejects overload. See the README for zero-limit behavior.
   maxConcurrentRequests: 64
   # Cap on a decoded upload-pack request body, in MiB (bounds memory, defuses a
   # gzip bomb). Caps only the negotiation request, never the streamed packfile.

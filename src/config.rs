@@ -231,12 +231,11 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_MAX_BACKGROUND_FETCHES", default_value_t = 4, value_parser = positive_usize)]
     pub max_background_fetches: usize,
 
-    /// Maximum number of requests handled concurrently, shared across all
-    /// connections. Excess requests queue until a slot frees. This bounds the
-    /// concurrent upstream clone/fetch work a burst can trigger (the slot is held
-    /// for the handler, then released before the packfile streams, so it caps
-    /// setup rather than in-flight streaming; see `max_concurrent_upload_packs`).
-    /// `0` = unlimited. Complementary to any ingress-level rate limiting.
+    /// Request capacity shared across connections. Strict mode queues excess
+    /// handlers. Stale mode bounds decoding, inspection and local serving
+    /// independently and rejects overload; mandatory upstream work has at most
+    /// max(1, capacity - 1) slots. Zero disables local limits; stale upstream
+    /// preparation still uses max_background_fetches as its bound.
     #[arg(
         long,
         env = "GITCACHEPROXY_MAX_CONCURRENT_REQUESTS",
@@ -247,7 +246,8 @@ pub struct Config {
     /// Maximum number of `git upload-pack` processes at once, to bound
     /// `pack-objects` memory on large repos. A slot frees when the process exits,
     /// so it covers the streamed pack. Excess clones queue while holding a
-    /// `max_concurrent_requests` slot, so a full cap can also block `info/refs`.
+    /// `max_concurrent_requests` slot. In stale mode it stays held until Git is
+    /// reaped; a full cap can also return overload for `info/refs`.
     /// `0` = unlimited.
     #[arg(
         long,

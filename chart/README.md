@@ -117,7 +117,7 @@ pointing at the Service.
 | `config.maxStaleSeconds` | `0` | Maximum age of cached refs served while refreshing (`0` = disabled) |
 | `config.maxBackgroundFetches` | `4` | Maximum concurrent background refreshes (at least `1`) |
 | `config.cacheMaxMb` | `0` | Cap on on-disk cache, MiB; evicts LRU idle mirrors (`0` = unlimited) |
-| `config.maxConcurrentRequests` | `64` | Max concurrent in-flight requests (`0` = unlimited) |
+| `config.maxConcurrentRequests` | `64` | Request capacity; stale mode isolates local/upstream work and rejects overload (see README) |
 | `config.maxDecodedBodyMb` | `512` | Cap on a decoded upload-pack request body, MiB |
 | `config.logLevel` | `info` | Log filter directive |
 | `config.logFormat` | `text` | `text` or `json` |
