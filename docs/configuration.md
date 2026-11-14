@@ -32,3 +32,14 @@ Every flag has an environment-variable equivalent.
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](./metrics.md)).
 
+
+## Reusing a cache after changing upstream
+
+Mirrors are keyed by repo path under `--cache-root`, not by upstream URL.
+After changing `--upstream` and restarting the proxy, clone, incremental fetch,
+and missing-SHA fetch use the configured upstream. Existing mirrors are reused;
+their recorded `origin` URL is not rewritten. Normal fetch TTL rules still apply.
+
+Old cached objects and local want-by-SHA pins remain and can still be served.
+Changing the fetch URL is not a security-domain migration. When switching trust
+domains, use a fresh or separate cache root, including for LFS objects.
