@@ -193,6 +193,7 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -252,6 +253,7 @@ async fn upload_pack_upstream_failure_returns_bad_gateway() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -354,6 +356,7 @@ fn state(auth: Arc<Auth>) -> AppState {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

@@ -110,6 +110,20 @@ pub struct GitConfig {
     pub pack_threads: Option<u32>,
     /// git `pack.windowMemory` for upload-pack (`None` = git default).
     pub pack_window_memory: Option<String>,
+    /// Background refresh of recently used mirrors (`None` = disabled).
+    pub refresh: Option<RefreshConfig>,
+}
+
+/// Settings for [`GitCache::start_refresh`]. Callers validate them with
+/// `Config::validate_refresh` first.
+#[derive(Clone, Copy)]
+pub struct RefreshConfig {
+    /// Pause between round starts.
+    pub interval: Duration,
+    /// Only mirrors used within this window are refreshed.
+    pub active_window: Duration,
+    /// Maximum background fetches in flight.
+    pub concurrency: usize,
 }
 
 /// Per-repo serialization point. `fetch_lock` is a `Mutex`, not an `RwLock`, on
@@ -120,6 +134,29 @@ pub struct GitConfig {
 /// would only add overhead and never grant a concurrent reader.
 struct RepoSlot {
     fetch_lock: Mutex<Option<Instant>>,
+    refresh: Mutex<RefreshState>,
+    /// Bumped by `evict` before it waits for `fetch_lock`, so a background
+    /// refresh holding the lock can yield instead of fetching data that is
+    /// about to be deleted.
+    evict_requests: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct RefreshState {
+    used: Option<(RepoRef, Instant)>,
+    failures: u32,
+    retry_after: Option<Instant>,
+    auth_blocked: bool,
+}
+
+impl RefreshState {
+    fn succeeded(&mut self, server_credential: bool) {
+        self.failures = 0;
+        self.retry_after = None;
+        if server_credential {
+            self.auth_blocked = false;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -135,8 +172,7 @@ pub struct GitCache {
     /// short for reader/writer separation to pay off.
     slots: Arc<Mutex<HashMap<String, Arc<RepoSlot>>>>,
     /// Cache-size index for LRU eviction, or `None` when no cap is configured.
-    /// When present it is `touch`ed on every request and `record`ed after each
-    /// clone/fetch; when absent the eviction machinery is entirely inert.
+    /// Requests promote entries; background refresh only schedules remeasurement.
     index: Option<Arc<crate::evict::CacheIndex>>,
     /// `None` when `max_upload_packs` is `0` (unlimited).
     upload_packs: Option<Arc<Semaphore>>,
@@ -144,10 +180,18 @@ pub struct GitCache {
 
 impl GitCache {
     pub fn new(
-        cfg: GitConfig,
+        mut cfg: GitConfig,
         metrics: Arc<Metrics>,
         index: Option<Arc<crate::evict::CacheIndex>>,
     ) -> Self {
+        // Settings that cannot run a round count as disabled, so request use is
+        // never recorded for a refresh task that will not exist.
+        if let Some(refresh) = cfg.refresh
+            && (refresh.interval.is_zero() || refresh.concurrency == 0)
+        {
+            tracing::warn!("refresh interval and concurrency must be at least 1; refresh disabled");
+            cfg.refresh = None;
+        }
         let upload_packs =
             (cfg.max_upload_packs > 0).then(|| Arc::new(Semaphore::new(cfg.max_upload_packs)));
         Self {
@@ -176,7 +220,8 @@ impl GitCache {
         self.owners.close();
     }
 
-    /// Wait for upstream owners to reap children and release repository locks.
+    /// Wait for request upstream owners to reap children and release repository locks.
+    /// Also await the handle returned by start_refresh to finish refresh cleanup.
     pub async fn wait_for_shutdown(&self) {
         self.owners.wait().await;
     }
@@ -189,9 +234,172 @@ impl GitCache {
             .or_insert_with(|| {
                 Arc::new(RepoSlot {
                     fetch_lock: Mutex::new(None),
+                    refresh: Mutex::new(RefreshState::default()),
+                    evict_requests: watch::channel(0).0,
                 })
             })
             .clone()
+    }
+
+    async fn record_fetch_success(&self, repo: &RepoRef, cred: Option<&str>) {
+        if self.cfg.refresh.is_none() {
+            return;
+        }
+        self.slot(&repo.name)
+            .await
+            .refresh
+            .lock()
+            .await
+            .succeeded(cred.is_none() || cred == self.cfg.upstream_auth_header.as_deref());
+    }
+
+    async fn record_client_use(&self, repo: &RepoRef, finished: Instant) {
+        let slot = self.slot(&repo.name).await;
+        let mut state = slot.refresh.lock().await;
+        if !self.shutdown.is_cancelled()
+            && state
+                .used
+                .as_ref()
+                .is_none_or(|(_, previous)| *previous <= finished)
+        {
+            state.used = Some((repo.clone(), finished));
+        }
+    }
+
+    /// Start optional refresh work from `GitConfig::refresh`. Disabled refresh
+    /// creates no task. Callers should validate the settings with Config first.
+    pub fn start_refresh(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let RefreshConfig {
+            interval,
+            concurrency,
+            ..
+        } = self.cfg.refresh?;
+        let cache = self.clone();
+        Some(tokio::spawn(async move {
+            refresh_loop(interval, cache.shutdown.child_token(), |deadline| {
+                let cache = &cache;
+                async move {
+                    let candidates = cache.refresh_candidates().await;
+                    refresh_round(
+                        candidates.into_iter().map(|(repo, _)| repo),
+                        concurrency,
+                        deadline,
+                        cache.shutdown.child_token(),
+                        |repo| {
+                            let worker = cache.clone();
+                            async move {
+                                worker.refresh_repo(&repo, deadline).await;
+                            }
+                        },
+                    )
+                    .await;
+                }
+            })
+            .await;
+        }))
+    }
+
+    async fn refresh_candidates(&self) -> Vec<(RepoRef, Instant)> {
+        let Some(RefreshConfig { active_window, .. }) = self.cfg.refresh else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::new();
+        for slot in self.slots.lock().await.values() {
+            let state = slot.refresh.lock().await;
+            if let Some((repo, used)) = &state.used
+                && used.elapsed() <= active_window
+            {
+                candidates.push((repo.clone(), *used));
+            }
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
+        candidates
+    }
+
+    /// Refresh an existing mirror without recording client use or LRU access.
+    pub(crate) async fn refresh_repo(&self, repo: &RepoRef, deadline: Instant) {
+        let Some(RefreshConfig {
+            interval,
+            active_window,
+            ..
+        }) = self.cfg.refresh
+        else {
+            return;
+        };
+        let slot = self.slot(&repo.name).await;
+        // Subscribe before taking the lock so an eviction queued behind us is seen.
+        let mut evict_requested = slot.evict_requests.subscribe();
+        let mut last = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return,
+            _ = tokio::time::sleep_until(deadline) => return,
+            guard = slot.fetch_lock.lock() => guard,
+        };
+        {
+            let state = slot.refresh.lock().await;
+            if Instant::now() >= deadline
+                || self.shutdown.is_cancelled()
+                || state.auth_blocked
+                || state.retry_after.is_some_and(|t| t > Instant::now())
+                || state
+                    .used
+                    .as_ref()
+                    .is_none_or(|(_, used)| used.elapsed() > active_window)
+                || !repo.cache_dir.join("HEAD").exists()
+                || last.is_some_and(|t| {
+                    !self.cfg.fetch_ttl.is_zero() && t.elapsed() < self.cfg.fetch_ttl
+                })
+            {
+                return;
+            }
+        }
+        let started = Instant::now();
+        let mut worker = self.clone();
+        worker.shutdown = self.shutdown.child_token();
+        let cancel = worker.shutdown.clone();
+        let fetch = worker.fetch(repo, None);
+        tokio::pin!(fetch);
+        let mut preempted = false;
+        // Cancel rather than drop the fetch so its child is still killed and reaped.
+        let result = tokio::select! {
+            result = &mut fetch => result,
+            _ = evict_requested.changed() => {
+                preempted = true;
+                cancel.cancel();
+                fetch.await
+            }
+        };
+        if preempted {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                *last = Some(started);
+                if let Some(index) = &self.index {
+                    index.mark_dirty(&repo.name);
+                }
+            }
+            Err(error) => {
+                if self.shutdown.is_cancelled() {
+                    return;
+                }
+                tracing::warn!(repo = %repo.name, error = %error, "background refresh failed");
+                let mut state = slot.refresh.lock().await;
+                state.auth_blocked |= is_auth_failure(&error);
+                state.failures = state.failures.saturating_add(1);
+                let multiplier = 1u32 << state.failures.saturating_sub(1).min(5);
+                state.retry_after = if state.failures == 1 {
+                    None
+                } else {
+                    // Startup validation reserves space for the maximum backoff.
+                    Some(
+                        Instant::now()
+                            .checked_add(interval.saturating_mul(multiplier))
+                            .expect("validated refresh interval fits maximum backoff"),
+                    )
+                };
+            }
+        }
     }
 
     /// Flag a mirror as changed after a clone/fetch so the background evictor
@@ -213,6 +421,7 @@ impl GitCache {
     /// its open file descriptors and drains cleanly (POSIX unlink semantics).
     pub async fn evict(&self, name: &str, cache_dir: &Path) -> Result<()> {
         let slot = self.slot(name).await;
+        slot.evict_requests.send_modify(|n| *n = n.wrapping_add(1));
         let guard = slot.fetch_lock.lock().await;
         if !cache_dir.join("HEAD").exists() {
             return Ok(()); // already gone (raced a prior eviction or manual removal)
@@ -237,6 +446,8 @@ impl GitCache {
     /// the same repo are serialized; the first does the work, the rest see it already
     /// fresh. `body` is the client's upload-pack request (empty for `info/refs`),
     /// scanned for want-by-SHA misses - see `ensure_wanted_oids`.
+    /// Refresh use is recorded after successful preparation, including TTL hits,
+    /// independently of later HTTP response or pack-stream success.
     pub async fn ensure_fresh(
         &self,
         repo: &RepoRef,
@@ -244,20 +455,26 @@ impl GitCache {
         body: &[u8],
         cred: Option<&str>,
     ) -> Result<CacheOutcome> {
+        let track_use = self.cfg.refresh.is_some();
         let mut owner = self.clone();
         owner.shutdown = self.shutdown.child_token();
         let _cancel_on_drop = owner.shutdown.clone().drop_guard();
-        let repo = repo.clone();
+        let owner_repo = repo.clone();
         let wants = parse_wants(body);
         let cred = cred.map(str::to_owned);
-        self.owners
+        let outcome = self
+            .owners
             .spawn(async move {
                 owner
-                    .ensure_fresh_owned(&repo, want_fetch, &wants, cred.as_deref())
+                    .ensure_fresh_owned(&owner_repo, want_fetch, &wants, cred.as_deref())
                     .await
             })
             .await
-            .context("join upstream owner")?
+            .context("join upstream owner")??;
+        if track_use {
+            self.record_client_use(repo, Instant::now()).await;
+        }
+        Ok(outcome)
     }
 
     async fn ensure_fresh_owned(
@@ -293,6 +510,7 @@ impl GitCache {
             }
         {
             self.fetch(repo, cred).await?;
+            self.mark_changed(repo);
             *last = Some(started);
             CacheOutcome::Fetched
         } else {
@@ -480,6 +698,7 @@ impl GitCache {
         self.metrics
             .observe_upstream(UpstreamOp::Clone, &repo.name, elapsed);
         self.mark_changed(repo);
+        self.record_fetch_success(repo, cred).await;
         Ok(())
     }
 
@@ -518,7 +737,7 @@ impl GitCache {
             &repo.name,
             started.elapsed().as_secs_f64(),
         );
-        self.mark_changed(repo);
+        self.record_fetch_success(repo, cred).await;
         Ok(())
     }
 
@@ -591,6 +810,7 @@ impl GitCache {
             started.elapsed().as_secs_f64(),
         );
         self.mark_changed(repo);
+        self.record_fetch_success(repo, cred).await;
         // Best-effort: a failed prune is not worth failing the request over.
         if let Err(e) = self.prune_wants(repo).await {
             tracing::warn!(repo = %repo.name, error = %e, "pruning want-by-sha pins failed");
@@ -1332,9 +1552,1009 @@ fn parse_wants(body: &[u8]) -> HashSet<String> {
     oids
 }
 
+async fn refresh_loop<F, Fut>(interval: Duration, shutdown: CancellationToken, round: F)
+where
+    F: Fn(Instant) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let Some(mut next) = Instant::now().checked_add(interval) else {
+        tracing::warn!("refresh interval exceeds the monotonic deadline range");
+        return;
+    };
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep_until(next) => {}
+        }
+        let Some(deadline) = Instant::now().checked_add(interval) else {
+            tracing::warn!("refresh interval exceeds the monotonic deadline range");
+            break;
+        };
+        round(deadline).await;
+        next = deadline;
+    }
+}
+
+async fn refresh_round<F, Fut>(
+    candidates: impl IntoIterator<Item = RepoRef>,
+    concurrency: usize,
+    deadline: Instant,
+    shutdown: CancellationToken,
+    fetch: F,
+) where
+    F: Fn(RepoRef) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut jobs = tokio::task::JoinSet::new();
+    for repo in candidates {
+        if jobs.len() == concurrency
+            && let Some(Err(error)) = jobs.join_next().await
+        {
+            tracing::warn!(%error, "background refresh job failed");
+        }
+        if Instant::now() >= deadline || shutdown.is_cancelled() {
+            break;
+        }
+        jobs.spawn(fetch(repo));
+    }
+    while let Some(result) = jobs.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "background refresh job failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_usage_tracks_success_and_ttl_hits_only() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = refresh_test_mirror(root.path(), "repo.git");
+        let mut cfg = test_config();
+        cfg.git_binary = "true".into();
+        let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+        enable_refresh(&mut cache, 3600, 604800, 1);
+        let handle = cache.start_refresh().unwrap();
+        let slot = cache.slot(&repo.name).await;
+        cache
+            .clone()
+            .ensure_fresh(&repo, false, b"", None)
+            .await
+            .unwrap();
+        let first = slot.refresh.lock().await.used.as_ref().unwrap().1;
+        *slot.fetch_lock.lock().await = Some(Instant::now());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, b"", None).await.unwrap(),
+            CacheOutcome::Cached
+        ));
+        let latest = slot.refresh.lock().await.used.as_ref().unwrap().1;
+        assert!(latest > first);
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(3600),
+                Duration::from_secs(604800),
+                Instant::now() + Duration::from_secs(3600),
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.used.as_ref().unwrap().1, latest);
+        cache.shutdown();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failed_preparation_does_not_add_or_replace_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+        let slot = cache.slot(&repo.name).await;
+        let previous = slot.refresh.lock().await.used.as_ref().unwrap().1;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(cache.ensure_fresh(&repo, true, b"", None).await.is_err());
+        assert_eq!(slot.refresh.lock().await.used.as_ref().unwrap().1, previous);
+        let unseen = refresh_test_mirror(root.path(), "unseen.git");
+        assert!(cache.ensure_fresh(&unseen, true, b"", None).await.is_err());
+        assert!(
+            cache
+                .slot(&unseen.name)
+                .await
+                .refresh
+                .lock()
+                .await
+                .used
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_auth_failed_preparation_preserves_successful_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_fixture(
+            root.path(),
+            "echo 'fatal: Authentication failed' >&2\nexit 1\n",
+        )
+        .await;
+        let slot = cache.slot(&repo.name).await;
+        let previous = slot.refresh.lock().await.used.as_ref().unwrap().1;
+        let error = cache
+            .ensure_fresh(&repo, true, b"", None)
+            .await
+            .unwrap_err();
+        assert!(is_auth_failure(&error));
+        assert_eq!(slot.refresh.lock().await.used.as_ref().unwrap().1, previous);
+        let unseen = refresh_test_mirror(root.path(), "unseen.git");
+        assert!(is_auth_failure(
+            &cache
+                .ensure_fresh(&unseen, true, b"", None)
+                .await
+                .unwrap_err()
+        ));
+        assert!(
+            cache
+                .slot(&unseen.name)
+                .await
+                .refresh
+                .lock()
+                .await
+                .used
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_cancelled_preparation_preserves_usage() {
+        for previously_used in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+            let slot = cache.slot(&repo.name).await;
+            if !previously_used {
+                slot.refresh.lock().await.used = None;
+            }
+            let previous = slot
+                .refresh
+                .lock()
+                .await
+                .used
+                .as_ref()
+                .map(|(_, used)| *used);
+            let guard = slot.fetch_lock.lock().await;
+            let worker = cache.clone();
+            let mirror = repo.clone();
+            let request =
+                tokio::spawn(async move { worker.ensure_fresh(&mirror, false, b"", None).await });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            cache.shutdown();
+            drop(guard);
+            cache.wait_for_shutdown().await;
+            assert_eq!(
+                slot.refresh
+                    .lock()
+                    .await
+                    .used
+                    .as_ref()
+                    .map(|(_, used)| *used),
+                previous
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_usage_cannot_move_backwards() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+        let older = Instant::now();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let newer = Instant::now();
+        tokio::join!(
+            cache.record_client_use(&repo, newer),
+            cache.record_client_use(&repo, older)
+        );
+        assert_eq!(
+            cache
+                .slot(&repo.name)
+                .await
+                .refresh
+                .lock()
+                .await
+                .used
+                .as_ref()
+                .unwrap()
+                .1,
+            newer
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_loop_rejects_an_overflowing_deadline_without_panicking() {
+        let round = |_| async { panic!("test refresh round") };
+        let valid_round = tokio::spawn(async move {
+            refresh_loop(Duration::from_secs(1), CancellationToken::new(), round).await;
+        });
+        assert!(valid_round.await.unwrap_err().is_panic());
+        let now = Instant::now();
+        let (mut valid, mut invalid) = (0, u64::MAX);
+        while invalid - valid > 1 {
+            let seconds = valid + (invalid - valid) / 2;
+            if now.checked_add(Duration::from_secs(seconds)).is_some() {
+                valid = seconds;
+            } else {
+                invalid = seconds;
+            }
+        }
+        let interval = Duration::from_secs(invalid);
+        assert!(now.checked_add(Duration::from_secs(valid)).is_some());
+        assert!(now.checked_add(interval).is_none());
+        refresh_loop(interval, CancellationToken::new(), round).await;
+        let interval = Duration::from_secs(1);
+        let token = CancellationToken::new();
+        let refresh = refresh_loop(interval, token.clone(), round);
+        tokio::pin!(refresh);
+        std::future::poll_fn(|cx| {
+            assert!(refresh.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(valid)).await;
+        assert!(Instant::now().checked_add(interval).is_none());
+        refresh.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_refresh_attempts_request_recorded_repos_in_recency_order() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+        let stale = refresh_test_mirror(root.path(), "stale.git");
+        cache.ensure_fresh(&stale, false, b"", None).await.unwrap();
+        let cold = refresh_test_mirror(root.path(), "cold.git");
+        tokio::time::advance(Duration::from_secs(200)).await;
+        cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let newest_z = refresh_test_mirror(root.path(), "z.git");
+        let newest_a = refresh_test_mirror(root.path(), "a.git");
+        for mirror in [&newest_z, &newest_a] {
+            cache.ensure_fresh(mirror, false, b"", None).await.unwrap();
+        }
+        let output = RefreshLog::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        enable_refresh(&mut cache, 10, 100, 1);
+        let handle = cache.start_refresh().unwrap();
+        tokio::time::sleep(Duration::from_millis(10001)).await;
+        cache.shutdown();
+        handle.await.unwrap();
+        let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let attempts: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("background refresh failed"))
+            .collect();
+        assert_eq!(attempts.len(), 3, "{log}");
+        for (line, name) in attempts.iter().zip(["a.git", "z.git", "repo.git"]) {
+            assert!(line.contains(&format!("repo={name} ")), "{line}");
+            assert_eq!(cache.slot(name).await.refresh.lock().await.failures, 1);
+        }
+        assert_eq!(
+            cache.slot(&stale.name).await.refresh.lock().await.failures,
+            0
+        );
+        assert!(!cache.slots.lock().await.contains_key(&cold.name));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_job_panics_are_logged_and_other_jobs_finish() {
+        let root = tempfile::tempdir().unwrap();
+        let output = RefreshLog::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for names in [["a.git", "b.git"], ["b.git", "a.git"]] {
+            let candidates = names.map(|name| refresh_test_mirror(root.path(), name));
+            let completed = Arc::new(Mutex::new(Vec::new()));
+            refresh_round(
+                candidates,
+                1,
+                Instant::now() + Duration::from_secs(10),
+                CancellationToken::new(),
+                |repo| {
+                    let completed = completed.clone();
+                    async move {
+                        if repo.name == "a.git" {
+                            panic!("test refresh panic");
+                        }
+                        completed.lock().await.push(repo.name);
+                    }
+                },
+            )
+            .await;
+            assert_eq!(*completed.lock().await, ["b.git"]);
+        }
+        std::io::Write::flush(&mut output.clone()).unwrap();
+        let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN"));
+        assert_eq!(log.matches("background refresh job failed").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_without_config_has_no_candidates_and_skips_the_fetch() {
+        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        cache.slot(&repo.name).await.refresh.lock().await.used =
+            Some((repo.clone(), Instant::now()));
+        assert!(cache.refresh_candidates().await.is_empty());
+        cache
+            .refresh_repo(&repo, Instant::now() + Duration::from_secs(10))
+            .await;
+        assert!(!repo.cache_dir.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_candidates_use_client_recency_and_window_boundary() {
+        let mut cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        enable_refresh(&mut cache, 3600, 20, 1);
+        let root = tempfile::tempdir().unwrap();
+        for name in ["old.git", "recent.git", "newest.git"] {
+            let repo = crate::repo::resolve(name, "https://example.com", root.path()).unwrap();
+            cache.slot(name).await.refresh.lock().await.used = Some((repo, Instant::now()));
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+        let candidates = cache.refresh_candidates().await;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(repo, _)| repo.name.as_str())
+                .collect::<Vec<_>>(),
+            ["newest.git", "recent.git"]
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(cache.refresh_candidates().await.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_want_fetch_success_clears_backoff_with_credential_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_fixture(root.path(),
+            "if [ \"$1\" = cat-file ]; then while read -r oid; do printf '%s missing\\n' \"$oid\"; done; fi\n").await;
+        let slot = cache.slot(&repo.name).await;
+        for cred in [Some("Authorization: client"), None] {
+            {
+                let mut state = slot.refresh.lock().await;
+                state.failures = 3;
+                state.retry_after = Some(Instant::now() + Duration::from_secs(100));
+                state.auth_blocked = true;
+            }
+            let body = pkt_line(&format!("want {}\n", "a".repeat(40)));
+            cache.ensure_fresh(&repo, false, &body, cred).await.unwrap();
+            let state = slot.refresh.lock().await;
+            assert_eq!(state.failures, 0);
+            assert!(state.retry_after.is_none());
+            assert_eq!(state.auth_blocked, cred.is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_shutdown_reaps_running_fetch_and_releases_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) =
+            refresh_fixture(root.path(), "printf x > started\nexec sleep 30\n").await;
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(repo.cache_dir.join("started"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let worker = cache.clone();
+        let mirror = repo.clone();
+        let job = tokio::spawn(async move {
+            worker
+                .refresh_repo_with(
+                    &mirror,
+                    Duration::from_secs(10),
+                    Duration::from_secs(100),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await;
+        });
+        tokio::fs::File::open(repo.cache_dir.join("started"))
+            .await
+            .unwrap()
+            .read_exact(&mut [0])
+            .await
+            .unwrap();
+        cache.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .unwrap()
+            .unwrap();
+        let slot = cache.slot(&repo.name).await;
+        assert!(slot.fetch_lock.try_lock().is_ok());
+        assert_eq!(slot.refresh.lock().await.failures, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eviction_preempts_a_running_refresh_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) =
+            refresh_fixture(root.path(), "printf x > started\nexec sleep 30\n").await;
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(repo.cache_dir.join("started"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let worker = cache.clone();
+        let mirror = repo.clone();
+        let job = tokio::spawn(async move {
+            worker
+                .refresh_repo_with(
+                    &mirror,
+                    Duration::from_secs(10),
+                    Duration::from_secs(100),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await;
+        });
+        tokio::fs::File::open(repo.cache_dir.join("started"))
+            .await
+            .unwrap()
+            .read_exact(&mut [0])
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cache.evict(&repo.name, &repo.cache_dir),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!repo.cache_dir.join("HEAD").exists());
+        let slot = cache.slot(&repo.name).await;
+        let state = slot.refresh.lock().await;
+        assert_eq!(state.failures, 0);
+        assert!(!state.auth_blocked);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_uses_static_auth_and_client_waits_for_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_fixture(root.path(),
+            "printf '%s' \"$GIT_CONFIG_VALUE_2\" > auth\nprintf '%s\\n' \"$@\" > args\nprintf x >> fetches\nprintf x > started\ncat release >/dev/null\n").await;
+        for name in ["started", "release"] {
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(repo.cache_dir.join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let worker = cache.clone();
+        let mirror = repo.clone();
+        let job = tokio::spawn(async move {
+            worker
+                .refresh_repo_with(
+                    &mirror,
+                    Duration::from_secs(10),
+                    Duration::from_secs(100),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await;
+        });
+        let mut signal = tokio::fs::File::open(repo.cache_dir.join("started"))
+            .await
+            .unwrap();
+        signal.read_exact(&mut [0]).await.unwrap();
+        assert!(cache.slot(&repo.name).await.fetch_lock.try_lock().is_err());
+        let request = cache.ensure_fresh(&repo, true, b"", Some("Authorization: client"));
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::pause();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        std::future::poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::resume();
+        assert_eq!(
+            tokio::fs::read(repo.cache_dir.join("fetches"))
+                .await
+                .unwrap(),
+            b"x"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(repo.cache_dir.join("auth"))
+                .await
+                .unwrap(),
+            "Authorization: server"
+        );
+        let args = tokio::fs::read_to_string(repo.cache_dir.join("args"))
+            .await
+            .unwrap();
+        assert!(args.lines().any(|arg| arg == repo.upstream_url));
+        assert!(!args.lines().any(|arg| arg == "origin"));
+        tokio::fs::write(repo.cache_dir.join("release"), b"done")
+            .await
+            .unwrap();
+        job.await.unwrap();
+        assert!(matches!(request.await.unwrap(), CacheOutcome::Cached));
+        assert_eq!(
+            tokio::fs::read(repo.cache_dir.join("fetches"))
+                .await
+                .unwrap(),
+            b"x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_failure_backoff_auth_rejection_and_request_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut cache, repo) = refresh_fixture(root.path(), "exit 1\n").await;
+        let interval = Duration::from_secs(10);
+        let slot = cache.slot(&repo.name).await;
+        for failures in 1..=8 {
+            slot.refresh.lock().await.retry_after = None;
+            let before = Instant::now();
+            cache
+                .refresh_repo_with(&repo, interval, Duration::from_secs(100), before + interval)
+                .await;
+            let state = slot.refresh.lock().await;
+            assert_eq!(state.failures, failures);
+            let delay = interval * (1 << (failures - 1).min(5));
+            if failures == 1 {
+                assert!(state.retry_after.is_none());
+            } else {
+                let retry_after = state.retry_after.unwrap();
+                assert!(retry_after >= before + delay);
+                if failures >= 6 {
+                    assert!(retry_after <= Instant::now() + interval * 32);
+                }
+            }
+            assert!(!state.auth_blocked);
+        }
+        cache.cfg.git_binary = "true".into();
+        cache
+            .ensure_fresh(&repo, true, b"", Some("Authorization: client"))
+            .await
+            .unwrap();
+        assert_eq!(slot.refresh.lock().await.failures, 0);
+        cache.cfg.git_binary = root.path().join("git-wrapper").to_str().unwrap().into();
+        write_test_script(
+            Path::new(&cache.cfg.git_binary),
+            "#!/bin/sh\necho 'fatal: Authentication failed' >&2\nexit 1\n",
+        );
+        *slot.fetch_lock.lock().await = None;
+        cache
+            .refresh_repo_with(
+                &repo,
+                interval,
+                Duration::from_secs(100),
+                Instant::now() + interval,
+            )
+            .await;
+        assert!(slot.refresh.lock().await.auth_blocked);
+        assert_eq!(slot.refresh.lock().await.failures, 1);
+        cache
+            .refresh_repo_with(
+                &repo,
+                interval,
+                Duration::from_secs(100),
+                Instant::now() + interval,
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.failures, 1);
+        cache.cfg.git_binary = "true".into();
+        cache
+            .ensure_fresh(&repo, true, b"", Some("Authorization: client"))
+            .await
+            .unwrap();
+        assert!(slot.refresh.lock().await.auth_blocked);
+        *slot.fetch_lock.lock().await = None;
+        cache.ensure_fresh(&repo, true, b"", None).await.unwrap();
+        assert!(!slot.refresh.lock().await.auth_blocked);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_backoff_stops_at_thirty_two_intervals() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+        let slot = cache.slot(&repo.name).await;
+        let interval = Duration::from_secs(10);
+        for failures in 1..=8 {
+            slot.refresh.lock().await.retry_after = None;
+            cache
+                .refresh_repo_with(
+                    &repo,
+                    interval,
+                    Duration::from_secs(100),
+                    Instant::now() + interval,
+                )
+                .await;
+            let state = slot.refresh.lock().await;
+            assert_eq!(state.failures, failures);
+            let expected = if failures == 1 {
+                None
+            } else {
+                Some(Instant::now() + interval * (1 << (failures - 1).min(5)))
+            };
+            assert_eq!(state.retry_after, expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_first_failure_retries_in_the_next_round() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+        let interval = Duration::from_secs(10);
+        let token = CancellationToken::new();
+        let slot = cache.slot(&repo.name).await;
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            refresh_loop(interval, token.clone(), |deadline| {
+                let (cache, repo, slot, token) = (&cache, &repo, &slot, &token);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    cache
+                        .refresh_repo_with(repo, interval, Duration::from_secs(100), deadline)
+                        .await;
+                    if slot.refresh.lock().await.failures == 2 {
+                        token.cancel();
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("first failure must retry in round two");
+        assert_eq!(started.elapsed(), Duration::from_secs(23));
+        assert_eq!(slot.refresh.lock().await.failures, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_second_failure_waits_two_intervals() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, repo) = refresh_spawn_failure_fixture(root.path()).await;
+        let interval = Duration::from_secs(10);
+        let slot = cache.slot(&repo.name).await;
+        for _ in 0..2 {
+            cache
+                .refresh_repo_with(
+                    &repo,
+                    interval,
+                    Duration::from_secs(100),
+                    Instant::now() + interval,
+                )
+                .await;
+        }
+        let retry_after = slot.refresh.lock().await.retry_after.unwrap();
+        assert_eq!(retry_after, Instant::now() + interval * 2);
+        tokio::time::advance(interval).await;
+        cache
+            .refresh_repo_with(
+                &repo,
+                interval,
+                Duration::from_secs(100),
+                Instant::now() + interval,
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.failures, 2);
+        tokio::time::advance(interval).await;
+        cache
+            .refresh_repo_with(
+                &repo,
+                interval,
+                Duration::from_secs(100),
+                Instant::now() + interval,
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.failures, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_schedule_spaces_short_rounds_and_waits_for_overruns() {
+        for length in [3, 15] {
+            let token = CancellationToken::new();
+            let starts = Mutex::new(Vec::new());
+            let start = Instant::now();
+            refresh_loop(Duration::from_secs(10), token.clone(), |_| async {
+                starts.lock().await.push(Instant::now());
+                tokio::time::sleep(Duration::from_secs(length)).await;
+                if starts.lock().await.len() == 3 {
+                    token.cancel();
+                }
+            })
+            .await;
+            let starts = starts.lock().await;
+            assert_eq!(starts[0] - start, Duration::from_secs(10));
+            assert_eq!(starts[1] - starts[0], Duration::from_secs(length.max(10)));
+            assert_eq!(starts[2] - starts[1], Duration::from_secs(length.max(10)));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_disabled_creates_no_task_or_request_state_access() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = refresh_test_mirror(root.path(), "repo.git");
+        let mut cfg = test_config();
+        cfg.git_binary = "true".into();
+        let cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+        let slot = cache.slot(&repo.name).await;
+        let guard = slot.refresh.lock().await;
+        assert!(cache.start_refresh().is_none());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.ensure_fresh(&repo, true, b"", None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(guard.used.is_none());
+        assert_eq!(guard.failures, 0);
+        assert!(cache.owners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_unusable_settings_count_as_disabled() {
+        for (interval, concurrency) in [(3600, 0), (0, 1)] {
+            let mut cfg = test_config();
+            cfg.refresh = Some(RefreshConfig {
+                interval: Duration::from_secs(interval),
+                active_window: Duration::from_secs(1),
+                concurrency,
+            });
+            let cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+            assert!(cache.cfg.refresh.is_none());
+            assert!(cache.start_refresh().is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_round_deadline_drains_running_jobs_without_starting_waiters() {
+        let root = tempfile::tempdir().unwrap();
+        let candidates = ["new.git", "middle.git", "old.git"]
+            .map(|name| crate::repo::resolve(name, "https://example.com", root.path()).unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let start = Instant::now();
+        let token = CancellationToken::new();
+        refresh_round(
+            candidates,
+            2,
+            start + Duration::from_secs(10),
+            token.clone(),
+            |repo| {
+                let events = events.clone();
+                async move {
+                    events.lock().await.push((repo.name.clone(), false));
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    events.lock().await.push((repo.name, true));
+                }
+            },
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(15));
+        let events = events.lock().await;
+        assert_eq!(
+            &events[..2],
+            &[("new.git".into(), false), ("middle.git".into(), false)]
+        );
+        let mut completed = events[2..].to_vec();
+        completed.sort();
+        assert_eq!(
+            completed,
+            [("middle.git".into(), true), ("new.git".into(), true)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_round_short_jobs_start_in_order_with_bounded_concurrency() {
+        let root = tempfile::tempdir().unwrap();
+        let candidates = ["a.git", "b.git", "c.git"]
+            .map(|name| crate::repo::resolve(name, "https://example.com", root.path()).unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let start = Instant::now();
+        refresh_round(
+            candidates,
+            1,
+            start + Duration::from_secs(10),
+            CancellationToken::new(),
+            |repo| {
+                let events = events.clone();
+                async move {
+                    events.lock().await.push((repo.name, Instant::now()));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            },
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        let events = events.lock().await;
+        for (i, (name, when)) in events.iter().enumerate() {
+            assert_eq!(name, &["a.git", "b.git", "c.git"][i]);
+            assert_eq!(*when - start, Duration::from_secs(i as u64));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_lock_deadline_and_shutdown_leave_failure_state_unchanged() {
+        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let slot = cache.slot(&repo.name).await;
+        slot.refresh.lock().await.failures = 3;
+        let guard = slot.fetch_lock.lock().await;
+        let start = Instant::now();
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(100),
+                start + Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert_eq!(slot.refresh.lock().await.failures, 3);
+        cache.shutdown();
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(100),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.failures, 3);
+        drop(guard);
+        assert!(slot.fetch_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_success_shares_ttl_and_preserves_client_usage() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        std::fs::create_dir_all(&repo.cache_dir).unwrap();
+        std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+        let mut cfg = test_config();
+        cfg.git_binary = "true".into();
+        cfg.fetch_ttl = Duration::from_secs(60);
+        let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+        enable_refresh(&mut cache, 3600, 604800, 1);
+        let slot = cache.slot(&repo.name).await;
+        let used = Instant::now();
+        slot.refresh.lock().await.used = Some((repo.clone(), used));
+        slot.refresh.lock().await.failures = 3;
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(100),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert!(slot.fetch_lock.lock().await.is_some());
+        assert_eq!(slot.refresh.lock().await.used.as_ref().unwrap().1, used);
+        assert_eq!(slot.refresh.lock().await.failures, 0);
+        assert!(matches!(
+            cache.ensure_fresh(&repo, true, b"", None).await.unwrap(),
+            CacheOutcome::Cached
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_skips_inactive_missing_auth_blocked_and_backoff_repos() {
+        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let slot = cache.slot(&repo.name).await;
+        let used = Instant::now();
+        slot.refresh.lock().await.used = Some((repo.clone(), used));
+        tokio::time::advance(Duration::from_secs(11)).await;
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert!(!repo.cache_dir.exists());
+        assert_eq!(slot.refresh.lock().await.failures, 0);
+        slot.refresh.lock().await.used = Some((repo.clone(), Instant::now()));
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert!(!repo.cache_dir.exists());
+        std::fs::create_dir_all(&repo.cache_dir).unwrap();
+        std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+        slot.refresh.lock().await.auth_blocked = true;
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.failures, 0);
+        slot.refresh.lock().await.auth_blocked = false;
+        slot.refresh.lock().await.retry_after = Some(Instant::now() + Duration::from_secs(20));
+        cache
+            .refresh_repo_with(
+                &repo,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(slot.refresh.lock().await.failures, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_auth_mark_requires_server_credential_success() {
+        let mut cfg = test_config();
+        cfg.upstream_auth_header = Some("Authorization: server".into());
+        let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+        enable_refresh(&mut cache, 3600, 604800, 1);
+        let root = tempfile::tempdir().unwrap();
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
+        let slot = cache.slot(&repo.name).await;
+        {
+            let mut state = slot.refresh.lock().await;
+            state.auth_blocked = true;
+            state.failures = 4;
+            state.retry_after = Some(Instant::now() + Duration::from_secs(100));
+        }
+        cache
+            .record_fetch_success(&repo, Some("Authorization: client"))
+            .await;
+        {
+            let state = slot.refresh.lock().await;
+            assert!(state.auth_blocked);
+            assert_eq!(state.failures, 0);
+            assert!(state.retry_after.is_none());
+        }
+        cache.record_fetch_success(&repo, None).await;
+        assert!(!slot.refresh.lock().await.auth_blocked);
+        slot.refresh.lock().await.auth_blocked = true;
+        cache
+            .record_fetch_success(&repo, Some("Authorization: server"))
+            .await;
+        assert!(!slot.refresh.lock().await.auth_blocked);
+    }
 
     #[tokio::test]
     async fn missing_oids_drains_more_than_a_pipe_buffer() {
@@ -1355,6 +2575,7 @@ mod tests {
                 max_upload_packs: 0,
                 pack_threads: None,
                 pack_window_memory: None,
+                refresh: None,
             },
             Arc::new(Metrics::new()),
             None,
@@ -3007,6 +4228,7 @@ mod tests {
             max_upload_packs: 1,
             pack_threads: None,
             pack_window_memory: None,
+            refresh: None,
         }
     }
 
@@ -3044,9 +4266,91 @@ mod tests {
                 max_upload_packs: 1,
                 pack_threads: None,
                 pack_window_memory: None,
+                refresh: None,
             },
             Arc::new(Metrics::new()),
             None,
         )
+    }
+
+    impl GitCache {
+        /// `refresh_repo` with explicit settings, so a test can vary them per call.
+        /// The clone shares slots, metrics and the shutdown token with `self`; only
+        /// its private copy of the settings differs.
+        async fn refresh_repo_with(
+            &self,
+            repo: &RepoRef,
+            interval: Duration,
+            active_window: Duration,
+            deadline: Instant,
+        ) {
+            let mut cache = self.clone();
+            cache.cfg.refresh = Some(RefreshConfig {
+                interval,
+                active_window,
+                concurrency: 1,
+            });
+            cache.refresh_repo(repo, deadline).await;
+        }
+    }
+
+    fn enable_refresh(cache: &mut GitCache, interval: u64, active_window: u64, concurrency: usize) {
+        cache.cfg.refresh = Some(RefreshConfig {
+            interval: Duration::from_secs(interval),
+            active_window: Duration::from_secs(active_window),
+            concurrency,
+        });
+    }
+
+    #[derive(Clone, Default)]
+    struct RefreshLog(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for RefreshLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn refresh_test_mirror(root: &Path, name: &str) -> RepoRef {
+        let repo = crate::repo::resolve(name, "https://example.com", root).unwrap();
+        std::fs::create_dir_all(&repo.cache_dir).unwrap();
+        std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+        repo
+    }
+
+    async fn refresh_spawn_failure_fixture(root: &Path) -> (GitCache, RepoRef) {
+        let mut cfg = test_config();
+        cfg.git_binary = root.join("missing-git").to_str().unwrap().into();
+        let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root).unwrap();
+        std::fs::create_dir_all(&repo.cache_dir).unwrap();
+        std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+        enable_refresh(&mut cache, 3600, 604800, 1);
+        cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
+        (cache, repo)
+    }
+
+    #[cfg(unix)]
+    async fn refresh_fixture(root: &Path, script: &str) -> (GitCache, RepoRef) {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = root.join("git-wrapper");
+        write_test_script(&binary, &format!("#!/bin/sh\n{script}"));
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = test_config();
+        cfg.git_binary = binary.to_str().unwrap().into();
+        cfg.upstream_auth_header = Some("Authorization: server".into());
+        cfg.fetch_ttl = Duration::from_secs(60);
+        let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
+        let repo = crate::repo::resolve("repo.git", "https://example.com", root).unwrap();
+        std::fs::create_dir_all(&repo.cache_dir).unwrap();
+        std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
+        enable_refresh(&mut cache, 3600, 604800, 1);
+        cache.ensure_fresh(&repo, false, b"", None).await.unwrap();
+        (cache, repo)
     }
 }

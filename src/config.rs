@@ -3,9 +3,14 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
+
+use crate::git::RefreshConfig;
 
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -221,6 +226,30 @@ pub struct Config {
     #[arg(long, env = "GITCACHEPROXY_FETCH_TTL_SECONDS", default_value_t = 10)]
     pub fetch_ttl_seconds: u64,
 
+    /// Pause between refresh round starts; 0 disables background refresh.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_REFRESH_INTERVAL_SECONDS",
+        default_value_t = 0
+    )]
+    pub refresh_interval_seconds: u64,
+
+    /// Refresh only mirrors requested within this many seconds.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_REFRESH_ACTIVE_WINDOW_SECONDS",
+        default_value_t = 604800
+    )]
+    pub refresh_active_window_seconds: u64,
+
+    /// Maximum background fetches in flight when refresh is enabled.
+    #[arg(
+        long,
+        env = "GITCACHEPROXY_MAX_CONCURRENT_REFRESHES",
+        default_value_t = 4
+    )]
+    pub max_concurrent_refreshes: usize,
+
     /// Maximum number of requests handled concurrently, shared across all
     /// connections. Excess requests queue until a slot frees. This bounds the
     /// concurrent upstream clone/fetch work a burst can trigger (the slot is held
@@ -310,9 +339,46 @@ pub struct Config {
 
 fn parse_upstream_timeout(value: &str) -> Result<u64, String> {
     let seconds = value.parse::<u64>().map_err(|e| e.to_string())?;
-    crate::git::validate_upstream_timeout(std::time::Duration::from_secs(seconds))
+    crate::git::validate_upstream_timeout(Duration::from_secs(seconds))
         .map_err(|e| e.to_string())?;
     Ok(seconds)
+}
+
+impl Config {
+    /// Refresh settings, or `None` when `--refresh-interval-seconds` is 0.
+    pub fn refresh_config(&self) -> Option<RefreshConfig> {
+        (self.refresh_interval_seconds != 0).then(|| RefreshConfig {
+            interval: Duration::from_secs(self.refresh_interval_seconds),
+            active_window: Duration::from_secs(self.refresh_active_window_seconds),
+            concurrency: self.max_concurrent_refreshes,
+        })
+    }
+
+    /// Validate refresh options before starting background work.
+    pub fn validate_refresh(&self) -> Result<()> {
+        if self.refresh_interval_seconds != 0 {
+            if self.refresh_interval_seconds < 3600 {
+                bail!("--refresh-interval-seconds must be 0 or at least 3600");
+            }
+            let interval = Duration::from_secs(self.refresh_interval_seconds);
+            if interval
+                .checked_mul(32)
+                .and_then(|delay| Instant::now().checked_add(delay))
+                .is_none()
+            {
+                bail!(
+                    "--refresh-interval-seconds and its maximum backoff must fit in a monotonic deadline"
+                );
+            }
+            if self.refresh_active_window_seconds == 0 {
+                bail!("--refresh-active-window-seconds must be at least 1 when refresh is enabled");
+            }
+            if self.max_concurrent_refreshes == 0 {
+                bail!("--max-concurrent-refreshes must be at least 1");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
