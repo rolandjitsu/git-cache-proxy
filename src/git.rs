@@ -640,17 +640,16 @@ impl GitCache {
             .stderr(Stdio::null())
             .spawn()
             .context("spawn git update-ref --stdin")?;
-        child
-            .stdin
-            .take()
-            .context("update-ref: no stdin")?
-            .write_all(deletions.as_bytes())
-            .await
-            .context("write update-ref deletions")?;
+        let mut stdin = child.stdin.take().context("update-ref: no stdin")?;
+        let written = stdin.write_all(deletions.as_bytes()).await;
+        drop(stdin); // EOF so update-ref commits the transaction
         let status = child.wait().await.context("git update-ref --stdin")?;
+        // Report the exit status first: a child that fails early closes its
+        // stdin, so the write error is only a symptom of that failure.
         if !status.success() {
             bail!("git update-ref --stdin failed for {}", repo.name);
         }
+        written.context("write update-ref deletions")?;
         tracing::info!(
             repo = %repo.name,
             pruned = refs.len() - self.cfg.max_wants,
@@ -1898,6 +1897,33 @@ mod tests {
             assert!(error.to_string().contains(&repo.name), "{error}");
             assert_eq!(git_test_command(&repo.cache_dir, &["show-ref"]), before);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_wants_reports_exit_status_when_update_ref_stops_reading() {
+        let (dir, repo, oids) = wanted_oids_fixture();
+        // Loose refs written directly: the deletion list must exceed any pipe
+        // buffer so the write blocks until the child exits and fails.
+        git_test_command(&repo.cache_dir, &["fetch", "-q", "origin", &oids[0]]);
+        let pins = repo.cache_dir.join(PROXY_WANTS_NS);
+        std::fs::create_dir_all(&pins).unwrap();
+        for i in 0..600 {
+            std::fs::write(pins.join(format!("{i:0>200}")), format!("{}\n", oids[0])).unwrap();
+        }
+        let binary = write_failing_git(
+            dir.path(),
+            "if [ \"$1\" = update-ref ]; then exit 7; fi\nexec git \"$@\"\n",
+        );
+        let mut cache = upload_pack_test_cache(binary.to_str().unwrap());
+        cache.cfg.max_wants = 1;
+        let error = cache.prune_wants(&repo).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("git update-ref --stdin failed for repo.git"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
