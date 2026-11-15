@@ -21,6 +21,9 @@ Every flag has an environment-variable equivalent.
 | `--auth-allow-http`      | `GITCACHEPROXY_AUTH_ALLOW_HTTP`      | `false`                      | Provider modes: accept a plain `http://` validation endpoint, which sends client credentials in cleartext |
 | `--upstream-timeout-seconds` | `GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS` | `3600`                     | Total seconds per upstream clone, full-ref fetch or SHA backfill, including all attempts and retry delays (must be positive) |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
+| `--refresh-interval-seconds` | `GITCACHEPROXY_REFRESH_INTERVAL_SECONDS` | `0` | Background refresh round spacing; 0 disables it, otherwise at least 3600 |
+| `--refresh-active-window-seconds` | `GITCACHEPROXY_REFRESH_ACTIVE_WINDOW_SECONDS` | `604800` | Only refresh mirrors requested within this window; at least 1 when enabled |
+| `--max-concurrent-refreshes` | `GITCACHEPROXY_MAX_CONCURRENT_REFRESHES` | `4` | Maximum background fetches in flight; at least 1 when enabled |
 | `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
 | `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
@@ -35,6 +38,18 @@ Every flag has an environment-variable equivalent.
 
 Endpoints: `/healthz`, `/readyz`, `/metrics` (see [Metrics](./metrics.md)).
 
+
+## Periodic refresh
+
+Refresh is disabled by default. Set `--refresh-interval-seconds` to at least
+3600 to enable it: the first round starts after one interval and refreshes
+mirrors requested within `--refresh-active-window-seconds`, at most
+`--max-concurrent-refreshes` at a time. The window and concurrency settings
+have no effect when disabled. The interval and its maximum backoff must fit in
+a monotonic deadline. Refresh never clones a missing mirror, and request usage
+is kept in memory only, so it resets on restart. See
+[Background refresh](./architecture.md#background-refresh) for scheduling,
+credential, and failure behavior.
 
 ## Reusing a cache after changing upstream
 

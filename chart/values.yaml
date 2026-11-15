@@ -83,6 +83,13 @@ config:
   fetchTtlSeconds: 10
   # Total upstream command budget, including retries (positive seconds).
   upstreamTimeoutSeconds: 3600
+  # Background refresh of recently requested mirrors: seconds between rounds.
+  # 0 = disabled; otherwise at least 3600.
+  refreshIntervalSeconds: 0
+  # Refresh only mirrors requested within this many seconds (at least 1).
+  refreshActiveWindowSeconds: 604800
+  # Max background fetches in flight (at least 1). Used only when refresh is on.
+  maxConcurrentRefreshes: 4
   # Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle
   # mirrors when exceeded. 0 = unlimited (no eviction). Set this whenever the
   # cache volume is bounded.

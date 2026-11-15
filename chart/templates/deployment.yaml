@@ -1,6 +1,9 @@
 {{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.config.upstreamTimeoutSeconds))) (le (int64 .Values.config.upstreamTimeoutSeconds) 0) }}
 {{- fail "config.upstreamTimeoutSeconds must be a positive integer" }}
 {{- end }}
+{{- if or (not (regexMatch "^[0-9]+$" (toString .Values.config.refreshIntervalSeconds))) (and (ne (int64 .Values.config.refreshIntervalSeconds) 0) (lt (int64 .Values.config.refreshIntervalSeconds) 3600)) }}
+{{- fail "config.refreshIntervalSeconds must be 0 or an integer of at least 3600" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -68,6 +71,12 @@ spec:
               value: /var/cache/git-cache-proxy
             - name: GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS
               value: {{ .Values.config.upstreamTimeoutSeconds | quote }}
+            - name: GITCACHEPROXY_REFRESH_INTERVAL_SECONDS
+              value: {{ .Values.config.refreshIntervalSeconds | quote }}
+            - name: GITCACHEPROXY_REFRESH_ACTIVE_WINDOW_SECONDS
+              value: {{ .Values.config.refreshActiveWindowSeconds | quote }}
+            - name: GITCACHEPROXY_MAX_CONCURRENT_REFRESHES
+              value: {{ .Values.config.maxConcurrentRefreshes | quote }}
             - name: GITCACHEPROXY_FETCH_TTL_SECONDS
               value: {{ .Values.config.fetchTtlSeconds | quote }}
             - name: GITCACHEPROXY_CACHE_MAX_MB

@@ -349,6 +349,7 @@ fn state(auth: Arc<Auth>) -> AppState {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

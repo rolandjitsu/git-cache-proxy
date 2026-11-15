@@ -273,6 +273,7 @@ async fn client_state(base: &str) -> AppState {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let auth =
         Arc::new(Auth::build(helpers::github_auth_config(base, 0), metrics.clone()).unwrap());

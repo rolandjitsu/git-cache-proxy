@@ -306,6 +306,7 @@ exec git "$@"
                 max_upload_packs: 0,
                 pack_threads: None,
                 pack_window_memory: None,
+                refresh: None,
             },
             Arc::new(Metrics::new()),
             None,

@@ -124,10 +124,9 @@ Working and end-to-end tested on both Git wire protocol versions - **v2**
 clone, incremental fetch, and push rejection. **git-LFS** is cached too (batch
 API proxied; objects stored content-addressed and integrity-checked).
 
-Not yet implemented:
-
-- A background/scheduled refresh (today every `info/refs` triggers an on-demand,
-  TTL-coalesced fetch).
+Optional background refresh of recently used mirrors is available with
+`--refresh-interval-seconds` (default `0`, disabled; minimum enabled value
+`3600`). See [Configuration](docs/configuration.md#periodic-refresh).
 
 **Non-goal: a git-free image.** The `git` binary is a permanent runtime
 dependency: the proxy serves clients by running `git upload-pack`, and no

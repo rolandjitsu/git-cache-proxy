@@ -69,6 +69,7 @@ async fn reused_mirror_fetches_configured_upstream_for_refs_and_missing_sha() {
             max_upload_packs: 0,
             pack_threads: None,
             pack_window_memory: None,
+            refresh: None,
         },
         metrics.clone(),
         None,
@@ -167,6 +168,7 @@ async fn upload_pack_decodes_gzip_encoded_request() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -296,6 +298,7 @@ async fn serves_want_by_sha_for_unadvertised_pull_ref() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -433,6 +436,7 @@ async fn want_by_sha_fetch_failure_is_recorded_and_degrades_gracefully() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -566,6 +570,7 @@ async fn want_by_sha_pins_are_capped_per_mirror() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
@@ -711,6 +716,7 @@ async fn caps_want_by_sha_fetch_within_a_single_request() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -806,6 +812,7 @@ async fn want_by_sha_pins_are_unlimited_when_max_wants_is_zero() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -888,6 +895,7 @@ async fn want_by_sha_tolerates_object_check_failure() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let gitcache = GitCache::new(cfg, metrics, None);
     let upstream_base = format!("file://{}", up.path().display());
@@ -952,6 +960,7 @@ async fn clones_through_proxy_serves_all_refs_and_rejects_push() {
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     // Eviction enabled with an effectively unbounded cap: no mirror is ever
     // evicted, but the on-request index bookkeeping (touch on serve, mark-changed
@@ -1533,6 +1542,7 @@ async fn upload_pack_cap_holds_a_slot_until_the_process_exits() {
             max_upload_packs: 1,
             pack_threads: None,
             pack_window_memory: None,
+            refresh: None,
         },
         Arc::new(Metrics::new()),
         None,
@@ -1604,6 +1614,7 @@ async fn upload_pack_runs_with_pack_options() {
             max_upload_packs: 0,
             pack_threads: Some(2),
             pack_window_memory: Some("64m".into()),
+            refresh: None,
         },
         Arc::new(Metrics::new()),
         None,
@@ -1727,6 +1738,7 @@ async fn start_proxy_with_auth(
         max_upload_packs: 0,
         pack_threads: None,
         pack_window_memory: None,
+        refresh: None,
     };
     let state = AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),

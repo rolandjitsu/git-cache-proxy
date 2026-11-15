@@ -22,6 +22,7 @@ use git_cache_proxy::{auth, evict, git, lfs, metrics, repo, server};
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let cfg = Config::parse();
+    cfg.validate_refresh()?;
     // Hold the non-blocking writer's guard for the whole process; its drop flushes
     // any buffered log lines on exit.
     let _log_guard = init_tracing(&cfg.log, cfg.log_format);
@@ -69,6 +70,7 @@ async fn main() -> Result<()> {
         max_upload_packs: cfg.max_concurrent_upload_packs,
         pack_threads: cfg.pack_threads,
         pack_window_memory: cfg.pack_window_memory.clone(),
+        refresh: cfg.refresh_config(),
     };
 
     let metrics = Arc::new(metrics::Metrics::new());
@@ -164,6 +166,8 @@ async fn main() -> Result<()> {
         cfg.cache_root.display(),
     );
 
+    let refresher = cache.start_refresh();
+
     let shutdown_cache = cache.clone();
     axum::serve(listener, server::router(state))
         .with_graceful_shutdown(async move {
@@ -174,6 +178,9 @@ async fn main() -> Result<()> {
         .context("http server")?;
 
     cache.wait_for_shutdown().await;
+    if let Some(handle) = refresher {
+        handle.await.context("join refresh task")?;
+    }
 
     // The server has drained; stop the evictor and wait for it to finish any
     // in-progress eviction before exiting.
