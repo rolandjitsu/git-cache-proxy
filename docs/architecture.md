@@ -114,6 +114,31 @@ linked. Cached objects share the `--cache-max-mb` budget and LRU eviction with t
 git mirrors. No configuration is needed: LFS is served on the same endpoints the git
 client already routes through the proxy.
 
+### Stale serving
+
+With `--max-stale-seconds` set, the TTL-expired path changes from "fetch, then
+serve" to "serve, and fetch in the background" (see
+[Stale serving](./configuration.md#stale-serving) for the knobs).
+
+- A request checks the mirror's age. Within the bound it serves from the mirror
+  and, if the TTL has passed, starts one coalesced background fetch. Past the
+  bound it waits for a clone or fetch, which must finish within the bound.
+- Age is the start of the last successful full-ref refresh, persisted in
+  `proxy-refresh.json` so a restart does not reset it. The record is trusted only
+  when it matches the repository, configured upstream and directory identity;
+  directory mtime is not evidence of success. A failed refresh or a SHA-only
+  backfill never renews age.
+- Body decoding, freshness inspection, mandatory upstream work and local delivery
+  admit through separate lanes, so slow upstream work cannot take every local
+  slot. A full lane returns 503 rather than queueing another expensive owner.
+- An upload that waited for a slot rechecks identity and age right before Git
+  starts. A stream already started may finish after the refs expire.
+- Fetch-triggered automatic maintenance is disabled so a refresh does not delete
+  objects just advertised. Active requests are protected from eviction until their
+  Git process exits, but nothing pins an object between an advertisement and the
+  following upload-pack, so eviction or external maintenance in that gap can
+  remove it. A missing SHA is fetched on demand when upstream allows it.
+
 ### Cache management
 
 The cache is self-managing. Mirrors are created on first request, and with

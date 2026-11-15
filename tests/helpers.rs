@@ -21,6 +21,36 @@ use git_cache_proxy::auth::AuthConfig;
 use git_cache_proxy::config::AuthProvider;
 use tokio::sync::{Mutex, Notify};
 
+/// Write an executable script that can be spawned right away. While this file is
+/// open for writing, a fork on another test thread inherits the descriptor until
+/// it execs, and spawning the script fails with ETXTBSY. Probe until the file is
+/// no longer busy; the script is guarded to exit early under the probe.
+#[cfg(unix)]
+pub fn write_script(path: &std::path::Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let (shebang, rest) = script.split_once('\n').unwrap();
+    std::fs::write(
+        path,
+        format!("{shebang}\n[ -n \"$SCRIPT_PROBE\" ] && exit 0\n{rest}"),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    loop {
+        match std::process::Command::new(path)
+            .env("SCRIPT_PROBE", "1")
+            .status()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => {
+                result.unwrap();
+                return;
+            }
+        }
+    }
+}
+
 /// The signing key the test replicas share, long enough for HMAC-SHA256.
 pub const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
 

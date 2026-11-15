@@ -78,6 +78,8 @@ Every flag has an environment-variable equivalent; the full reference is in
   to upstream.
 - `--serve-token` / `--auth-provider`: how clients authenticate to the proxy.
 - `--cache-max-mb`: cap on-disk cache size (LRU eviction; `0` = unlimited).
+- `--max-stale-seconds`: opt in to serving cached refs while a background fetch
+  refreshes them (see [Stale serving](./docs/configuration.md#stale-serving)).
 
 ## Metrics
 
@@ -129,8 +131,7 @@ Pin a version and try it against your own setup before relying on it.
 
 Not yet implemented:
 
-- A background/scheduled refresh (today every `info/refs` triggers an on-demand,
-  TTL-coalesced fetch).
+- Scheduled refresh. Background refresh is triggered by requests.
 
 **Non-goal: a git-free image.** The `git` binary is a permanent runtime
 dependency: the proxy serves clients by running `git upload-pack`, and no

@@ -187,6 +187,10 @@ explicit before you expose it:
   Each junk credential still costs one call, and failed logins count against
   the proxy's egress IP at the git host: rate-limit unauthenticated clients at
   the ingress.
+- **Stale serving exposes unreachable objects.** With `--max-stale-seconds` set,
+  a client that can read a mirror can request any object already in it by SHA,
+  including one no longer reachable from an advertised ref (for example after a
+  force-push or branch deletion upstream), until it is garbage collected or the mirror is evicted.
 - **Read-only.** Only `git-upload-pack` (clone/fetch) is served; `git-receive-pack`
   (push) is refused and upstream is only ever pulled from, never written.
 

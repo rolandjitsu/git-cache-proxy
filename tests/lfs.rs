@@ -292,6 +292,59 @@ async fn batch_upstream_failure_returns_bad_gateway() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn object_download_does_not_take_request_body_admission() {
+    // Stale mode bounds request bodies; an object download has none, so it must
+    // not be refused while that lane is full.
+    let (addr, _batches) = spawn_upstream(Mode::Ok).await;
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let mut state = proxy_state(addr, cache.path(), metrics.clone());
+    let git = GitCache::new(
+        GitConfig {
+            git_binary: "git".into(),
+            upstream_auth_header: None,
+            big_file_threshold: "8m".into(),
+            fetch_ttl: Duration::from_secs(10),
+            max_wants: 100,
+            max_upload_packs: 0,
+            pack_threads: None,
+            pack_window_memory: None,
+        },
+        metrics,
+        None,
+    )
+    .with_stale(Duration::from_secs(60), 1)
+    .with_request_limit(1);
+    let _full = git.body_permit().unwrap();
+    state.cache = Arc::new(git);
+    let oid = oid_of(PAYLOAD);
+
+    let resp = router(state.clone())
+        .oneshot(
+            Request::get(format!(
+                "/{REPO}/info/lfs/objects/{oid}?size={}",
+                PAYLOAD.len()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router(state)
+        .oneshot(
+            Request::post(format!("/{REPO}/info/lfs/objects/batch"))
+                .header(header::HOST, "proxy.test:8080")
+                .body(Body::from(batch_body(&oid, PAYLOAD.len())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 // --- test helpers --------------------------------------------------------
 
 const REPO: &str = "group/repo.git";

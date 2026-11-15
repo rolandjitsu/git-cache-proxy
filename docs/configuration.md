@@ -20,7 +20,9 @@ Every flag has an environment-variable equivalent.
 | `--auth-max-concurrent`  | `GITCACHEPROXY_AUTH_MAX_CONCURRENT`  | `32`                         | Max token-validation requests in flight; a check waits up to `--auth-timeout-seconds` for a slot, then fails with 503 (`0` = unlimited) |
 | `--auth-allow-http`      | `GITCACHEPROXY_AUTH_ALLOW_HTTP`      | `false`                      | Provider modes: accept a plain `http://` validation endpoint, which sends client credentials in cleartext |
 | `--fetch-ttl-seconds`    | `GITCACHEPROXY_FETCH_TTL_SECONDS`    | `10`                         | Skip upstream fetch if the last one started within this window (`0` = always fetch) |
-| `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Max concurrent in-flight requests; excess queue (`0` = unlimited)              |
+| `--max-stale-seconds` | `GITCACHEPROXY_MAX_STALE_SECONDS` | `0` | Maximum age of cached refs served during background refresh (`0` = disabled) |
+| `--max-background-fetches` | `GITCACHEPROXY_MAX_BACKGROUND_FETCHES` | `4` | Maximum concurrent background refreshes (at least `1`) |
+| `--max-concurrent-requests` | `GITCACHEPROXY_MAX_CONCURRENT_REQUESTS` | `64`                    | Request capacity: strict mode queues; stale mode isolates local and upstream work and rejects overload (see [Stale serving](#stale-serving) for `0`)              |
 | `--max-concurrent-upload-packs` | `GITCACHEPROXY_MAX_CONCURRENT_UPLOAD_PACKS` | `0`            | Max concurrent `git upload-pack` processes, held until each exits; bounds `pack-objects` memory. Clones waiting for a slot hold a `--max-concurrent-requests` slot (`0` = unlimited) |
 | `--max-decoded-body-mb`  | `GITCACHEPROXY_MAX_DECODED_BODY_MB`  | `512`                        | Cap on a decoded upload-pack request body, in MiB (bounds memory / gzip bombs) |
 | `--cache-max-mb`         | `GITCACHEPROXY_CACHE_MAX_MB`         | `0`                          | Cap on total on-disk mirror cache, in MiB; evicts least-recently-used idle mirrors when exceeded (`0` = unlimited, no eviction) |
@@ -43,3 +45,28 @@ their recorded `origin` URL is not rewritten. Normal fetch TTL rules still apply
 Old cached objects and local want-by-SHA pins remain and can still be served.
 Changing the fetch URL is not a security-domain migration. When switching trust
 domains, use a fresh or separate cache root, including for LFS objects.
+
+## Stale serving
+
+By default a request after the fetch TTL waits for an upstream fetch. With a
+positive `--max-stale-seconds`, an existing mirror serves its cached refs
+instead, while at most one background fetch per repository updates it. A cold
+mirror still needs a complete clone first.
+
+- **Age** is measured from the start of the last successful clone or fetch. Past
+  `--max-stale-seconds` a request waits for a refresh, or fails if that fails.
+- **Restarts** keep the age: a successful full-ref refresh records its start time
+  in `proxy-refresh.json` inside the mirror. A missing, invalid, oversized or
+  future-dated record, or one that does not match the repository, upstream and
+  mirror directory, forces a refresh. This assumes a correct wall clock across
+  downtime and one proxy process per cache root.
+- **Retries**: background attempts are limited globally by
+  `--max-background-fetches` and retried no sooner than the fetch TTL, or one
+  second, after the previous attempt completes.
+- **Overload**: `--max-concurrent-requests` bounds body decoding, freshness
+  inspection and local serving in separate lanes. Mandatory upstream work has at
+  most `max(1, N - 1)` slots for limit `N`; with `N = 0` only that lane stays
+  bounded, by `--max-background-fetches`. A full lane returns 503 instead of
+  queueing. The strict default keeps its queueing behavior.
+
+See [Architecture](./architecture.md#stale-serving) for how a request is handled.
