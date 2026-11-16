@@ -91,6 +91,20 @@ scoped to a single mirror's pins). If a single request needs more new SHAs than
 would immediately have its pins pruned anyway, so raise `--max-wants` if you expect
 that many unadvertised objects at once.
 
+When serving client clone/fetch requests, the proxy writes negotiation input
+to local git upload-pack while streaming its response to the client.
+Writing the request has a five-minute deadline. The operation also stops
+after 30 minutes without reading response data from Git, including during
+pack generation. Each read resets this inactivity deadline. Once the request
+is written, active transfers have no total duration limit.
+
+These fixed limits are separate from upstream retries. Cancellation, pipe
+errors and timeouts trigger subprocess cleanup. Failures after response
+headers are sent terminate the response body. On Unix targets with
+`waitid(NOWAIT)`, leader exit is observed independently of stdout EOF and
+remaining group members are stopped before the leader is reaped. Other
+targets wait for request completion and stdout EOF before observing exit.
+
 ### git-LFS
 
 LFS objects use a different HTTP API from the git protocol, so they are cached
