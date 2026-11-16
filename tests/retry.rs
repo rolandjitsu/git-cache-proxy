@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Real local Git operations with deterministic injected upstream failures.
+//! Real local Git operations with injected upstream failures.
+//! Keep real time while child processes run; a paused clock can expire the total
+//! operation deadline before the operating system schedules a child.
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -12,7 +14,7 @@ use git_cache_proxy::git::{CacheOutcome, GitCache, GitConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::repo::{RepoRef, resolve};
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn clone_retries_tls_eof_and_removes_partial_staging() {
     let f = Fixture::new();
     f.fail(
@@ -41,7 +43,7 @@ async fn clone_retries_tls_eof_and_removes_partial_staging() {
     assert_eq!(2, f.attempts("clone"));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn fetch_retries_http_503_and_keeps_the_mirror() {
     let f = Fixture::new();
     f.seed_mirror();
@@ -59,7 +61,7 @@ async fn fetch_retries_http_503_and_keeps_the_mirror() {
     assert!(f.repo.cache_dir.join("HEAD").exists());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn retries_are_bounded_and_failure_does_not_refresh_ttl() {
     for op in ["clone", "fetch"] {
         let f = Fixture::new();
@@ -83,7 +85,7 @@ async fn retries_are_bounded_and_failure_does_not_refresh_ttl() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn permanent_errors_are_not_retried() {
     for op in ["clone", "fetch"] {
         for message in [
@@ -114,7 +116,7 @@ async fn permanent_errors_are_not_retried() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn concurrent_clients_share_one_retry_sequence() {
     let f = Fixture::new();
     f.fail(
@@ -144,7 +146,7 @@ async fn concurrent_clients_share_one_retry_sequence() {
     assert_eq!(2, f.attempts("clone"));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn waiter_behind_a_slow_fetch_refetches_once_the_ttl_has_passed() {
     // TTL is measured from the start of a fetch, the moment it reads upstream.
     // Three retries take 7s, so a caller queued behind them sees stale refs.
@@ -160,7 +162,7 @@ async fn waiter_behind_a_slow_fetch_refetches_once_the_ttl_has_passed() {
     assert_eq!(5, f.attempts("fetch"));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn noisy_stderr_is_drained_and_not_exposed_in_errors() {
     let f = Fixture::new();
     let message = format!(
@@ -177,6 +179,67 @@ async fn noisy_stderr_is_drained_and_not_exposed_in_errors() {
     assert_eq!(4, f.attempts("clone"));
     assert!(!error.contains("private-upstream-diagnostic"));
     assert!(error.contains("TLS connection interrupted"));
+}
+
+#[tokio::test]
+async fn sha_backfill_propagates_auth_but_preserves_best_effort_failure() {
+    for (message, auth) in [
+        ("fatal: Authentication failed", true),
+        ("fatal: not our ref", false),
+    ] {
+        let f = Fixture::new();
+        f.seed_mirror();
+        f.fail("fetch", 10, message);
+        let result = f
+            .cache
+            .ensure_fresh(
+                &f.repo,
+                false,
+                b"0032want 1111111111111111111111111111111111111111\n0000",
+                None,
+            )
+            .await;
+        if auth {
+            assert!(git_cache_proxy::git::is_auth_failure(&result.unwrap_err()));
+        } else {
+            assert!(matches!(result.unwrap(), CacheOutcome::Cached));
+        }
+        assert_eq!(f.attempts("fetch"), 1);
+    }
+}
+
+#[tokio::test]
+async fn dropped_request_cancels_owner_and_releases_repository_lock() {
+    let f = Fixture::new();
+    std::fs::write(f.root.path().join("stall-clone"), "").unwrap();
+    let ready = f.root.path().join("ready-clone");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&ready)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let cache = f.cache.clone();
+    let repo = f.repo.clone();
+    let request = tokio::spawn(async move { cache.ensure_fresh(&repo, true, b"", None).await });
+    tokio::time::timeout(Duration::from_secs(5), tokio::fs::read_to_string(ready))
+        .await
+        .unwrap()
+        .unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    std::fs::remove_file(f.root.path().join("stall-clone")).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        f.cache.ensure_fresh(&f.repo, true, b"", None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(result, CacheOutcome::Cloned));
+    f.cache.shutdown();
+    f.cache.wait_for_shutdown().await;
 }
 
 struct Fixture {
@@ -202,7 +265,11 @@ impl Fixture {
 set -eu
 base=$(dirname "$0")
 op=$1
-test "$LC_ALL" = C
+if test -e "$base/stall-$op"; then
+    echo ready > "$base/ready-$op"
+    sleep 30
+fi
+case "$op" in clone|fetch) test "$LC_ALL" = C ;; esac
 count=0
 test ! -f "$base/count-$op" || count=$(cat "$base/count-$op")
 count=$((count + 1))
