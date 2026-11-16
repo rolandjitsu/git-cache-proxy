@@ -3,6 +3,14 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.13 (2026-11-16)
+
+### Fixes
+
+- drain upload-pack stdout while writing
+- stop inheriting stdin in git commands
+- report update-ref status on early exit
+
 ## 0.2.12 (2026-11-16)
 
 ### Features
