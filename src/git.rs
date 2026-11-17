@@ -39,7 +39,7 @@ use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::metrics::{Metrics, ServeKind, Status, UpstreamOp};
+use crate::metrics::{Metrics, RefreshResult, ServeKind, Status, UpstreamOp};
 use crate::repo::RepoRef;
 
 /// Reserved ref namespace for objects fetched by bare SHA on a want-miss.
@@ -280,7 +280,8 @@ impl GitCache {
                 let cache = &cache;
                 async move {
                     let candidates = cache.refresh_candidates().await;
-                    refresh_round(
+                    let total = candidates.len();
+                    let started = refresh_round(
                         candidates.into_iter().map(|(repo, _)| repo),
                         concurrency,
                         deadline,
@@ -293,6 +294,13 @@ impl GitCache {
                         },
                     )
                     .await;
+                    // Candidates the round never reached would otherwise be invisible.
+                    let unstarted = total - started;
+                    if unstarted > 0 && !cache.shutdown.is_cancelled() {
+                        cache
+                            .metrics
+                            .record_refresh(RefreshResult::Skipped, unstarted as u64);
+                    }
                 }
             })
             .await;
@@ -332,13 +340,15 @@ impl GitCache {
         let mut last = tokio::select! {
             biased;
             _ = self.shutdown.cancelled() => return,
-            _ = tokio::time::sleep_until(deadline) => return,
+            _ = tokio::time::sleep_until(deadline) => {
+                self.metrics.record_refresh(RefreshResult::Skipped, 1);
+                return;
+            }
             guard = slot.fetch_lock.lock() => guard,
         };
-        {
+        let skip = {
             let state = slot.refresh.lock().await;
-            if Instant::now() >= deadline
-                || self.shutdown.is_cancelled()
+            Instant::now() >= deadline
                 || state.auth_blocked
                 || state.retry_after.is_some_and(|t| t > Instant::now())
                 || state
@@ -349,31 +359,37 @@ impl GitCache {
                 || last.is_some_and(|t| {
                     !self.cfg.fetch_ttl.is_zero() && t.elapsed() < self.cfg.fetch_ttl
                 })
-            {
-                return;
-            }
+        };
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        if skip {
+            self.metrics.record_refresh(RefreshResult::Skipped, 1);
+            return;
         }
         let started = Instant::now();
         let mut worker = self.clone();
         worker.shutdown = self.shutdown.child_token();
         let cancel = worker.shutdown.clone();
-        let fetch = worker.fetch(repo, None);
+        let preempt = CancellationToken::new();
+        let fetch = worker.fetch_inner(repo, None, Some(&preempt));
         tokio::pin!(fetch);
-        let mut preempted = false;
         // Cancel rather than drop the fetch so its child is still killed and reaped.
         let result = tokio::select! {
             result = &mut fetch => result,
             _ = evict_requested.changed() => {
-                preempted = true;
+                preempt.cancel();
                 cancel.cancel();
                 fetch.await
             }
         };
-        if preempted {
+        if preempt.is_cancelled() {
+            self.metrics.record_refresh(RefreshResult::Preempted, 1);
             return;
         }
         match result {
             Ok(()) => {
+                self.metrics.record_refresh(RefreshResult::Ok, 1);
                 *last = Some(started);
                 if let Some(index) = &self.index {
                     index.mark_dirty(&repo.name);
@@ -384,8 +400,17 @@ impl GitCache {
                     return;
                 }
                 tracing::warn!(repo = %repo.name, error = %error, "background refresh failed");
+                let auth_rejected = is_auth_failure(&error);
+                self.metrics.record_refresh(
+                    if auth_rejected {
+                        RefreshResult::AuthRejected
+                    } else {
+                        RefreshResult::Error
+                    },
+                    1,
+                );
                 let mut state = slot.refresh.lock().await;
-                state.auth_blocked |= is_auth_failure(&error);
+                state.auth_blocked |= auth_rejected;
                 state.failures = state.failures.saturating_add(1);
                 let multiplier = 1u32 << state.failures.saturating_sub(1).min(5);
                 state.retry_after = if state.failures == 1 {
@@ -703,6 +728,17 @@ impl GitCache {
     }
 
     async fn fetch(&self, repo: &RepoRef, cred: Option<&str>) -> Result<()> {
+        self.fetch_inner(repo, cred, None).await
+    }
+
+    /// `preempt` is cancelled when an eviction, not a failure, stops the fetch; that
+    /// cancellation must not inflate the upstream error count.
+    async fn fetch_inner(
+        &self,
+        repo: &RepoRef,
+        cred: Option<&str>,
+        preempt: Option<&CancellationToken>,
+    ) -> Result<()> {
         tracing::debug!(repo = %repo.name, "fetching updates from upstream");
         // A reused mirror can still record an older upstream in origin.
         let started = Instant::now();
@@ -726,8 +762,10 @@ impl GitCache {
         )
         .await
         {
-            self.metrics
-                .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
+            if !preempt.is_some_and(CancellationToken::is_cancelled) {
+                self.metrics
+                    .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
+            }
             return Err(error);
         }
         self.metrics
@@ -1582,10 +1620,12 @@ async fn refresh_round<F, Fut>(
     deadline: Instant,
     shutdown: CancellationToken,
     fetch: F,
-) where
+) -> usize
+where
     F: Fn(RepoRef) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    let mut started = 0;
     let mut jobs = tokio::task::JoinSet::new();
     for repo in candidates {
         if jobs.len() == concurrency
@@ -1597,12 +1637,14 @@ async fn refresh_round<F, Fut>(
             break;
         }
         jobs.spawn(fetch(repo));
+        started += 1;
     }
     while let Some(result) = jobs.join_next().await {
         if let Err(error) = result {
             tracing::warn!(%error, "background refresh job failed");
         }
     }
+    started
 }
 
 #[cfg(test)]
@@ -1900,6 +1942,7 @@ mod tests {
         cache
             .refresh_repo(&repo, Instant::now() + Duration::from_secs(10))
             .await;
+        assert_eq!(refresh_count(&cache, "ok"), 0);
         assert!(!repo.cache_dir.exists());
     }
 
@@ -2036,6 +2079,14 @@ mod tests {
         let state = slot.refresh.lock().await;
         assert_eq!(state.failures, 0);
         assert!(!state.auth_blocked);
+        assert_eq!(refresh_count(&cache, "preempted"), 1);
+        assert!(
+            !cache
+                .metrics
+                .gather()
+                .contains(r#"upstream_ops_total{op="fetch",repo="-",result="error"}"#),
+            "an eviction must not count as an upstream error"
+        );
     }
 
     #[cfg(unix)]
@@ -2142,6 +2193,13 @@ mod tests {
             }
             assert!(!state.auth_blocked);
         }
+        assert_eq!(refresh_count(&cache, "error"), 8);
+        assert!(
+            cache
+                .metrics
+                .gather()
+                .contains(r#"upstream_ops_total{op="fetch",repo="-",result="error"} 8"#)
+        );
         cache.cfg.git_binary = "true".into();
         cache
             .ensure_fresh(&repo, true, b"", Some("Authorization: client"))
@@ -2164,6 +2222,7 @@ mod tests {
             .await;
         assert!(slot.refresh.lock().await.auth_blocked);
         assert_eq!(slot.refresh.lock().await.failures, 1);
+        assert_eq!(refresh_count(&cache, "auth_rejected"), 1);
         cache
             .refresh_repo_with(
                 &repo,
@@ -2173,6 +2232,8 @@ mod tests {
             )
             .await;
         assert_eq!(slot.refresh.lock().await.failures, 1);
+        assert_eq!(refresh_count(&cache, "skipped"), 1);
+        assert_eq!(refresh_count(&cache, "error"), 8);
         cache.cfg.git_binary = "true".into();
         cache
             .ensure_fresh(&repo, true, b"", Some("Authorization: client"))
@@ -2323,6 +2384,34 @@ mod tests {
         assert!(cache.owners.is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn refresh_counts_candidates_the_round_deadline_never_started() {
+        let mut cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let root = tempfile::tempdir().unwrap();
+        let older = crate::repo::resolve("older.git", "https://example.com", root.path()).unwrap();
+        let newer = crate::repo::resolve("newer.git", "https://example.com", root.path()).unwrap();
+        let older_slot = cache.slot(&older.name).await;
+        older_slot.refresh.lock().await.used = Some((older.clone(), Instant::now()));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let newer_slot = cache.slot(&newer.name).await;
+        newer_slot.refresh.lock().await.used = Some((newer.clone(), Instant::now()));
+        // The most recent candidate runs first and waits on its lock until the
+        // deadline; with one slot the other is never started.
+        let _held = newer_slot.fetch_lock.lock().await;
+        enable_refresh(&mut cache, 10, 1000, 1);
+        let handle = cache.start_refresh().unwrap();
+        // Covers the first round only: the next one ends after this sleep.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(refresh_count(&cache, "skipped"), 2);
+        cache.shutdown();
+        handle.await.unwrap();
+        assert_eq!(
+            refresh_count(&cache, "skipped"),
+            2,
+            "shutdown is not counted"
+        );
+    }
+
     #[tokio::test]
     async fn refresh_unusable_settings_count_as_disabled() {
         for (interval, concurrency) in [(3600, 0), (0, 1)] {
@@ -2346,7 +2435,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let start = Instant::now();
         let token = CancellationToken::new();
-        refresh_round(
+        let started = refresh_round(
             candidates,
             2,
             start + Duration::from_secs(10),
@@ -2361,6 +2450,7 @@ mod tests {
             },
         )
         .await;
+        assert_eq!(started, 2);
         assert_eq!(start.elapsed(), Duration::from_secs(15));
         let events = events.lock().await;
         assert_eq!(
@@ -2423,6 +2513,7 @@ mod tests {
             .await;
         assert_eq!(start.elapsed(), Duration::from_secs(10));
         assert_eq!(slot.refresh.lock().await.failures, 3);
+        assert_eq!(refresh_count(&cache, "skipped"), 1);
         cache.shutdown();
         cache
             .refresh_repo_with(
@@ -2433,6 +2524,11 @@ mod tests {
             )
             .await;
         assert_eq!(slot.refresh.lock().await.failures, 3);
+        assert_eq!(
+            refresh_count(&cache, "skipped"),
+            1,
+            "shutdown is not counted"
+        );
         drop(guard);
         assert!(slot.fetch_lock.try_lock().is_ok());
     }
@@ -2463,6 +2559,7 @@ mod tests {
         assert!(slot.fetch_lock.lock().await.is_some());
         assert_eq!(slot.refresh.lock().await.used.as_ref().unwrap().1, used);
         assert_eq!(slot.refresh.lock().await.failures, 0);
+        assert_eq!(refresh_count(&cache, "ok"), 1);
         assert!(matches!(
             cache.ensure_fresh(&repo, true, b"", None).await.unwrap(),
             CacheOutcome::Cached
@@ -2521,6 +2618,11 @@ mod tests {
             )
             .await;
         assert_eq!(slot.refresh.lock().await.failures, 0);
+        assert_eq!(refresh_count(&cache, "skipped"), 4);
+        assert_eq!(
+            refresh_count(&cache, "ok") + refresh_count(&cache, "error"),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4300,6 +4402,17 @@ mod tests {
             active_window: Duration::from_secs(active_window),
             concurrency,
         });
+    }
+
+    /// Value of `refresh_total{result}`; 0 when the series was never recorded.
+    fn refresh_count(cache: &GitCache, result: &str) -> u64 {
+        let prefix = format!(r#"gitcacheproxy_refresh_total{{result="{result}"}} "#);
+        cache
+            .metrics
+            .gather()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map_or(0, |value| value.parse().unwrap())
     }
 
     #[derive(Clone, Default)]
