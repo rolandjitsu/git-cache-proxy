@@ -67,7 +67,7 @@ spell checking.
 
 ## Design
 
-The design and rationale live in the [README](./README.md). All git protocol work is delegated
+The design and rationale live in [docs/architecture.md](./docs/architecture.md). All git protocol work is delegated
 to the system `git` binary; keep it that way so protocol correctness (v2, shallow, partial
 clones) comes for free. The proxy is strictly read-only and pull-only - it must never push or
 proactively replicate to upstream.
