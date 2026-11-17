@@ -124,9 +124,6 @@ Working and end-to-end tested on both Git wire protocol versions - **v2**
 clone, incremental fetch, and push rejection. **git-LFS** is cached too (batch
 API proxied; objects stored content-addressed and integrity-checked).
 
-Early, single-maintainer software: no independent review or wide deployment yet.
-Pin a version and try it against your own setup before relying on it.
-
 Not yet implemented:
 
 - A background/scheduled refresh (today every `info/refs` triggers an on-demand,
