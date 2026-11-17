@@ -91,6 +91,21 @@ scoped to a single mirror's pins). If a single request needs more new SHAs than
 would immediately have its pins pruned anyway, so raise `--max-wants` if you expect
 that many unadvertised objects at once.
 
+`--upstream-timeout-seconds` (`GITCACHEPROXY_UPSTREAM_TIMEOUT_SECONDS`, default
+`3600`) bounds each clone, full-ref fetch and SHA backfill across attempts and
+retry delays. The value must be positive and fit in a monotonic deadline.
+Library users can set the same budget with `GitCache::with_upstream_timeout`.
+The budget starts when the operation starts, after the repository lock is acquired.
+
+SIGTERM and Ctrl-C reject new upstream work and cancel active commands, retry
+backoff and repository lock waits before HTTP drain. Upstream owners kill process
+groups on Unix and wait for the direct child before releasing repository locks.
+Dropped requests also cancel their upstream owner. Library hosts call
+`GitCache::shutdown` before draining HTTP and `wait_for_shutdown` after draining.
+Active local upload-pack responses continue to drain. This does not impose a hard
+shutdown bound on active uploads or blocking filesystem work. On non-Unix targets,
+cancellation terminates only the direct child.
+
 When serving client clone/fetch requests, the proxy writes negotiation input
 to local git upload-pack while streaming its response to the client.
 Writing the request has a five-minute deadline. The operation also stops
