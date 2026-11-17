@@ -1474,18 +1474,12 @@ mod tests {
                 .success()
         );
         let binary = root.path().join("git-wrapper");
-        // Keep the writable descriptor out of parallel test processes' forked children.
-        assert!(
-            std::process::Command::new("sh")
-                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
-                .arg(&binary)
-                .arg(format!(
-                    "#!/bin/sh\ncat >/dev/null\ncat '{}' >/dev/null\nprintf pack\n",
-                    release.display()
-                ))
-                .status()
-                .unwrap()
-                .success()
+        write_test_script(
+            &binary,
+            &format!(
+                "#!/bin/sh\ncat >/dev/null\ncat '{}' >/dev/null\nprintf pack\n",
+                release.display()
+            ),
         );
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = test_config();
@@ -2723,7 +2717,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("git");
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
+        write_test_script(&script, "#!/bin/sh\nexec sleep 300\n");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cache = upload_pack_test_cache(script.to_str().unwrap());
         let repo = RepoRef {
@@ -2754,7 +2748,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("git");
-        std::fs::write(&script, "#!/bin/sh\nexec 0<&-\nexec sleep 300\n").unwrap();
+        write_test_script(&script, "#!/bin/sh\nexec 0<&-\nexec sleep 300\n");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cache = upload_pack_test_cache(script.to_str().unwrap());
         let repo = RepoRef {
@@ -2912,12 +2906,28 @@ mod tests {
         cmd.spawn().unwrap()
     }
 
+    /// Write `script` through a short-lived `sh`, so no writable descriptor for it
+    /// lives in this process: a child forked by a parallel test would inherit one
+    /// and the later `exec` would fail with "Text file busy".
+    #[cfg(unix)]
+    fn write_test_script(path: &Path, script: &str) {
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+                .arg(path)
+                .arg(script)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
     #[cfg(unix)]
     fn write_failing_git(dir: &Path, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let binary = dir.join("git-wrapper");
-        std::fs::write(&binary, format!("#!/bin/sh\n{body}")).unwrap();
+        write_test_script(&binary, &format!("#!/bin/sh\n{body}"));
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         binary
     }
