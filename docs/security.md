@@ -116,7 +116,7 @@ upstream. Grants stay valid for 15 minutes across replicas sharing
 ### GitLab with a personal access token
 
 GitLab's git smart-HTTP endpoint authenticates a PAT via **HTTP Basic** auth
-(the PAT is the password; any non-empty username works) — not `Authorization:
+(the PAT is the password; any non-empty username works) - not `Authorization:
 Bearer` (OAuth2 access tokens only) and not the `PRIVATE-TOKEN` header (REST API
 only). Build the header as Basic auth:
 
@@ -124,7 +124,7 @@ only). Build the header as Basic auth:
 export GITCACHEPROXY_UPSTREAM_AUTH_HEADER="Authorization: Basic $(printf 'oauth2:%s' "$GITLAB_TOKEN" | base64 | tr -d '\n')"
 ```
 
-Verify it against the git endpoint before wiring up the proxy — a `200` means
+Verify it against the git endpoint before wiring up the proxy - a `200` means
 the header works, a `401` means the scheme is wrong:
 
 ```bash

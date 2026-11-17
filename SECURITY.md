@@ -10,12 +10,12 @@ posted on remediation.
 
 ## Scope
 
-git-cache-proxy is a shared, credentialed reader. Please read the "Security
-model" section of the README first: it documents the intended trust boundary
-(reachability), the single upstream credential, plain-HTTP serving, and the DoS
-knobs. Reports that contradict or extend that model are in scope. Known and
-documented behaviors - open defaults and an unbounded on-disk cache - are not
-vulnerabilities on their own.
+git-cache-proxy is a shared, credentialed reader. Please read
+[docs/security.md](./docs/security.md) first: it documents the intended trust
+boundary (reachability), the single upstream credential, plain-HTTP serving,
+and the DoS knobs. Reports that contradict or extend that model are in scope.
+Known and documented behaviors - open defaults and an unbounded on-disk cache -
+are not vulnerabilities on their own.
 
 ## Supported versions
 
