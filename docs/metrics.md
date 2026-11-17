@@ -14,6 +14,7 @@
 | `evictions_total`           | counter   | -                      | Idle mirrors evicted to keep the cache under `--cache-max-mb`                 |
 | `lfs_objects_total`         | counter   | `result`               | Cached git-LFS object lookups                                                 |
 | `cache_outcome_total`       | counter   | `outcome`              | info/refs operations by outcome: served locally vs. fetched from upstream     |
+| `refresh_total`             | counter   | `result`               | Background refresh attempts per mirror, by result                             |
 | `auth_validations_total`    | counter   | `result`               | Per-request token validation calls                                            |
 | `auth_cache_hits_total`     | counter   | -                      | Token checks answered from the `--auth-ttl-seconds` verdict cache             |
 | `upstream_duration_seconds` | histogram | `op`, `repo`           | Wall-clock duration of successful upstream clones/fetches                     |
@@ -32,6 +33,11 @@ Label values:
   On `auth_validations_total`: `allow`, `deny`, `unavailable` (the endpoint
   failed, throttled, or answered something else), `saturated` (no call made: no
   `--auth-max-concurrent` slot freed up in time).
+  On `refresh_total`: `ok`, `error`, `auth_rejected` (the upstream rejected the
+  server credential), `preempted` (an eviction cancelled the fetch), `skipped`
+  (not attempted: backoff, auth block, fetch TTL, inactive or missing mirror,
+  or the round deadline). Shutdown is not counted. Refresh fetches also appear
+  in `upstream_ops_total{op="fetch"}`.
 - `op`: `clone` (first mirror of a repo), `fetch` (refresh of an existing
   mirror), `want_fetch` (on-demand fetch of a bare SHA the mirror lacks, e.g. a
   PR merge commit).

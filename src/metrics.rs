@@ -69,6 +69,20 @@ pub enum LfsResult {
     Error,
 }
 
+/// The `result` label on `refresh_total`.
+#[derive(Debug, Clone, Copy)]
+pub enum RefreshResult {
+    Ok,
+    Error,
+    /// The upstream rejected the server credential; the mirror is blocked.
+    AuthRejected,
+    /// An eviction cancelled the fetch.
+    Preempted,
+    /// Not attempted: backoff, auth block, TTL, inactive, missing mirror, or the
+    /// round deadline.
+    Skipped,
+}
+
 /// The `result` label on `auth_validations_total`.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationResult {
@@ -179,6 +193,13 @@ pub struct Metrics {
     /// from the local mirror, no upstream call). Recorded once per advertisement,
     /// so the local-hit ratio is `cached / sum without (outcome) (...)`.
     cache_outcome: IntCounterVec,
+    /// `refresh_total{result}` - background refresh attempts per mirror;
+    /// result = ok | error | auth_rejected | preempted (evicted mid-fetch) |
+    /// skipped (not attempted). Mutually exclusive, so the sum is the number of
+    /// scheduled attempts and the failure rate is
+    /// `(error + auth_rejected) / sum without (result) (...)`. Shutdown is not
+    /// counted. No `repo` label, like `cache_outcome_total`.
+    refresh: IntCounterVec,
     /// `auth_validations_total{result}` - per-request token validation calls;
     /// result = allow | deny | unavailable | saturated. No `repo` label: a flood
     /// of junk credentials names arbitrary repos.
@@ -252,6 +273,14 @@ impl Metrics {
             &["outcome"],
         )
         .expect("valid metric");
+        let refresh = IntCounterVec::new(
+            Opts::new(
+                "gitcacheproxy_refresh_total",
+                "Background refresh attempts by result (ok/error/auth_rejected/preempted/skipped)",
+            ),
+            &["result"],
+        )
+        .expect("valid metric");
         let auth_validations = IntCounterVec::new(
             Opts::new(
                 "gitcacheproxy_auth_validations_total",
@@ -311,6 +340,9 @@ impl Metrics {
             .register(Box::new(cache_outcome.clone()))
             .expect("register cache_outcome");
         registry
+            .register(Box::new(refresh.clone()))
+            .expect("register refresh");
+        registry
             .register(Box::new(auth_validations.clone()))
             .expect("register auth_validations");
         registry
@@ -333,6 +365,7 @@ impl Metrics {
             evictions,
             lfs_objects,
             cache_outcome,
+            refresh,
             auth_validations,
             auth_cache_hits,
             upstream_duration,
@@ -388,6 +421,18 @@ impl Metrics {
             CacheOutcome::Cached => "cached",
         };
         self.cache_outcome.with_label_values(&[label]).inc();
+    }
+
+    /// Record `count` background refresh attempts that ended with `result`.
+    pub fn record_refresh(&self, result: RefreshResult, count: u64) {
+        let label = match result {
+            RefreshResult::Ok => "ok",
+            RefreshResult::Error => "error",
+            RefreshResult::AuthRejected => "auth_rejected",
+            RefreshResult::Preempted => "preempted",
+            RefreshResult::Skipped => "skipped",
+        };
+        self.refresh.with_label_values(&[label]).inc_by(count);
     }
 
     /// Record one token validation call, or a check that found no slot for one.
@@ -453,6 +498,8 @@ mod tests {
         m.record_cache_outcome(CacheOutcome::Cached);
         m.record_cache_outcome(CacheOutcome::Fetched);
         m.record_cache_outcome(CacheOutcome::Cloned);
+        m.record_refresh(RefreshResult::Ok, 1);
+        m.record_refresh(RefreshResult::Skipped, 3);
         m.record_validation(ValidationResult::Deny);
         m.record_auth_cache_hit();
         m.observe_upstream(UpstreamOp::Clone, "group/foo.git", 1.5);
@@ -469,6 +516,8 @@ mod tests {
         assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="cached"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="fetched"} 1"#));
         assert!(out.contains(r#"gitcacheproxy_cache_outcome_total{outcome="cloned"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_refresh_total{result="ok"} 1"#));
+        assert!(out.contains(r#"gitcacheproxy_refresh_total{result="skipped"} 3"#));
         assert!(out.contains(r#"gitcacheproxy_auth_validations_total{result="deny"} 1"#));
         assert!(out.contains("gitcacheproxy_auth_cache_hits_total 1"));
         assert!(out.contains(
