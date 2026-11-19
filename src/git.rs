@@ -21,10 +21,11 @@
 //! `PROXY_WANTS_NS` so the mirror can serve them.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
@@ -52,6 +53,9 @@ const UPSTREAM_RETRY_DELAYS: [Duration; 3] = [
 ];
 const MAX_UPSTREAM_RETRIES: usize = UPSTREAM_RETRY_DELAYS.len();
 const MAX_UPSTREAM_STDERR_BYTES: usize = 64 * 1024;
+const MAX_STDERR_SUMMARY_LINES: usize = 8;
+const MAX_STDERR_SUMMARY_BYTES: usize = 1024;
+const REDACTED: &str = "<redacted>";
 
 // Negotiation is bounded independently of pack size. Once input is written,
 // only inactivity is bounded: active downloads have no total duration limit.
@@ -275,7 +279,7 @@ impl GitCache {
         }
         let mut last = tokio::select! {
             biased;
-            _ = self.shutdown.cancelled() => bail!("upstream operation cancelled"),
+            _ = self.shutdown.cancelled() => return Err(UpstreamStopped::Cancelled.into()),
             guard = slot.fetch_lock.lock() => guard,
         };
 
@@ -305,7 +309,10 @@ impl GitCache {
             if is_auth_failure(&e) || self.shutdown.is_cancelled() || e.is::<UpstreamStopped>() {
                 return Err(e);
             }
-            tracing::warn!(repo = %repo.name, error = %e, "ensure wanted oids failed");
+            if !upstream_failure_logged(&e) {
+                let (repo, error) = (repo.name.as_str(), format!("{e:#}"));
+                tracing::warn!(repo, error, "ensure wanted oids failed");
+            }
         }
         Ok(outcome)
     }
@@ -464,11 +471,7 @@ impl GitCache {
         )
         .await
         {
-            // `-` not the repo name: a failed clone must not mint a per-repo series
-            // for an arbitrary client-supplied path (see `metrics`). The failing
-            // repo is still named in the returned error, which the caller logs.
-            self.metrics
-                .record_upstream(UpstreamOp::Clone, Status::Error, "-");
+            self.upstream_failed(UpstreamOp::Clone, repo, cred, started, &error);
             return Err(error);
         }
         let elapsed = started.elapsed().as_secs_f64();
@@ -507,8 +510,7 @@ impl GitCache {
         )
         .await
         {
-            self.metrics
-                .record_upstream(UpstreamOp::Fetch, Status::Error, "-");
+            self.upstream_failed(UpstreamOp::Fetch, repo, cred, started, &error);
             return Err(error);
         }
         self.metrics
@@ -579,8 +581,7 @@ impl GitCache {
         )
         .await
         {
-            self.metrics
-                .record_upstream(UpstreamOp::WantFetch, Status::Error, "-");
+            self.upstream_failed(UpstreamOp::WantFetch, repo, cred, started, &error);
             return Err(error);
         }
         self.metrics
@@ -596,6 +597,47 @@ impl GitCache {
             tracing::warn!(repo = %repo.name, error = %e, "pruning want-by-sha pins failed");
         }
         Ok(())
+    }
+
+    /// Count and log an upstream operation's final failure. This is the one place
+    /// that sees the operation, the repo, and the credential needed to redact
+    /// stderr, so callers skip errors for which `upstream_failure_logged` holds.
+    fn upstream_failed(
+        &self,
+        op: UpstreamOp,
+        repo: &RepoRef,
+        cred: Option<&str>,
+        started: Instant,
+        error: &anyhow::Error,
+    ) {
+        // `-` not the repo name: a failure must not mint a per-repo series for an
+        // arbitrary client-supplied path (see `metrics`). The log names the repo.
+        self.metrics.record_upstream(op, Status::Error, "-");
+        let Some(kind) = failure_kind(error) else {
+            return;
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (op, repo) = (op.as_str(), repo.name.as_str());
+        if kind == FailureKind::Cancelled {
+            tracing::debug!(op, repo, elapsed_ms, "upstream operation cancelled");
+            return;
+        }
+        let secret = cred.or(self.cfg.upstream_auth_header.as_deref());
+        let stderr = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<UpstreamFailed>())
+            .map(|failed| redact_stderr(&failed.stderr, secret))
+            .unwrap_or_default();
+        let (error_kind, error) = (kind.as_str(), format!("{error:#}"));
+        tracing::warn!(
+            op,
+            repo,
+            error_kind,
+            elapsed_ms,
+            stderr,
+            error,
+            "upstream operation failed"
+        );
     }
 
     /// Cap how many want-by-SHA pins a mirror keeps, deleting the oldest by creation
@@ -712,6 +754,8 @@ impl GitCache {
         let mut c = Command::new(&self.cfg.git_binary);
         c.env("GIT_TERMINAL_PROMPT", "0"); // fail instead of hanging on a prompt
         c.env("LC_ALL", "C"); // Retry classification relies on Git's English diagnostics.
+        // Trace output would bypass redaction and can carry request headers.
+        remove_trace_vars(&mut c, std::env::vars_os().map(|(key, _)| key));
         for (k, v) in git_config_env(
             &self.cfg.big_file_threshold,
             cred.or(self.cfg.upstream_auth_header.as_deref()),
@@ -761,16 +805,138 @@ pub fn validate_upstream_timeout(timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct UpstreamStopped;
+/// Whether `err` is an upstream git failure already logged where the operation
+/// failed, so a caller need not log it again.
+pub fn upstream_failure_logged(err: &anyhow::Error) -> bool {
+    failure_kind(err).is_some()
+}
+
+/// The `error_kind` of an upstream failure; `None` for a local error (spawn,
+/// staging cleanup), which is left to the caller to log.
+fn failure_kind(err: &anyhow::Error) -> Option<FailureKind> {
+    err.chain().find_map(|cause| {
+        if let Some(failed) = cause.downcast_ref::<UpstreamFailed>() {
+            return Some(failed.kind);
+        }
+        cause
+            .downcast_ref::<UpstreamStopped>()
+            .map(|stopped| match stopped {
+                UpstreamStopped::Cancelled => FailureKind::Cancelled,
+                UpstreamStopped::TimedOut => FailureKind::Timeout,
+            })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Auth,
+    TransientHttp,
+    Tls,
+    Connection,
+    Dns,
+    Unknown,
+    Timeout,
+    Cancelled,
+}
+
+impl FailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::TransientHttp => "transient_http",
+            Self::Tls => "tls",
+            Self::Connection => "connection",
+            Self::Dns => "dns",
+            Self::Unknown => "unknown",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Auth => "upstream rejected the credential",
+            Self::TransientHttp => "transient HTTP status",
+            Self::Tls => "TLS connection interrupted",
+            Self::Connection => "connection interrupted or timed out",
+            Self::Dns => "DNS resolution failed",
+            Self::Unknown => "permanent or unrecognized error",
+            Self::Timeout => "total budget exhausted",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UpstreamStopped {
+    Cancelled,
+    TimedOut,
+}
 
 impl std::fmt::Display for UpstreamStopped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("upstream operation cancelled or total budget exhausted")
+        f.write_str(match self {
+            Self::Cancelled => "upstream operation cancelled",
+            Self::TimedOut => "upstream operation exhausted its total budget",
+        })
     }
 }
 
 impl std::error::Error for UpstreamStopped {}
+
+/// A git process that exited unsuccessfully. The stderr tail is kept for the
+/// failure log only: it is upstream-controlled text, so it stays out of
+/// `Display` and `Debug` and is redacted before it is logged.
+struct UpstreamFailed {
+    operation: String,
+    repo: String,
+    attempts: usize,
+    status: ExitStatus,
+    kind: FailureKind,
+    stderr: Vec<u8>,
+}
+
+impl std::fmt::Debug for UpstreamFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamFailed")
+            .field("operation", &self.operation)
+            .field("repo", &self.repo)
+            .field("attempts", &self.attempts)
+            .field("status", &self.status)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for UpstreamFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kind == FailureKind::Auth {
+            // The cause, `UpstreamAuthFailed`, follows in the error chain.
+            return write!(
+                f,
+                "git {} failed for {} (status {})",
+                self.operation, self.repo, self.status
+            );
+        }
+        write!(
+            f,
+            "git {} failed for {} after {} attempt(s) ({}, status {})",
+            self.operation,
+            self.repo,
+            self.attempts,
+            self.kind.reason(),
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for UpstreamFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Keeps `is_auth_failure` a plain chain walk.
+        static AUTH: UpstreamAuthFailed = UpstreamAuthFailed;
+        (self.kind == FailureKind::Auth).then_some(&AUTH as _)
+    }
+}
 
 // The caller holds the repository lock throughout retries. Never retry local
 // upload-pack: once its response starts streaming it cannot be replayed safely.
@@ -790,8 +956,11 @@ async fn run_upstream(
     #[cfg(unix)]
     cmd.process_group(0);
     for attempt in 0..=MAX_UPSTREAM_RETRIES {
-        if cancellation.is_cancelled() || Instant::now() >= deadline {
-            return Err(UpstreamStopped.into());
+        if cancellation.is_cancelled() {
+            return Err(UpstreamStopped::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(UpstreamStopped::TimedOut.into());
         }
         if let Some(path) = staging {
             clean_staging(path).await?;
@@ -820,8 +989,8 @@ async fn run_upstream(
         };
         let result = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => Err(UpstreamStopped.into()),
-            _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped.into()),
+            _ = cancellation.cancelled() => Err(UpstreamStopped::Cancelled.into()),
+            _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped::TimedOut.into()),
             result = operation_result => result,
         };
         let (status, tail) = match result {
@@ -845,6 +1014,7 @@ async fn run_upstream(
             && status.code().is_some()
             && let Some(delay) = UPSTREAM_RETRY_DELAYS.get(attempt)
         {
+            let reason = reason.reason();
             tracing::warn!(
                 repo,
                 operation,
@@ -859,16 +1029,20 @@ async fn run_upstream(
         }
         // An upstream credential rejection is carried out typed, so a `client`-mode
         // caller can map it to a client 401 rather than a blanket 502.
-        if reason.is_none() && upstream_auth_diagnostic(&tail) {
-            return Err(anyhow::Error::new(UpstreamAuthFailed).context(format!(
-                "git {operation} failed for {repo}: upstream rejected the credential"
-            )));
+        let kind = match reason {
+            Some(kind) => kind,
+            None if upstream_auth_diagnostic(&tail) => FailureKind::Auth,
+            None => FailureKind::Unknown,
+        };
+        return Err(UpstreamFailed {
+            operation: operation.to_owned(),
+            repo: repo.to_owned(),
+            attempts: attempt + 1,
+            status,
+            kind,
+            stderr: tail,
         }
-        bail!(
-            "git {operation} failed for {repo} after {} attempt(s) ({}, status {status})",
-            attempt + 1,
-            reason.unwrap_or("permanent or unrecognized error")
-        );
+        .into());
     }
     unreachable!("final attempt returns an error or succeeds")
 }
@@ -887,8 +1061,8 @@ async fn wait_upstream_retry(
 ) -> Result<()> {
     tokio::select! {
         biased;
-        _ = cancellation.cancelled() => Err(UpstreamStopped.into()),
-        _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped.into()),
+        _ = cancellation.cancelled() => Err(UpstreamStopped::Cancelled.into()),
+        _ = tokio::time::sleep_until(deadline) => Err(UpstreamStopped::TimedOut.into()),
         _ = tokio::time::sleep(delay) => Ok(()),
     }
 }
@@ -920,7 +1094,7 @@ fn upstream_auth_diagnostic(stderr: &[u8]) -> bool {
     .any(|message| text.contains(message))
 }
 
-fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
+fn transient_upstream_error(stderr: &[u8]) -> Option<FailureKind> {
     let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     // Permanent errors take precedence if Git reports more than one diagnostic.
     if [
@@ -950,7 +1124,7 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
                 .ends_with(&format!("returned error: {code}"))
         })
     }) {
-        return Some("transient HTTP status");
+        return Some(FailureKind::TransientHttp);
     }
     if [
         "unexpected eof while reading",
@@ -961,7 +1135,7 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
     .iter()
     .any(|message| text.contains(message))
     {
-        return Some("TLS connection interrupted");
+        return Some(FailureKind::Tls);
     }
     if [
         "connection reset",
@@ -983,7 +1157,7 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
     .iter()
     .any(|message| text.contains(message))
     {
-        return Some("connection interrupted or timed out");
+        return Some(FailureKind::Connection);
     }
     if [
         "temporary failure in name resolution",
@@ -993,9 +1167,109 @@ fn transient_upstream_error(stderr: &[u8]) -> Option<&'static str> {
     .iter()
     .any(|message| text.contains(message))
     {
-        return Some("DNS resolution failed");
+        return Some(FailureKind::Dns);
     }
     None
+}
+
+fn remove_trace_vars(cmd: &mut Command, keys: impl IntoIterator<Item = OsString>) {
+    for key in keys {
+        if is_trace_var(&key) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+/// Git environment variables that send trace output to stderr.
+fn is_trace_var(key: &OsStr) -> bool {
+    key.to_str()
+        .is_some_and(|key| key.starts_with("GIT_TRACE") || key == "GIT_CURL_VERBOSE")
+}
+
+/// A bounded, single-line summary of upstream git stderr for the failure log.
+/// Git already strips credentials from URLs in its own diagnostics, but
+/// `remote:` lines are upstream-controlled text, so the same rules are applied
+/// again and the credential in use is removed wherever it appears verbatim.
+fn redact_stderr(stderr: &[u8], secret: Option<&str>) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let recent = &lines[lines.len().saturating_sub(MAX_STDERR_SUMMARY_LINES)..];
+    let mut summary = recent
+        .iter()
+        .map(|line| redact_line(line, secret))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if summary.len() > MAX_STDERR_SUMMARY_BYTES {
+        let mut cut = summary.len() - MAX_STDERR_SUMMARY_BYTES;
+        while !summary.is_char_boundary(cut) {
+            cut += 1;
+        }
+        summary.replace_range(..cut, "...");
+    }
+    summary
+}
+
+fn redact_line(line: &str, secret: Option<&str>) -> String {
+    let replaced: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut line = replaced.trim().to_owned();
+    if let Some(secret) = secret {
+        // The whole header first, then its credential alone. A short value is
+        // skipped: replacing it would mangle unrelated text.
+        let credential = secret.rsplit(char::is_whitespace).next().unwrap_or("");
+        for value in [secret.trim(), credential] {
+            if value.len() >= 8 {
+                line = line.replace(value, REDACTED);
+            }
+        }
+    }
+    redact_userinfo(&redact_header(&line))
+}
+
+/// Keep an `Authorization` header's scheme and drop the rest of the line, as
+/// git's curl trace does. Git keeps cookie names and redacts their values;
+/// this drops everything after `Cookie:`, which is stricter.
+fn redact_header(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let auth = lower.find("authorization:").map(|at| {
+        let value = &line[at + "authorization:".len()..];
+        let scheme = value.trim_start();
+        let scheme_len = scheme.find(char::is_whitespace).unwrap_or(scheme.len());
+        line.len() - scheme.len() + scheme_len
+    });
+    let cookie = lower.find("cookie:").map(|at| at + "cookie:".len());
+    match auth.into_iter().chain(cookie).min() {
+        Some(end) => format!("{} {REDACTED}", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
+/// Replace the userinfo of every `scheme://user:pass@host` URL in `line`.
+fn redact_userinfo(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find(|c: char| c == '/' || c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>'))
+            .unwrap_or(tail.len());
+        match tail[..authority_end].rfind('@') {
+            Some(userinfo_end) => {
+                out.push_str(REDACTED);
+                rest = &tail[userinfo_end..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 async fn write_upload_pack_request(
@@ -1102,7 +1376,7 @@ const UPLOAD_PACK_CAN_OBSERVE_EXIT_BEFORE_EOF: bool = cfg!(all(
         target_os = "redox",
     ))
 ))]
-async fn wait_upload_pack(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+async fn wait_upload_pack(child: &mut Child) -> std::io::Result<ExitStatus> {
     use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -1136,7 +1410,7 @@ async fn wait_upload_pack(child: &mut Child) -> std::io::Result<std::process::Ex
         target_os = "redox",
     ))
 )))]
-async fn wait_upload_pack(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+async fn wait_upload_pack(child: &mut Child) -> std::io::Result<ExitStatus> {
     child.wait().await
 }
 
@@ -1390,7 +1664,10 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            error.is::<UpstreamStopped>(),
+            matches!(
+                error.downcast_ref::<UpstreamStopped>(),
+                Some(UpstreamStopped::Cancelled)
+            ),
             "cancellation must precede spawn: {error}"
         );
     }
@@ -1538,7 +1815,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(error.is::<UpstreamStopped>());
+            assert_eq!(failure_kind(&error), Some(FailureKind::Timeout));
             assert!(!error.to_string().contains("private-diagnostic"));
         }
     }
@@ -1581,7 +1858,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(result.unwrap_err().is::<UpstreamStopped>());
+        assert_eq!(
+            failure_kind(&result.unwrap_err()),
+            Some(FailureKind::Cancelled)
+        );
         let mut pids = pids.split_whitespace();
         let leader = pids.next().unwrap();
         assert!(
@@ -1686,7 +1966,7 @@ mod tests {
                 "fatal: unable to access 'https://github.com/a/b/': The requested URL returned error: {code}\n"
             );
             assert_eq!(
-                Some("transient HTTP status"),
+                Some(FailureKind::TransientHttp),
                 transient_upstream_error(message.as_bytes())
             );
         }
@@ -1767,6 +2047,177 @@ mod tests {
         ] {
             assert!(!upstream_auth_diagnostic(stderr.as_bytes()), "{stderr}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_failure_keeps_stderr_out_of_the_error() {
+        let token = CancellationToken::new();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'remote: private-diagnostic' >&2; exit 128"]);
+        let error = run_upstream(
+            &mut cmd,
+            "fetch",
+            "repo.git",
+            None,
+            Duration::from_secs(5),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure_kind(&error), Some(FailureKind::Unknown));
+        assert!(upstream_failure_logged(&error));
+        let failed = error.downcast_ref::<UpstreamFailed>().unwrap();
+        assert_eq!(failed.attempts, 1);
+        let debug = format!("{failed:?}");
+        assert!(debug.contains("Unknown"), "{debug}");
+        assert!(!debug.contains("private-diagnostic"), "{debug}");
+        assert!(String::from_utf8_lossy(&failed.stderr).contains("private-diagnostic"));
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(!rendered.contains("private-diagnostic"), "{rendered}");
+            assert!(
+                rendered.contains("permanent or unrecognized error"),
+                "{rendered}"
+            );
+        }
+
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo 'fatal: The requested URL returned error: 404' >&2; exit 128",
+        ]);
+        let error = run_upstream(
+            &mut cmd,
+            "fetch",
+            "repo.git",
+            None,
+            Duration::from_secs(5),
+            &token,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_auth_failure(&error));
+        assert_eq!(failure_kind(&error), Some(FailureKind::Auth));
+        assert!(format!("{error:#}").ends_with("upstream rejected the credential"));
+    }
+
+    #[test]
+    fn local_errors_are_left_to_the_caller_to_log() {
+        let error = anyhow::anyhow!("disk full").context("spawn upstream git");
+        assert_eq!(failure_kind(&error), None);
+        assert!(!upstream_failure_logged(&error));
+        let stopped = anyhow::Error::new(UpstreamStopped::TimedOut).context("outer");
+        assert_eq!(failure_kind(&stopped), Some(FailureKind::Timeout));
+    }
+
+    #[test]
+    fn redact_stderr_removes_credentials() {
+        let secret = "Authorization: Bearer s3cret-token-value";
+        let stderr = "\
+remote: token s3cret-token-value is not allowed
+fatal: unable to access 'https://user:hunter2@git.example/a/b.git/': error
+> Authorization: Basic dXNlcjpwYXNz
+> proxy-authorization: Bearer abc.def
+> Cookie: session=abc; other=def
+plain https://git.example/a/b.git and ssh://git@git.example/a/b.git
+";
+        let summary = redact_stderr(stderr.as_bytes(), Some(secret));
+        for leaked in [
+            "s3cret-token-value",
+            "hunter2",
+            "user:",
+            "dXNlcjpwYXNz",
+            "abc.def",
+            "session=",
+        ] {
+            assert!(!summary.contains(leaked), "{leaked}: {summary}");
+        }
+        for kept in [
+            "remote: token <redacted> is not allowed",
+            "https://<redacted>@git.example/a/b.git/",
+            "Authorization: Basic <redacted>",
+            "proxy-authorization: Bearer <redacted>",
+            "Cookie: <redacted>",
+            "plain https://git.example/a/b.git and ssh://<redacted>@git.example/a/b.git",
+        ] {
+            assert!(summary.contains(kept), "{kept}: {summary}");
+        }
+        // A short credential is not replaced; it would mangle unrelated text.
+        assert_eq!(redact_stderr(b"a b c", Some("Bearer b")), "a b c");
+    }
+
+    #[test]
+    fn redact_stderr_is_bounded_and_single_line() {
+        let stderr: String = (0..20).map(|n| format!("line {n}\x07\r\x1b\n\n")).collect();
+        let summary = redact_stderr(stderr.as_bytes(), None);
+        assert!(!summary.contains("line 11 "), "{summary}");
+        assert!(summary.starts_with("line 12"), "{summary}");
+        assert!(summary.ends_with("line 19"), "{summary}");
+        assert!(!summary.chars().any(char::is_control), "{summary:?}");
+
+        // Odd length, so the cut first lands inside a two-byte character.
+        let long = format!("{}z", "\u{e9}".repeat(MAX_STDERR_SUMMARY_BYTES));
+        let summary = redact_stderr(long.as_bytes(), None);
+        assert!(summary.starts_with("..."));
+        assert!(summary.len() <= MAX_STDERR_SUMMARY_BYTES + "...".len());
+    }
+
+    #[test]
+    fn trace_variables_are_recognized() {
+        for key in [
+            "GIT_TRACE",
+            "GIT_TRACE_CURL",
+            "GIT_TRACE_PACKET",
+            "GIT_TRACE2_EVENT",
+            "GIT_CURL_VERBOSE",
+        ] {
+            assert!(is_trace_var(OsStr::new(key)), "{key}");
+        }
+        for key in ["GIT_TERMINAL_PROMPT", "GIT_CONFIG_COUNT", "TRACE"] {
+            assert!(!is_trace_var(OsStr::new(key)), "{key}");
+        }
+        let mut cmd = Command::new("git");
+        remove_trace_vars(&mut cmd, ["GIT_TRACE_CURL".into(), "HOME".into()]);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert_eq!(envs, [(OsStr::new("GIT_TRACE_CURL"), None)]);
+    }
+
+    #[test]
+    fn failure_kinds_have_distinct_labels_and_reasons() {
+        let kinds = [
+            FailureKind::Auth,
+            FailureKind::TransientHttp,
+            FailureKind::Tls,
+            FailureKind::Connection,
+            FailureKind::Dns,
+            FailureKind::Unknown,
+            FailureKind::Timeout,
+            FailureKind::Cancelled,
+        ];
+        let labels: HashSet<_> = kinds.iter().map(|kind| kind.as_str()).collect();
+        let reasons: HashSet<_> = kinds.iter().map(|kind| kind.reason()).collect();
+        assert_eq!(labels.len(), kinds.len());
+        assert_eq!(reasons.len(), kinds.len());
+        assert_eq!(
+            UpstreamStopped::Cancelled.to_string(),
+            "upstream operation cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_stops_before_spawning() {
+        let mut cmd = Command::new("missing-git");
+        let error = run_upstream(
+            &mut cmd,
+            "test",
+            "test",
+            None,
+            Duration::ZERO,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure_kind(&error), Some(FailureKind::Timeout));
     }
 
     #[test]
