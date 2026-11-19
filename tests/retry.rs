@@ -406,6 +406,7 @@ async fn request_cancellation_is_not_logged_as_a_failure() {
     .unwrap();
     assert!(logs.failures().is_empty(), "{}", logs.read());
     assert!(logs.read().contains("upstream operation cancelled"));
+    assert_eq!(0, f.upstream_errors("clone"));
 }
 
 #[tokio::test]
@@ -425,6 +426,7 @@ async fn shutdown_is_not_logged_as_a_failure() {
     f.cache.wait_for_shutdown().await;
     assert!(logs.failures().is_empty(), "{}", logs.read());
     assert!(logs.read().contains("upstream operation cancelled"));
+    assert_eq!(0, f.upstream_errors("clone"));
 }
 
 struct Fixture {
