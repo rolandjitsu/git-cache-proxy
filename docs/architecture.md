@@ -65,8 +65,18 @@ EOF, connection resets/timeouts, temporary DNS failures, and HTTP 408, 429,
 500, 502, 503, and 504. Authentication, missing repositories, certificate
 validation, local filesystem errors, and unknown failures are not retried.
 Classification uses Git's English stderr diagnostics; the child locale is fixed
-to `C`. Retry logs contain the operation, attempt, delay, and error category,
-without raw upstream stderr or credentials.
+to `C`. Retry logs contain the operation, attempt, delay, and error category.
+
+An operation that still fails is logged once, as `upstream operation failed`,
+with its operation, `trigger` (`request` or background `refresh`), repo,
+`error_kind`, elapsed time, and a summary of git's stderr. The summary is the
+last 8 lines, capped at 1 KiB, because `remote:` lines are upstream-controlled
+text. Git already strips credentials from URLs in its own diagnostics; the proxy
+repeats that, redacts `Authorization` and `Cookie` values and the credential in
+use, and removes inherited `GIT_TRACE*` and `GIT_CURL_VERBOSE` so trace output
+never reaches stderr. The stderr stays
+out of the returned error, which callers may surface. A cancelled operation (the
+client went away, or shutdown) is logged at debug, not as a failure.
 
 Retries stay inside the existing per-repository lock. Each failed clone's staging
 directory is removed before another attempt; an existing fetch mirror is kept.
