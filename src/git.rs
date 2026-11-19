@@ -885,10 +885,14 @@ impl GitCache {
         started: Instant,
         error: &anyhow::Error,
     ) {
-        // `-` not the repo name: a failure must not mint a per-repo series for an
-        // arbitrary client-supplied path (see `metrics`). The log names the repo.
-        self.metrics.record_upstream(op, Status::Error, "-");
-        let Some(kind) = failure_kind(error) else {
+        let kind = failure_kind(error);
+        // A client that went away, or shutdown, is not an upstream failure.
+        if kind != Some(FailureKind::Cancelled) {
+            // `-` not the repo name: a failure must not mint a per-repo series for
+            // an arbitrary client-supplied path (see `metrics`). The log names it.
+            self.metrics.record_upstream(op, Status::Error, "-");
+        }
+        let Some(kind) = kind else {
             return;
         };
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
