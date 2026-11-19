@@ -347,6 +347,65 @@ async fn upload_pack_local_failure_is_logged_by_the_handler() {
 }
 
 #[tokio::test]
+async fn unspawnable_git_is_logged_by_the_handler() {
+    // git cannot start, so the clone fails with no upstream diagnostic to
+    // classify: it still counts as an upstream error, and the handler logs it.
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish(),
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let upstream = "file:///nonexistent/git-cache-proxy-upstream";
+    let cfg = GitConfig {
+        git_binary: cache.path().join("missing-git").to_str().unwrap().into(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+        refresh: None,
+    };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: upstream.into(),
+            cache_root: cache.path().to_path_buf(),
+            upstream_auth_header: None,
+        },
+        None,
+    ));
+    let st = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
+        upstream_base: upstream.into(),
+        cache_root: cache.path().to_path_buf(),
+        auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
+        metrics: metrics.clone(),
+    };
+
+    let resp = get(st, "/missing.git/info/refs?service=git-upload-pack").await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("ensure_fresh failed"), "{logs}");
+    let scraped = metrics.gather();
+    assert!(
+        scraped.contains(r#"op="clone",repo="-",result="error""#),
+        "{scraped}"
+    );
+}
+
+#[tokio::test]
 async fn concurrency_limit_serializes_without_deadlock() {
     // The limit wraps the git-serving fallback (health/readiness/metrics are
     // exempt), and is shared across per-connection service clones. Three
