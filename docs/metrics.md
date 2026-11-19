@@ -28,7 +28,9 @@ Label values:
   `serve_duration_seconds`: `info_refs` (the buffered ref advertisement) or
   `upload_pack` (the packfile stream, timed to EOF).
 - `result` on `requests_total`: `ok`, `error`, `upstream_error`, `unauthorized`,
-  `rejected`. On `upstream_ops_total`: `ok` or `error`. On `lfs_objects_total`:
+  `rejected`. On `upstream_ops_total`: `ok` or `error`, once per operation after
+  retries; an operation cancelled because the client went away or the proxy is
+  shutting down is not counted. On `lfs_objects_total`:
   `hit` (served from disk), `miss` (fetched from upstream, then cached), `error`.
   On `auth_validations_total`: `allow`, `deny`, `unavailable` (the endpoint
   failed, throttled, or answered something else), `saturated` (no call made: no
