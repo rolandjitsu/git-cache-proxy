@@ -244,10 +244,197 @@ async fn dropped_request_cancels_owner_and_releases_repository_lock() {
     f.cache.wait_for_shutdown().await;
 }
 
+#[tokio::test]
+async fn final_failure_is_logged_once_with_redacted_stderr() {
+    let logs = Logs::capture();
+    let f = Fixture::new();
+    f.seed_mirror();
+    f.fail(
+        "fetch",
+        10,
+        "remote: token s3cret-token-value rejected\n\
+         fatal: unable to access 'https://user:hunter2@git.example/repo.git/': odd failure",
+    );
+    let cred = "Authorization: Bearer s3cret-token-value";
+    assert!(
+        f.cache
+            .ensure_fresh(&f.repo, true, b"", Some(cred))
+            .await
+            .is_err()
+    );
+    let failures = logs.failures();
+    assert_eq!(1, failures.len(), "{}", logs.read());
+    let line = &failures[0];
+    assert!(line.starts_with(" WARN"), "{line}");
+    for expected in [
+        "op=\"fetch\"",
+        "trigger=\"request\"",
+        "repo=\"repo.git\"",
+        "error_kind=\"unknown\"",
+        "elapsed_ms=",
+        "remote: token <redacted> rejected",
+        "https://<redacted>@git.example/repo.git/': odd failure",
+        "after 1 attempt(s) (permanent or unrecognized error, status exit status: 128)",
+    ] {
+        assert!(line.contains(expected), "{expected}: {line}");
+    }
+    let all = logs.read();
+    assert!(!all.contains("s3cret-token-value"), "{all}");
+    assert!(!all.contains("hunter2"), "{all}");
+    assert_eq!(1, f.upstream_errors("fetch"));
+}
+
+#[tokio::test]
+async fn static_auth_header_is_redacted_from_logs() {
+    let logs = Logs::capture();
+    let f = Fixture::build(
+        Duration::from_secs(60),
+        Some("Authorization: Bearer static-token-value"),
+    );
+    f.seed_mirror();
+    f.fail("fetch", 10, "remote: static-token-value is revoked");
+    assert!(
+        f.cache
+            .ensure_fresh(&f.repo, true, b"", None)
+            .await
+            .is_err()
+    );
+    let all = logs.read();
+    assert!(!all.contains("static-token-value"), "{all}");
+    assert!(all.contains("remote: <redacted> is revoked"), "{all}");
+}
+
+#[tokio::test]
+async fn success_after_retry_logs_no_failure() {
+    let logs = Logs::capture();
+    let f = Fixture::new();
+    f.seed_mirror();
+    f.fail("fetch", 1, "The requested URL returned error: 503");
+    f.cache
+        .ensure_fresh(&f.repo, true, b"", None)
+        .await
+        .unwrap();
+    assert!(logs.read().contains("retrying upstream git"));
+    assert!(logs.failures().is_empty(), "{}", logs.read());
+    assert_eq!(0, f.upstream_errors("fetch"));
+}
+
+#[tokio::test]
+async fn auth_rejection_is_logged_with_its_diagnostic() {
+    let logs = Logs::capture();
+    let f = Fixture::new();
+    f.fail(
+        "clone",
+        10,
+        "fatal: unable to access 'https://git.example/repo.git/': The requested URL returned error: 404",
+    );
+    let error = f
+        .cache
+        .ensure_fresh(&f.repo, true, b"", None)
+        .await
+        .unwrap_err();
+    assert!(git_cache_proxy::git::is_auth_failure(&error));
+    let failures = logs.failures();
+    assert_eq!(1, failures.len(), "{}", logs.read());
+    assert!(
+        failures[0].contains("error_kind=\"auth\""),
+        "{}",
+        failures[0]
+    );
+    assert!(
+        failures[0].contains("returned error: 404"),
+        "{}",
+        failures[0]
+    );
+    assert!(
+        failures[0].contains("upstream rejected the credential"),
+        "{}",
+        failures[0]
+    );
+}
+
+#[tokio::test]
+async fn budget_timeout_is_logged_as_timeout() {
+    let logs = Logs::capture();
+    let mut f = Fixture::new();
+    f.cache = f
+        .cache
+        .clone()
+        .with_upstream_timeout(Duration::from_millis(300))
+        .unwrap();
+    let _ready = f.stall("clone");
+    assert!(
+        f.cache
+            .ensure_fresh(&f.repo, true, b"", None)
+            .await
+            .is_err()
+    );
+    let failures = logs.failures();
+    assert_eq!(1, failures.len(), "{}", logs.read());
+    assert!(
+        failures[0].contains("error_kind=\"timeout\""),
+        "{}",
+        failures[0]
+    );
+    assert!(
+        failures[0].contains("exhausted its total budget"),
+        "{}",
+        failures[0]
+    );
+    assert_eq!(1, f.upstream_errors("clone"));
+}
+
+#[tokio::test]
+async fn request_cancellation_is_not_logged_as_a_failure() {
+    let logs = Logs::capture();
+    let f = Fixture::new();
+    let ready = f.stall("clone");
+    let cache = f.cache.clone();
+    let repo = f.repo.clone();
+    let request = tokio::spawn(async move { cache.ensure_fresh(&repo, true, b"", None).await });
+    tokio::time::timeout(Duration::from_secs(5), tokio::fs::read_to_string(ready))
+        .await
+        .unwrap()
+        .unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    std::fs::remove_file(f.root.path().join("stall-clone")).unwrap();
+    // Queues behind the cancelled owner, so its outcome is recorded by now.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        f.cache.ensure_fresh(&f.repo, true, b"", None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(logs.failures().is_empty(), "{}", logs.read());
+    assert!(logs.read().contains("upstream operation cancelled"));
+}
+
+#[tokio::test]
+async fn shutdown_is_not_logged_as_a_failure() {
+    let logs = Logs::capture();
+    let f = Fixture::new();
+    let ready = f.stall("clone");
+    let cache = f.cache.clone();
+    let repo = f.repo.clone();
+    let request = tokio::spawn(async move { cache.ensure_fresh(&repo, true, b"", None).await });
+    tokio::time::timeout(Duration::from_secs(5), tokio::fs::read_to_string(ready))
+        .await
+        .unwrap()
+        .unwrap();
+    f.cache.shutdown();
+    assert!(request.await.unwrap().is_err());
+    f.cache.wait_for_shutdown().await;
+    assert!(logs.failures().is_empty(), "{}", logs.read());
+    assert!(logs.read().contains("upstream operation cancelled"));
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     repo: RepoRef,
     cache: GitCache,
+    metrics: Arc<Metrics>,
 }
 
 impl Fixture {
@@ -256,6 +443,10 @@ impl Fixture {
     }
 
     fn with_ttl(fetch_ttl: Duration) -> Self {
+        Self::build(fetch_ttl, None)
+    }
+
+    fn build(fetch_ttl: Duration, upstream_auth_header: Option<&str>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let upstream = root.path().join("upstream");
         std::fs::create_dir(&upstream).unwrap();
@@ -297,17 +488,24 @@ exec git "$@"
             &root.path().join("cache"),
         )
         .unwrap();
+        let metrics = Arc::new(Metrics::new());
         let cache = GitCache::new(
             GitConfig {
                 git_binary: binary.to_str().unwrap().into(),
+                upstream_auth_header: upstream_auth_header.map(str::to_owned),
                 fetch_ttl,
                 max_wants: 0,
                 ..helpers::test_git_config()
             },
-            Arc::new(Metrics::new()),
+            metrics.clone(),
             None,
         );
-        Self { root, repo, cache }
+        Self {
+            root,
+            repo,
+            cache,
+            metrics,
+        }
     }
 
     fn seed_mirror(&self) {
@@ -332,12 +530,70 @@ exec git "$@"
         std::fs::write(self.root.path().join(format!("error-{op}")), message).unwrap();
     }
 
+    fn stall(&self, op: &str) -> std::path::PathBuf {
+        std::fs::write(self.root.path().join(format!("stall-{op}")), "").unwrap();
+        let ready = self.root.path().join(format!("ready-{op}"));
+        assert!(
+            Command::new("mkfifo")
+                .arg(&ready)
+                .status()
+                .unwrap()
+                .success()
+        );
+        ready
+    }
+
+    fn upstream_errors(&self, op: &str) -> u64 {
+        let prefix =
+            format!(r#"gitcacheproxy_upstream_ops_total{{op="{op}",repo="-",result="error"}} "#);
+        self.metrics
+            .gather()
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map_or(0, |count| count.parse().unwrap())
+    }
+
     fn attempts(&self, op: &str) -> u32 {
         std::fs::read_to_string(self.root.path().join(format!("count-{op}")))
             .unwrap()
             .trim()
             .parse()
             .unwrap()
+    }
+}
+
+/// Capture this thread's log events; `#[tokio::test]` runs spawned tasks on it.
+struct Logs {
+    file: tempfile::NamedTempFile,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Logs {
+    fn capture() -> Self {
+        // A global subscriber that wants every callsite: without one, a test thread
+        // with no subscriber can cache a callsite as disabled for all threads.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(file.reopen().unwrap())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        Self { file, _guard }
+    }
+
+    fn read(&self) -> String {
+        std::fs::read_to_string(self.file.path()).unwrap()
+    }
+
+    fn failures(&self) -> Vec<String> {
+        self.read()
+            .lines()
+            .filter(|line| line.contains("upstream operation failed"))
+            .map(str::to_owned)
+            .collect()
     }
 }
 
