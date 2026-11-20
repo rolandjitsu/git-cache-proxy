@@ -22,7 +22,7 @@ use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::auth;
 use crate::config::UpstreamCredential;
-use crate::git::{GitCache, is_auth_failure};
+use crate::git::{GitCache, is_auth_failure, upstream_failure_logged};
 use crate::lfs::{Lfs, Outcome};
 use crate::metrics::{LfsResult, Metrics, RequestKind, Status};
 use crate::repo;
@@ -503,7 +503,10 @@ async fn info_refs(
             }
             st.metrics
                 .record_request(RequestKind::InfoRefs, Status::UpstreamError, "-");
-            tracing::warn!(repo = %name, error = %e, "ensure_fresh failed");
+            if !upstream_failure_logged(&e) {
+                let (repo, error) = (name, format!("{e:#}"));
+                tracing::warn!(repo, error, "ensure_fresh failed");
+            }
             return err(StatusCode::BAD_GATEWAY, "upstream fetch failed");
         }
     }
@@ -559,7 +562,10 @@ async fn upload_pack(
         }
         st.metrics
             .record_request(RequestKind::UploadPack, Status::UpstreamError, "-");
-        tracing::warn!(repo = %name, error = %e, "ensure mirror exists failed");
+        if !upstream_failure_logged(&e) {
+            let (repo, error) = (name, format!("{e:#}"));
+            tracing::warn!(repo, error, "ensure mirror exists failed");
+        }
         return err(StatusCode::BAD_GATEWAY, "upstream unavailable");
     }
 

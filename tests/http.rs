@@ -182,6 +182,17 @@ async fn upload_pack_rejects_undecodable_body() {
 async fn upstream_failure_returns_bad_gateway_and_records_error() {
     // A real (but doomed) clone: the upstream points at a path that does not
     // exist, so `git clone --mirror` fails and the request surfaces a 502.
+    // A global subscriber that wants every callsite: without one, a test thread
+    // with no subscriber can cache a callsite as disabled for all threads.
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish(),
+    );
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
@@ -216,6 +227,12 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
 
     let resp = get(st, "/missing.git/info/refs?service=git-upload-pack").await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    // Logged once, where the clone failed; the handler does not repeat it.
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("upstream operation failed"), "{logs}");
+    assert!(logs.contains("repo=\"missing.git\""), "{logs}");
 
     let scraped = metrics.gather();
     // A failed clone records under the `-` sentinel, not the client-supplied path,
@@ -282,6 +299,125 @@ async fn upload_pack_upstream_failure_returns_bad_gateway() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn upload_pack_local_failure_is_logged_by_the_handler() {
+    // The cache root is a file, so creating the mirror's parent fails before any
+    // upstream git runs: a local error the handler logs, not the git layer.
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish(),
+    );
+    let root = tempfile::NamedTempFile::new().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let upstream = "file:///nonexistent/git-cache-proxy-upstream";
+    let cfg = GitConfig {
+        git_binary: "git".into(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+    };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: upstream.into(),
+            cache_root: root.path().to_path_buf(),
+            upstream_auth_header: None,
+        },
+        None,
+    ));
+    let st = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
+        upstream_base: upstream.into(),
+        cache_root: root.path().to_path_buf(),
+        auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
+        metrics,
+    };
+
+    let resp = router(st)
+        .oneshot(
+            Request::post("/missing.git/git-upload-pack")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("ensure mirror exists failed"), "{logs}");
+    assert!(logs.contains("create cache parent"), "{logs}");
+}
+
+#[tokio::test]
+async fn unspawnable_git_is_logged_by_the_handler() {
+    // git cannot start, so the clone fails with no upstream diagnostic to
+    // classify: it still counts as an upstream error, and the handler logs it.
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.reopen().unwrap())
+            .finish(),
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let upstream = "file:///nonexistent/git-cache-proxy-upstream";
+    let cfg = GitConfig {
+        git_binary: cache.path().join("missing-git").to_str().unwrap().into(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::from_secs(10),
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+    };
+    let lfs = Arc::new(Lfs::new(
+        LfsConfig {
+            upstream_base: upstream.into(),
+            cache_root: cache.path().to_path_buf(),
+            upstream_auth_header: None,
+        },
+        None,
+    ));
+    let st = AppState {
+        cache: Arc::new(GitCache::new(cfg, metrics.clone(), None)),
+        lfs,
+        upstream_base: upstream.into(),
+        cache_root: cache.path().to_path_buf(),
+        auth: anon_auth(),
+        upstream_credential: UpstreamCredential::Static,
+        max_decoded_body: 512 * 1024 * 1024,
+        max_concurrent: 0,
+        metrics: metrics.clone(),
+    };
+
+    let resp = get(st, "/missing.git/info/refs?service=git-upload-pack").await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(1, logs.matches(" WARN ").count(), "{logs}");
+    assert!(logs.contains("ensure_fresh failed"), "{logs}");
+    let scraped = metrics.gather();
+    assert!(
+        scraped.contains(r#"op="clone",repo="-",result="error""#),
+        "{scraped}"
+    );
 }
 
 #[tokio::test]

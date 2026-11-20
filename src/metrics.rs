@@ -106,7 +106,7 @@ impl Status {
 }
 
 impl UpstreamOp {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Clone => "clone",
             Self::Fetch => "fetch",
@@ -154,6 +154,8 @@ pub struct Metrics {
     requests: IntCounterVec,
     /// `upstream_ops_total{op, result, repo}` - op = clone | fetch | want_fetch;
     /// result = ok | error; repo = the repo path when result = ok, else `-`.
+    /// One sample per operation, after retries; a cancelled operation (client
+    /// gone, or shutdown) is not counted.
     upstream: IntCounterVec,
     /// `cache_bytes` - total size of the on-disk mirror cache, maintained
     /// incrementally as mirrors are added, refreshed, and evicted. Populated only
