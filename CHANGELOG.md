@@ -3,6 +3,13 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.14 (2026-11-21)
+
+### Features
+
+- refresh recently used mirrors in the background
+- count background refresh results
+
 ## 0.2.13 (2026-11-16)
 
 ### Fixes
