@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Shared helpers for the suites that exercise per-request token validation:
-//! a mock upstream `info/refs` on a live local socket, and the `github` auth
-//! config that probes it. Each suite pulls it in with `mod helpers;`.
+//! Shared test helpers: a mock upstream `info/refs` on a live local socket, the
+//! `github` auth config that probes it, and log capture. Each suite pulls it in
+//! with `mod helpers;`.
 
 // Each suite compiles its own copy and uses a different subset, so the unused
 // rest is the sharing, not a real gap.
@@ -202,4 +202,39 @@ pub fn write_test_script(path: &Path, script: impl AsRef<str>) {
             .unwrap()
             .success()
     );
+}
+
+/// Capture this thread's log events; `#[tokio::test]` runs spawned tasks on it.
+pub struct Logs {
+    file: tempfile::NamedTempFile,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Logs {
+    pub fn capture() -> Self {
+        // A global subscriber that wants every callsite: without one, a test thread
+        // with no subscriber can cache a callsite as disabled for all threads.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(file.reopen().unwrap())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        Self { file, _guard }
+    }
+
+    pub fn read(&self) -> String {
+        std::fs::read_to_string(self.file.path()).unwrap()
+    }
+
+    pub fn failures(&self) -> Vec<String> {
+        self.read()
+            .lines()
+            .filter(|line| line.contains("upstream operation failed"))
+            .map(str::to_owned)
+            .collect()
+    }
 }

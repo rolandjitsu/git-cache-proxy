@@ -13,6 +13,7 @@ use std::time::Duration;
 use git_cache_proxy::git::{CacheOutcome, GitCache, GitConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::repo::{RepoRef, resolve};
+use helpers::Logs;
 
 mod helpers;
 
@@ -561,41 +562,6 @@ exec git "$@"
             .trim()
             .parse()
             .unwrap()
-    }
-}
-
-/// Capture this thread's log events; `#[tokio::test]` runs spawned tasks on it.
-struct Logs {
-    file: tempfile::NamedTempFile,
-    _guard: tracing::subscriber::DefaultGuard,
-}
-
-impl Logs {
-    fn capture() -> Self {
-        // A global subscriber that wants every callsite: without one, a test thread
-        // with no subscriber can cache a callsite as disabled for all threads.
-        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(file.reopen().unwrap())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        Self { file, _guard }
-    }
-
-    fn read(&self) -> String {
-        std::fs::read_to_string(self.file.path()).unwrap()
-    }
-
-    fn failures(&self) -> Vec<String> {
-        self.read()
-            .lines()
-            .filter(|line| line.contains("upstream operation failed"))
-            .map(str::to_owned)
-            .collect()
     }
 }
 
