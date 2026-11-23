@@ -10,6 +10,8 @@ use rustix::process::{Pid, Signal, kill_process};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+mod helpers;
+
 #[tokio::test]
 async fn signals_cancel_upstream_before_http_drain() {
     for signal in [Signal::TERM, Signal::INT] {
@@ -23,11 +25,10 @@ async fn signals_cancel_upstream_before_http_drain() {
                 .success()
         );
         let wrapper = root.path().join("git-wrapper");
-        std::fs::write(
+        helpers::write_test_script(
             &wrapper,
             "#!/bin/sh\nsleep 30 &\necho \"$$ $!\" > \"$READY_FIFO\"\nwait\n",
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
