@@ -877,11 +877,10 @@ async fn want_by_sha_tolerates_object_check_failure() {
     // A git shim that passes everything through except `cat-file`, which fails.
     // It drains stdin first: exiting unread races the query write into EPIPE.
     let shim = work.path().join("git-shim");
-    std::fs::write(
+    helpers::write_test_script(
         &shim,
         "#!/bin/sh\nif [ \"$1\" = cat-file ]; then cat >/dev/null; echo 'fatal: simulated cat-file failure' >&2; exit 1; fi\nexec git \"$@\"\n",
-    )
-    .unwrap();
+    );
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let cache = tempfile::tempdir().unwrap();
@@ -1467,7 +1466,7 @@ async fn check_upload_pack_disconnect(reset_connection: bool) {
     let bin = tempfile::tempdir().unwrap();
     let pid_file = bin.path().join("grandchild.pid");
     let fake_git = bin.path().join("fake-git");
-    std::fs::write(
+    helpers::write_test_script(
         &fake_git,
         format!(
             "#!/bin/sh\n\
@@ -1478,8 +1477,7 @@ async fn check_upload_pack_disconnect(reset_connection: bool) {
              exec git \"$@\"\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
+    );
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let proxy = start_proxy_with_git(up.path(), "8m", fake_git.to_str().unwrap()).await;
 
@@ -1530,7 +1528,7 @@ async fn upload_pack_cap_holds_a_slot_until_the_process_exits() {
 
     let dir = tempfile::tempdir().unwrap();
     let fake_git = dir.path().join("fake-git");
-    std::fs::write(&fake_git, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n").unwrap();
+    helpers::write_test_script(&fake_git, "#!/bin/sh\ncat >/dev/null\nexec sleep 30\n");
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cache = GitCache::new(
         GitConfig {
@@ -1595,14 +1593,13 @@ async fn upload_pack_runs_with_pack_options() {
     let dir = tempfile::tempdir().unwrap();
     let argv_log = dir.path().join("argv.log");
     let fake_git = dir.path().join("fake-git");
-    std::fs::write(
+    helpers::write_test_script(
         &fake_git,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git \"$@\"\n",
             argv_log.display()
         ),
-    )
-    .unwrap();
+    );
     std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let cache = GitCache::new(
         GitConfig {

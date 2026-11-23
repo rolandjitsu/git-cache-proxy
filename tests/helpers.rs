@@ -7,6 +7,7 @@
 // rest is the sharing, not a real gap.
 #![allow(dead_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -167,4 +168,20 @@ pub fn github_auth_config(base: &str, ttl_secs: u64) -> AuthConfig {
         allow_http: true,
         upstream_base: base.to_string(),
     }
+}
+
+/// Write an executable-to-be script through a short-lived `sh`, so this process
+/// never holds a writable descriptor for it. The tests run on parallel threads:
+/// a child forked by another one while the descriptor is open inherits it, and
+/// a later `exec` of the script then fails with "Text file busy".
+pub fn write_test_script(path: &Path, script: impl AsRef<str>) {
+    assert!(
+        std::process::Command::new("sh")
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
+            .arg(path)
+            .arg(script.as_ref())
+            .status()
+            .unwrap()
+            .success()
+    );
 }

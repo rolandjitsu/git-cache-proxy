@@ -14,6 +14,8 @@ use git_cache_proxy::git::{CacheOutcome, GitCache, GitConfig};
 use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::repo::{RepoRef, resolve};
 
+mod helpers;
+
 #[tokio::test]
 async fn clone_retries_tls_eof_and_removes_partial_staging() {
     let f = Fixture::new();
@@ -259,7 +261,7 @@ impl Fixture {
         std::fs::create_dir(&upstream).unwrap();
         git(&upstream, &["init", "--bare", "-q", "repo.git"]);
         let binary = root.path().join("git-wrapper");
-        std::fs::write(
+        helpers::write_test_script(
             &binary,
             r#"#!/bin/sh
 set -eu
@@ -287,8 +289,7 @@ if test "$count" -le "$limit"; then
 fi
 exec git "$@"
 "#,
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let repo = resolve(
             "repo.git",
