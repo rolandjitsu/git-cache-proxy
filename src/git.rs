@@ -1652,6 +1652,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    #[cfg(unix)]
+    use crate::test_util::write_test_script;
+
     #[tokio::test(start_paused = true)]
     async fn refresh_usage_tracks_success_and_ttl_hits_only() {
         let root = tempfile::tempdir().unwrap();
@@ -4227,22 +4230,6 @@ mod tests {
             cmd.process_group(0);
         }
         cmd.spawn().unwrap()
-    }
-
-    /// Write `script` through a short-lived `sh`, so no writable descriptor for it
-    /// lives in this process: a child forked by a parallel test would inherit one
-    /// and the later `exec` would fail with "Text file busy".
-    #[cfg(unix)]
-    fn write_test_script(path: &Path, script: &str) {
-        assert!(
-            std::process::Command::new("sh")
-                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
-                .arg(path)
-                .arg(script)
-                .status()
-                .unwrap()
-                .success()
-        );
     }
 
     #[cfg(unix)]
