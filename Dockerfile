@@ -14,7 +14,9 @@ RUN cargo build --release --locked --bin git-cache-proxy
 FROM alpine:3.24
 # The cache root is created owned by the runtime user so the image works as
 # non-root on runtimes with no fsGroup equivalent (Docker, ECS).
-RUN apk add --no-cache git ca-certificates \
+# tini is PID 1: git leaves orphans (detached auto maintenance, descendants of a
+# killed process group) that only PID 1 can reap, and the proxy does not.
+RUN apk add --no-cache git ca-certificates tini \
  && rm -rf /var/cache/apk/* \
  && addgroup -S -g 10001 gitcache \
  && adduser -S -D -u 10001 -G gitcache gitcache \
@@ -26,4 +28,7 @@ VOLUME /var/cache/git-cache-proxy
 EXPOSE 8080
 # Numeric, so Kubernetes `runAsNonRoot` can verify it.
 USER 10001:10001
-ENTRYPOINT ["/usr/local/bin/git-cache-proxy"]
+# Under another init (`docker run --init`, a shared Kubernetes PID namespace)
+# tini is not PID 1; as a subreaper it still reaps instead of only warning.
+ENV TINI_SUBREAPER=1
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/git-cache-proxy"]

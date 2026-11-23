@@ -71,3 +71,13 @@ jobs:
           done
           docker logs smoke
           exit 1
+      # An orphan is reparented to the container's PID 1; without an init that
+      # reaps, it stays a zombie (git leaves such orphans after every fetch).
+      - name: Check orphaned processes are reaped
+        run: |
+          docker exec smoke sh -c 'sleep 1 & exit'
+          sleep 3
+          if docker exec smoke ps -o stat | grep -q '^Z'; then
+            docker exec smoke ps -o pid,ppid,stat,args
+            exit 1
+          fi
