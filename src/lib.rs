@@ -13,5 +13,5 @@ pub mod lfs;
 pub mod metrics;
 pub mod repo;
 pub mod server;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod test_util;

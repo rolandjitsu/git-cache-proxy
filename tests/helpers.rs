@@ -19,6 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use git_cache_proxy::auth::AuthConfig;
 use git_cache_proxy::config::AuthProvider;
+use git_cache_proxy::git::GitConfig;
 use tokio::sync::{Mutex, Notify};
 
 /// The signing key the test replicas share, long enough for HMAC-SHA256.
@@ -148,6 +149,23 @@ pub async fn spawn_validator_with(reply: Reply) -> (String, Arc<Mutex<Vec<Hit>>>
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), hits, arrived)
+}
+
+/// A `GitConfig` for tests: the real `git`, no upstream credential, no upload-pack
+/// cap and a zero fetch TTL (every request fetches). Override what a test needs
+/// with struct update syntax, so a new field is added here and not at every site.
+pub fn test_git_config() -> GitConfig {
+    GitConfig {
+        git_binary: "git".into(),
+        upstream_auth_header: None,
+        big_file_threshold: "8m".into(),
+        fetch_ttl: Duration::ZERO,
+        max_wants: 100,
+        max_upload_packs: 0,
+        pack_threads: None,
+        pack_window_memory: None,
+        refresh: None,
+    }
 }
 
 /// A `github` provider config probing the mock at `base` as its upstream, with

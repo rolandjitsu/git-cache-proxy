@@ -341,15 +341,8 @@ fn state(auth: Arc<Auth>) -> AppState {
     let cache_root = std::env::temp_dir().join("git-cache-proxy-auth-tests-unused");
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-        refresh: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

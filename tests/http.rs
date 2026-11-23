@@ -18,6 +18,8 @@ use git_cache_proxy::metrics::Metrics;
 use git_cache_proxy::server::{AppState, router};
 use tower::ServiceExt; // for `oneshot`
 
+mod helpers;
+
 #[tokio::test]
 async fn health_endpoints_return_ok() {
     assert_eq!(
@@ -185,15 +187,8 @@ async fn upstream_failure_returns_bad_gateway_and_records_error() {
     let cache = tempfile::tempdir().unwrap();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-        refresh: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -245,15 +240,8 @@ async fn upload_pack_upstream_failure_returns_bad_gateway() {
     let metrics = Arc::new(Metrics::new());
     let upstream = "file:///nonexistent/git-cache-proxy-upstream";
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-        refresh: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {
@@ -348,15 +336,8 @@ fn state(auth: Arc<Auth>) -> AppState {
     let cache_root = std::env::temp_dir().join("git-cache-proxy-tests-unused");
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-        refresh: None,
+        ..helpers::test_git_config()
     };
     let lfs = Arc::new(Lfs::new(
         LfsConfig {

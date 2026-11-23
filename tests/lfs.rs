@@ -414,15 +414,8 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
     let upstream = format!("http://{addr}");
     let idx = CacheIndex::new(cache.to_path_buf(), u64::MAX, metrics.clone());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(10),
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-        refresh: None,
+        ..helpers::test_git_config()
     };
     AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), Some(idx.clone()))),

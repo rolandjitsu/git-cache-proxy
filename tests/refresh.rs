@@ -19,6 +19,8 @@ use git_cache_proxy::repo::resolve;
 use git_cache_proxy::server::{AppState, router};
 use tower::ServiceExt;
 
+mod helpers;
+
 #[tokio::test(start_paused = true)]
 async fn refresh_default_disabled_does_not_start_a_task() {
     let cfg = Config::try_parse_from(["proxy", "--upstream", "https://example.com"]).unwrap();
@@ -29,14 +31,9 @@ async fn refresh_default_disabled_does_not_start_a_task() {
     let cache = GitCache::new(
         GitConfig {
             git_binary: "missing-git-must-not-run".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
             fetch_ttl: Duration::from_secs(10),
-            max_wants: 100,
-            max_upload_packs: 0,
-            pack_threads: None,
-            pack_window_memory: None,
             refresh: cfg.refresh_config(),
+            ..helpers::test_git_config()
         },
         Arc::new(Metrics::new()),
         None,
