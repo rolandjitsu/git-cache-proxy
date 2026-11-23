@@ -473,7 +473,8 @@ mod tests {
 
     use tokio::sync::watch;
 
-    use crate::git::{GitCache, GitConfig};
+    use crate::git::GitCache;
+    use crate::test_util::test_git_config;
     #[cfg(unix)]
     use crate::test_util::write_test_script;
 
@@ -671,7 +672,7 @@ mod tests {
 
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), 4096, metrics.clone());
-        let cache = GitCache::new(dummy_cfg(), metrics.clone(), Some(idx.clone()));
+        let cache = GitCache::new(test_git_config(), metrics.clone(), Some(idx.clone()));
         idx.mark_changed("big.git"); // request path would do this after a clone
 
         maintain(&cache, &idx).await; // measures big.git (>cap) then evicts it
@@ -699,7 +700,7 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), 6000, metrics.clone()); // over cap
         let cache = Arc::new(GitCache::new(
-            dummy_cfg(),
+            test_git_config(),
             metrics.clone(),
             Some(idx.clone()),
         ));
@@ -752,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn evict_is_a_noop_when_the_mirror_is_already_gone() {
         let tmp = tempfile::tempdir().unwrap();
-        let cache = GitCache::new(dummy_cfg(), Arc::new(Metrics::new()), None);
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         // No `HEAD` at this path, so `evict` returns early without touching disk.
         let dir = tmp.path().join("absent.git");
         cache.evict("absent.git", &dir).await.unwrap();
@@ -799,7 +800,7 @@ mod tests {
             "only the blob is tracked, not the in-flight file"
         );
 
-        let cache = GitCache::new(dummy_cfg(), metrics.clone(), Some(idx.clone()));
+        let cache = GitCache::new(test_git_config(), metrics.clone(), Some(idx.clone()));
         maintain(&cache, &idx).await; // over cap -> the blob file is unlinked
         assert!(!blob.exists(), "over-cap LFS blob should be evicted");
         assert_eq!(idx.totals(), (0, 0));
@@ -874,7 +875,7 @@ mod tests {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), cap, metrics.clone());
-        let mut cfg = dummy_cfg();
+        let mut cfg = test_git_config();
         cfg.git_binary = binary.to_str().unwrap().into();
         cfg.refresh = Some(crate::git::RefreshConfig {
             interval: Duration::from_secs(3600),
@@ -884,21 +885,6 @@ mod tests {
         let cache = GitCache::new(cfg, metrics, Some(idx.clone()));
         let repo = crate::repo::resolve("a.git", "https://example.com", root).unwrap();
         (cache, idx, repo)
-    }
-
-    fn dummy_cfg() -> GitConfig {
-        // Eviction never shells out to git, so the binary is irrelevant.
-        GitConfig {
-            git_binary: "git".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::from_secs(10),
-            max_wants: 100,
-            max_upload_packs: 0,
-            pack_threads: None,
-            pack_window_memory: None,
-            refresh: None,
-        }
     }
 
     /// A fake bare mirror: `HEAD` plus a data file summing to at least `data_bytes`.

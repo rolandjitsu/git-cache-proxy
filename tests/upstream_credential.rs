@@ -265,15 +265,8 @@ async fn client_state(base: &str) -> AppState {
     let cache_root = cache.keep();
     let metrics = Arc::new(Metrics::new());
     let cfg = GitConfig {
-        git_binary: "git".into(),
-        upstream_auth_header: None,
-        big_file_threshold: "8m".into(),
         fetch_ttl: Duration::from_secs(0), // always fetch, so a revoked token is seen
-        max_wants: 100,
-        max_upload_packs: 0,
-        pack_threads: None,
-        pack_window_memory: None,
-        refresh: None,
+        ..helpers::test_git_config()
     };
     let auth =
         Arc::new(Auth::build(helpers::github_auth_config(base, 0), metrics.clone()).unwrap());

@@ -300,14 +300,9 @@ exec git "$@"
         let cache = GitCache::new(
             GitConfig {
                 git_binary: binary.to_str().unwrap().into(),
-                upstream_auth_header: None,
-                big_file_threshold: "8m".into(),
                 fetch_ttl,
                 max_wants: 0,
-                max_upload_packs: 0,
-                pack_threads: None,
-                pack_window_memory: None,
-                refresh: None,
+                ..helpers::test_git_config()
             },
             Arc::new(Metrics::new()),
             None,

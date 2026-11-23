@@ -1652,6 +1652,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    use crate::test_util::test_git_config;
     #[cfg(unix)]
     use crate::test_util::write_test_script;
 
@@ -1659,7 +1660,7 @@ mod tests {
     async fn refresh_usage_tracks_success_and_ttl_hits_only() {
         let root = tempfile::tempdir().unwrap();
         let repo = refresh_test_mirror(root.path(), "repo.git");
-        let mut cfg = test_config();
+        let mut cfg = test_git_config();
         cfg.git_binary = "true".into();
         let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
         enable_refresh(&mut cache, 3600, 604800, 1);
@@ -1936,7 +1937,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_without_config_has_no_candidates_and_skips_the_fetch() {
-        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         let root = tempfile::tempdir().unwrap();
         let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
         cache.slot(&repo.name).await.refresh.lock().await.used =
@@ -1951,7 +1952,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn refresh_candidates_use_client_recency_and_window_boundary() {
-        let mut cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let mut cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         enable_refresh(&mut cache, 3600, 20, 1);
         let root = tempfile::tempdir().unwrap();
         for name in ["old.git", "recent.git", "newest.git"] {
@@ -2369,7 +2370,7 @@ mod tests {
     async fn refresh_disabled_creates_no_task_or_request_state_access() {
         let root = tempfile::tempdir().unwrap();
         let repo = refresh_test_mirror(root.path(), "repo.git");
-        let mut cfg = test_config();
+        let mut cfg = test_git_config();
         cfg.git_binary = "true".into();
         let cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
         let slot = cache.slot(&repo.name).await;
@@ -2389,7 +2390,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn refresh_counts_candidates_the_round_deadline_never_started() {
-        let mut cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let mut cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         let root = tempfile::tempdir().unwrap();
         let older = crate::repo::resolve("older.git", "https://example.com", root.path()).unwrap();
         let newer = crate::repo::resolve("newer.git", "https://example.com", root.path()).unwrap();
@@ -2418,7 +2419,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_unusable_settings_count_as_disabled() {
         for (interval, concurrency) in [(3600, 0), (0, 1)] {
-            let mut cfg = test_config();
+            let mut cfg = test_git_config();
             cfg.refresh = Some(RefreshConfig {
                 interval: Duration::from_secs(interval),
                 active_window: Duration::from_secs(1),
@@ -2499,7 +2500,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn refresh_lock_deadline_and_shutdown_leave_failure_state_unchanged() {
-        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         let root = tempfile::tempdir().unwrap();
         let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
         let slot = cache.slot(&repo.name).await;
@@ -2542,7 +2543,7 @@ mod tests {
         let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
         std::fs::create_dir_all(&repo.cache_dir).unwrap();
         std::fs::write(repo.cache_dir.join("HEAD"), "ref: refs/heads/main").unwrap();
-        let mut cfg = test_config();
+        let mut cfg = test_git_config();
         cfg.git_binary = "true".into();
         cfg.fetch_ttl = Duration::from_secs(60);
         let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
@@ -2571,7 +2572,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn refresh_skips_inactive_missing_auth_blocked_and_backoff_repos() {
-        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         let root = tempfile::tempdir().unwrap();
         let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
         let slot = cache.slot(&repo.name).await;
@@ -2630,7 +2631,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_auth_mark_requires_server_credential_success() {
-        let mut cfg = test_config();
+        let mut cfg = test_git_config();
         cfg.upstream_auth_header = Some("Authorization: server".into());
         let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
         enable_refresh(&mut cache, 3600, 604800, 1);
@@ -2670,21 +2671,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let cache = GitCache::new(
-            GitConfig {
-                git_binary: "git".into(),
-                upstream_auth_header: None,
-                big_file_threshold: "8m".into(),
-                fetch_ttl: Duration::from_secs(60),
-                max_wants: 100,
-                max_upload_packs: 0,
-                pack_threads: None,
-                pack_window_memory: None,
-                refresh: None,
-            },
-            Arc::new(Metrics::new()),
-            None,
-        );
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         let repo = RepoRef {
             name: "test/repo.git".into(),
             upstream_url: String::new(),
@@ -2766,7 +2753,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_cancels_repository_waiters_and_rejects_admission() {
-        let cache = GitCache::new(test_config(), Arc::new(Metrics::new()), None);
+        let cache = GitCache::new(test_git_config(), Arc::new(Metrics::new()), None);
         let root = tempfile::tempdir().unwrap();
         let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
         let slot = cache.slot(&repo.name).await;
@@ -2808,8 +2795,9 @@ mod tests {
             ),
         );
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut config = test_config();
+        let mut config = test_git_config();
         config.git_binary = binary.to_str().unwrap().into();
+        config.max_upload_packs = 1;
         let cache = GitCache::new(config, Arc::new(Metrics::new()), None);
         let repo = crate::repo::resolve("repo.git", "https://example.com", root.path()).unwrap();
         let stream = cache
@@ -4324,19 +4312,6 @@ mod tests {
             eof: false,
         }
     }
-    fn test_config() -> GitConfig {
-        GitConfig {
-            git_binary: "git".into(),
-            upstream_auth_header: None,
-            big_file_threshold: "8m".into(),
-            fetch_ttl: Duration::from_secs(60),
-            max_wants: 0,
-            max_upload_packs: 1,
-            pack_threads: None,
-            pack_window_memory: None,
-            refresh: None,
-        }
-    }
 
     /// `ps` state of `pid`: empty once reaped, `Z` while a zombie awaits reaping.
     /// `kill -0` reports zombies as alive, and /proc is Linux-only.
@@ -4365,14 +4340,8 @@ mod tests {
         GitCache::new(
             GitConfig {
                 git_binary: binary.into(),
-                upstream_auth_header: None,
-                big_file_threshold: "8m".into(),
-                fetch_ttl: Duration::from_secs(60),
-                max_wants: 100,
                 max_upload_packs: 1,
-                pack_threads: None,
-                pack_window_memory: None,
-                refresh: None,
+                ..test_git_config()
             },
             Arc::new(Metrics::new()),
             None,
@@ -4441,7 +4410,7 @@ mod tests {
     }
 
     async fn refresh_spawn_failure_fixture(root: &Path) -> (GitCache, RepoRef) {
-        let mut cfg = test_config();
+        let mut cfg = test_git_config();
         cfg.git_binary = root.join("missing-git").to_str().unwrap().into();
         let mut cache = GitCache::new(cfg, Arc::new(Metrics::new()), None);
         let repo = crate::repo::resolve("repo.git", "https://example.com", root).unwrap();
@@ -4458,7 +4427,7 @@ mod tests {
         let binary = root.join("git-wrapper");
         write_test_script(&binary, &format!("#!/bin/sh\n{script}"));
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut cfg = test_config();
+        let mut cfg = test_git_config();
         cfg.git_binary = binary.to_str().unwrap().into();
         cfg.upstream_auth_header = Some("Authorization: server".into());
         cfg.fetch_ttl = Duration::from_secs(60);
