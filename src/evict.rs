@@ -474,6 +474,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::git::{GitCache, GitConfig};
+    #[cfg(unix)]
+    use crate::test_util::write_test_script;
 
     #[cfg(unix)]
     #[tokio::test]
@@ -868,16 +870,7 @@ mod tests {
         make_mirror(&root.join("a.git"), 10, None);
         make_mirror(&root.join("b.git"), 10, None);
         let binary = root.join("git-wrapper");
-        // Avoid writable descriptors inherited by parallel tests' forked children.
-        assert!(
-            std::process::Command::new("sh")
-                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh"])
-                .arg(&binary)
-                .arg(format!("#!/bin/sh\n{script}"))
-                .status()
-                .unwrap()
-                .success()
-        );
+        write_test_script(&binary, &format!("#!/bin/sh\n{script}"));
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let metrics = Arc::new(Metrics::new());
         let idx = CacheIndex::new(root.to_path_buf(), cap, metrics.clone());
