@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.15 (2026-11-24)
+
+### Fixes
+
+- bump url to 2.5.9 to address RUSTSEC-2026-0592
+
 ## 0.2.14 (2026-11-21)
 
 ### Features
