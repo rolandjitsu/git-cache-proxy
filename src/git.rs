@@ -2981,6 +2981,23 @@ mod tests {
         assert!(is_auth_failure(&error));
     }
 
+    #[tokio::test]
+    async fn clean_staging_handles_missing_path_and_reports_errors() {
+        let root = tempfile::tempdir().unwrap();
+        clean_staging(&root.path().join("missing")).await.unwrap();
+        let dir = root.path().join("staging");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        clean_staging(&dir).await.unwrap();
+        assert!(!dir.exists());
+        let file = root.path().join("file");
+        tokio::fs::write(&file, b"test").await.unwrap();
+        let err = clean_staging(&file).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("remove upstream clone staging directory")
+        );
+    }
+
     #[test]
     fn upstream_retry_classifies_transient_diagnostics() {
         for message in [
