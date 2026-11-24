@@ -3,6 +3,12 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.2.16 (2026-11-24)
+
+### Fixes
+
+- run the proxy under tini to reap orphans
+
 ## 0.2.15 (2026-11-24)
 
 ### Fixes
