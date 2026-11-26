@@ -333,7 +333,8 @@ async fn handle_git(
 
 /// Proxy an LFS batch request to upstream, rewriting each object's download URL back
 /// to this proxy so the object fetch is cached here. An `upload` batch is refused:
-/// the proxy is read-only, like `git-receive-pack`.
+/// the proxy is read-only, like `git-receive-pack`. With the cache fallback on, a
+/// transient upstream failure is answered from the cache.
 async fn lfs_batch(
     st: AppState,
     name: &str,
@@ -353,23 +354,35 @@ async fn lfs_batch(
     // In `client` mode the grant seals `cred` so the object GET can re-batch with
     // it; in `static` mode `cred` is `None` and the grant carries no credential.
     let grant = |oid: &str, size| st.auth.lfs_grant(name, oid, size, cred);
-    match st.lfs.batch(name, &body, &advertise, grant, cred).await {
+    let json = match st.lfs.batch(name, &body, &advertise, grant, cred).await {
         Ok(json) => {
             st.metrics
                 .record_request(RequestKind::LfsBatch, Status::Ok, name);
-            Response::builder()
-                .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
-                .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from(json))
-                .expect("valid response")
+            json
         }
         Err(e) => {
+            tracing::warn!(repo = %name, error = %format_args!("{e:#}"), "lfs batch failed");
+            let Some(json) = st
+                .lfs
+                .cached_batch(&e, name, &body, &advertise, grant)
+                .await
+            else {
+                st.metrics
+                    .record_request(RequestKind::LfsBatch, Status::UpstreamError, "-");
+                return err(StatusCode::BAD_GATEWAY, "upstream lfs batch failed");
+            };
+            // `-`, not the repo: upstream did not confirm the repo exists.
             st.metrics
-                .record_request(RequestKind::LfsBatch, Status::UpstreamError, "-");
-            tracing::warn!(repo = %name, error = %e, "lfs batch failed");
-            err(StatusCode::BAD_GATEWAY, "upstream lfs batch failed")
+                .record_request(RequestKind::LfsBatch, Status::CacheFallback, "-");
+            tracing::info!(repo = %name, "lfs batch served from cache");
+            json
         }
-    }
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(json))
+        .expect("valid response")
 }
 
 /// Serve a cached LFS object, fetching and caching it from upstream on a miss. The

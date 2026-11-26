@@ -185,7 +185,9 @@ fleet pays the WAN cost, the rest are served locally. The upstream LFS transfer 
 in-process over HTTPS (reqwest + rustls, no OpenSSL), so the binary stays statically
 linked. Cached objects share the `--cache-max-mb` budget and LRU eviction with the
 git mirrors. No configuration is needed: LFS is served on the same endpoints the git
-client already routes through the proxy.
+client already routes through the proxy. With `--lfs-batch-cache-fallback`, a batch
+whose upstream call fails transiently is answered from the cache when every
+object in it is cached (see [Auth model](./security.md#auth-model) for where that is allowed).
 
 ### Cache management
 

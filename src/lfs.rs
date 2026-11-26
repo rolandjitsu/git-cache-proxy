@@ -11,7 +11,9 @@
 //! Flow:
 //!   POST <repo>/info/lfs/objects/batch
 //!     -> forward to upstream, then rewrite every download href to point back here
-//!        (`<repo>/info/lfs/objects/<oid>`) so the object fetch is cached.
+//!        (`<repo>/info/lfs/objects/<oid>`) so the object fetch is cached. With
+//!        `--lfs-batch-cache-fallback`, a transient upstream failure is answered
+//!        locally when every requested object is cached (see `Lfs::cached_batch`).
 //!   GET <repo>/info/lfs/objects/<oid>
 //!     -> serve from the on-disk cache (content-addressed by oid), or on a miss fetch
 //!        it once (re-batch for a fresh authorized URL, download, verify sha256 ==
@@ -85,6 +87,8 @@ pub struct Lfs {
     /// Names the per-download temp file the object is streamed to before its atomic
     /// rename into the content-addressed cache path.
     tmp_counter: AtomicU64,
+    /// Whether a transiently failed download batch may be answered from the cache.
+    batch_cache_fallback: bool,
 }
 
 impl Lfs {
@@ -102,7 +106,16 @@ impl Lfs {
             index,
             slots: Mutex::new(HashMap::new()),
             tmp_counter: AtomicU64::new(0),
+            batch_cache_fallback: false,
         }
+    }
+
+    /// Allow `cached_batch` to answer a download batch whose upstream call failed
+    /// transiently. Startup validation (`validate_lfs_batch_cache_fallback`) only
+    /// allows it where the upstream batch authorizes nothing.
+    pub fn with_batch_cache_fallback(mut self, enabled: bool) -> Self {
+        self.batch_cache_fallback = enabled;
+        self
     }
 
     /// Proxy a client batch request to upstream and rewrite the download hrefs so the
@@ -126,6 +139,59 @@ impl Lfs {
         let mut json: Value = serde_json::from_slice(&resp).context("parse lfs batch response")?;
         rewrite_download_hrefs(&mut json, advertise_base, repo, grant);
         serde_json::to_vec(&json).context("serialize lfs batch response")
+    }
+
+    /// Answer a download batch from the cache alone after the upstream batch failed
+    /// with `err`. Each object gets the same download action `batch` would produce,
+    /// so its GET is a plain cache hit. Objects are content-addressed and
+    /// hash-verified on store, so a cached one is never stale. `None`, leaving the
+    /// caller to fail the batch, when the fallback is off, `err` is not transient,
+    /// the request is not a well-formed basic-transfer download batch, or any
+    /// requested object is not cached: the client would need upstream for it anyway.
+    pub async fn cached_batch(
+        &self,
+        err: &anyhow::Error,
+        repo: &str,
+        body: &[u8],
+        advertise_base: &str,
+        grant: impl Fn(&str, u64) -> Option<DownloadGrant>,
+    ) -> Option<Vec<u8>> {
+        if !self.batch_cache_fallback || !is_transient_batch_error(err) {
+            return None;
+        }
+        let req: Value = serde_json::from_slice(body).ok()?;
+        if req.get("operation")?.as_str()? != "download" {
+            return None;
+        }
+        // An omitted list means basic; otherwise the client must offer it.
+        if let Some(transfers) = req.get("transfers")
+            && !transfers.as_array()?.iter().any(|t| t == "basic")
+        {
+            return None;
+        }
+        let mut objects = Vec::new();
+        for obj in req.get("objects")?.as_array()? {
+            let oid = obj.get("oid")?.as_str()?;
+            let size = obj.get("size")?.as_u64()?;
+            if !repo::valid_lfs_oid(oid)
+                || !self
+                    .cached(&repo::lfs_object_path(&self.cfg.cache_root, oid))
+                    .await
+            {
+                return None;
+            }
+            // `authenticated`: the href carries its own credential, so git-lfs
+            // would otherwise prompt for one on the proxy href.
+            objects.push(serde_json::json!({
+                "oid": oid,
+                "size": size,
+                "authenticated": true,
+                "actions": { "download": { "href": "" } },
+            }));
+        }
+        let mut json = serde_json::json!({ "transfer": "basic", "objects": objects });
+        rewrite_download_hrefs(&mut json, advertise_base, repo, grant);
+        serde_json::to_vec(&json).ok()
     }
 
     /// Ensure the object identified by `oid` is on disk and return its path plus
@@ -247,13 +313,22 @@ impl Lfs {
         {
             req = req.header(name, value);
         }
+        // URLs are dropped from errors: they are logged, and an upstream base may
+        // carry userinfo.
         let resp = req
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("send lfs batch")?
             .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .context("lfs batch http status")?;
-        Ok(resp.bytes().await.context("read lfs batch body")?.to_vec())
+        Ok(resp
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("read lfs batch body")?
+            .to_vec())
     }
 
     /// Stream an object href to `out`, sending the batch-supplied `headers`. reqwest
@@ -304,11 +379,24 @@ impl Lfs {
     }
 }
 
+/// Whether an upstream batch failure is transient: a connect or send failure, a
+/// body cut short, or a 5xx. A 4xx is upstream's answer about the
+/// repo or credential and must not be papered over, nor a malformed 2xx body.
+fn is_transient_batch_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<reqwest::Error>())
+        .is_some_and(|e| match e.status() {
+            Some(status) => status.is_server_error(),
+            None => !e.is_builder() && !e.is_redirect(),
+        })
+}
+
 /// Rewrite each object's `download` href to point back at this proxy so the fetch is
 /// cached, and set the object GET's credential from `grant` (or drop it when the
 /// proxy serves anonymously) - the client authenticates to the proxy, not upstream.
 /// Objects carrying an `error`, or an `upload` action, are left untouched, so a
-/// grant is only ever issued for an object upstream listed for `repo`.
+/// grant is only ever issued for an object upstream listed for `repo`, or, with
+/// `--lfs-batch-cache-fallback` (only under `none`/`shared` auth), one already cached.
 /// Malformed entries are skipped rather than failing the batch.
 fn rewrite_download_hrefs(
     json: &mut Value,

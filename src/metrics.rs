@@ -43,6 +43,8 @@ pub enum Status {
     UpstreamError,
     Unauthorized,
     Rejected,
+    /// An LFS batch upstream failed transiently, answered from the cache.
+    CacheFallback,
 }
 
 /// The `op` label on `upstream_ops_total` / `upstream_duration_seconds`.
@@ -115,6 +117,7 @@ impl Status {
             Self::UpstreamError => "upstream_error",
             Self::Unauthorized => "unauthorized",
             Self::Rejected => "rejected",
+            Self::CacheFallback => "cache_fallback",
         }
     }
 }
@@ -163,8 +166,8 @@ pub struct Metrics {
     pub registry: Registry,
     /// `requests_total{kind, result, repo}` - kind = info_refs | upload_pack |
     /// auth | receive_pack | lfs_batch | lfs_object; result = ok | error |
-    /// upstream_error | unauthorized | rejected; repo = the served repo path when
-    /// result = ok, else `-`.
+    /// upstream_error | unauthorized | rejected | cache_fallback; repo = the served
+    /// repo path when result = ok, else `-`.
     requests: IntCounterVec,
     /// `upstream_ops_total{op, result, repo}` - op = clone | fetch | want_fetch;
     /// result = ok | error; repo = the repo path when result = ok, else `-`.
