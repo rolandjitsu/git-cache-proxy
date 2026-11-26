@@ -893,15 +893,9 @@ impl GitCache {
             .map(|failed| redact_stderr(&failed.stderr, secret))
             .unwrap_or_default();
         let (error_kind, error) = (kind.as_str(), format!("{error:#}"));
+        let message = "upstream operation failed";
         tracing::warn!(
-            op,
-            trigger,
-            repo,
-            error_kind,
-            elapsed_ms,
-            stderr,
-            error,
-            "upstream operation failed"
+            op, trigger, repo, error_kind, elapsed_ms, stderr, error, message
         );
     }
 
