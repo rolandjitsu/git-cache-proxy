@@ -97,6 +97,30 @@ pub fn validate_upstream_credential(
     Ok(())
 }
 
+/// Reject a `--lfs-batch-cache-fallback` that would bypass an authorization
+/// check. In `client` upstream-credential mode the upstream batch runs on the
+/// client's own credential, so it is what authorizes the client. Under a
+/// `github`/`gitlab`/`custom` provider a batch grant binds an object to the
+/// validated repo, and only the upstream batch confirms the object belongs to
+/// that repo; the cache is shared across repos, so a fallback would let a
+/// client reach another repo's cached object by its oid.
+pub fn validate_lfs_batch_cache_fallback(
+    enabled: bool,
+    mode: UpstreamCredential,
+    provider: AuthProvider,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if mode != UpstreamCredential::Static {
+        bail!("--lfs-batch-cache-fallback requires --upstream-credential static");
+    }
+    if !matches!(provider, AuthProvider::None | AuthProvider::Shared) {
+        bail!("--lfs-batch-cache-fallback requires --auth-provider none or shared, not {provider}");
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "git-cache-proxy",
@@ -213,6 +237,13 @@ pub struct Config {
     /// every request, the safest default.
     #[arg(long, env = "GITCACHEPROXY_AUTH_TTL_SECONDS", default_value_t = 0)]
     pub auth_ttl_seconds: u64,
+
+    /// Answer an LFS download batch from the cache when the upstream batch fails
+    /// transiently (no response, or a 5xx). Requires `--upstream-credential static`
+    /// and `--auth-provider none` or `shared`, where the upstream batch authorizes
+    /// nothing the client could not already reach.
+    #[arg(long, env = "GITCACHEPROXY_LFS_BATCH_CACHE_FALLBACK")]
+    pub lfs_batch_cache_fallback: bool,
 
     /// Total seconds per upstream clone, full-ref fetch or SHA backfill,
     /// including all attempts and retry delays. Must be positive.
@@ -423,6 +454,46 @@ mod tests {
             AuthProvider::Custom,
         ] {
             let err = validate_upstream_credential(UpstreamCredential::Client, provider, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--auth-provider"), "{err}");
+        }
+    }
+
+    #[test]
+    fn lfs_batch_cache_fallback_needs_static_mode_and_no_per_repo_auth() {
+        let all = [
+            AuthProvider::None,
+            AuthProvider::Shared,
+            AuthProvider::Github,
+            AuthProvider::Gitlab,
+            AuthProvider::Custom,
+        ];
+        for provider in all {
+            for mode in [UpstreamCredential::Static, UpstreamCredential::Client] {
+                assert!(validate_lfs_batch_cache_fallback(false, mode, provider).is_ok());
+            }
+        }
+        for provider in [AuthProvider::None, AuthProvider::Shared] {
+            assert!(
+                validate_lfs_batch_cache_fallback(true, UpstreamCredential::Static, provider)
+                    .is_ok()
+            );
+        }
+        let err = validate_lfs_batch_cache_fallback(
+            true,
+            UpstreamCredential::Client,
+            AuthProvider::Github,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--upstream-credential static"), "{err}");
+        for provider in [
+            AuthProvider::Github,
+            AuthProvider::Gitlab,
+            AuthProvider::Custom,
+        ] {
+            let err = validate_lfs_batch_cache_fallback(true, UpstreamCredential::Static, provider)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("--auth-provider"), "{err}");

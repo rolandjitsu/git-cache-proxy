@@ -82,6 +82,12 @@ cannot fetch another repo's object from the shared object cache. Every replica
 behind one address must share `--auth-signing-key`, or a grant issued by one
 is refused by the others; the caches themselves stay independent.
 
+That repo binding relies on the upstream batch to confirm an object belongs to
+the repo, which is why `--lfs-batch-cache-fallback` (answering a batch from the
+cache while upstream is down) is refused at startup with a provider mode or
+`--upstream-credential client`. With `none` or `shared` auth any client can
+already GET any cached object, so the fallback grants nothing new.
+
 ### Fetch upstream with the client's credential (`--upstream-credential client`)
 
 In the default `static` mode the proxy clones and fetches upstream with the one

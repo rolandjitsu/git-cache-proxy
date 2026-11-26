@@ -2,8 +2,8 @@
 //! End-to-end git-LFS tests: a mock upstream LFS server (batch API + object storage)
 //! on a live socket, with the proxy driven in-process reaching it over real HTTP.
 //! Verifies batch href rewriting, a cache miss (fetch + sha256 verify + store), a
-//! cache hit served from disk without touching upstream, and rejection of a
-//! corrupted object.
+//! cache hit served from disk without touching upstream, rejection of a
+//! corrupted object, and the batch cache fallback on a transient upstream failure.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -292,6 +292,133 @@ async fn batch_upstream_failure_returns_bad_gateway() {
     ));
 }
 
+/// A transient upstream batch failure (504) with every object cached is
+/// answered locally, and the object GET is a plain cache hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_serves_a_fully_cached_batch_on_upstream_5xx() {
+    let (addr, batches) = spawn_upstream(Mode::BatchStatus(StatusCode::GATEWAY_TIMEOUT)).await;
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let state = proxy_state_with(addr, cache.path(), metrics.clone(), true);
+    let oid = seed(cache.path(), PAYLOAD).await;
+
+    let resp = batch(state.clone(), &[(&oid, PAYLOAD.len())]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let obj = &json["objects"][0];
+    assert_eq!(obj["oid"], oid.as_str());
+    assert_eq!(obj["size"], PAYLOAD.len());
+    let href = obj["actions"]["download"]["href"].as_str().unwrap();
+    assert_eq!(
+        href,
+        format!(
+            "http://proxy.test:8080/{REPO}/info/lfs/objects/{oid}?size={}",
+            PAYLOAD.len()
+        )
+    );
+    assert_eq!(batches.load(Ordering::SeqCst), 1);
+
+    let path = href.strip_prefix("http://proxy.test:8080").unwrap();
+    let resp = object_get(state, path, None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_bytes(resp).await, PAYLOAD);
+    assert_eq!(
+        batches.load(Ordering::SeqCst),
+        1,
+        "a fallback-served object GET must not re-batch upstream"
+    );
+
+    let scraped = metrics.gather();
+    assert!(scraped.contains(
+        r#"gitcacheproxy_requests_total{kind="lfs_batch",repo="-",result="cache_fallback"} 1"#
+    ));
+    assert!(scraped.contains(r#"gitcacheproxy_lfs_objects_total{result="hit"} 1"#));
+}
+
+/// One uncached object fails the whole batch: the client needs upstream for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_needs_every_object_cached() {
+    let (addr, _batches) = spawn_upstream(Mode::BatchStatus(StatusCode::BAD_GATEWAY)).await;
+    let cache = tempfile::tempdir().unwrap();
+    let state = proxy_state_with(addr, cache.path(), Arc::new(Metrics::new()), true);
+    let cached = seed(cache.path(), PAYLOAD).await;
+    let resp = batch(state, &[(&cached, PAYLOAD.len()), (&oid_of(b"absent"), 6)]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// A connection failure is as transient as a 5xx.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_covers_an_unreachable_upstream() {
+    let cache = tempfile::tempdir().unwrap();
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let state = proxy_state_with(dead, cache.path(), Arc::new(Metrics::new()), true);
+    let oid = seed(cache.path(), PAYLOAD).await;
+    let resp = batch(state, &[(&oid, PAYLOAD.len())]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_with_nothing_cached_still_fails() {
+    let (addr, _batches) = spawn_upstream(Mode::BatchStatus(StatusCode::GATEWAY_TIMEOUT)).await;
+    let cache = tempfile::tempdir().unwrap();
+    let metrics = Arc::new(Metrics::new());
+    let state = proxy_state_with(addr, cache.path(), metrics.clone(), true);
+    let resp = batch(state, &[(&oid_of(PAYLOAD), PAYLOAD.len())]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(metrics.gather().contains(
+        r#"gitcacheproxy_requests_total{kind="lfs_batch",repo="-",result="upstream_error"} 1"#
+    ));
+}
+
+/// A 4xx is upstream's answer about the repo or credential, so it stands even
+/// when the object is cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_never_bypasses_an_upstream_4xx() {
+    for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::UNPROCESSABLE_ENTITY,
+    ] {
+        let (addr, _batches) = spawn_upstream(Mode::BatchStatus(status)).await;
+        let cache = tempfile::tempdir().unwrap();
+        let state = proxy_state_with(addr, cache.path(), Arc::new(Metrics::new()), true);
+        let oid = seed(cache.path(), PAYLOAD).await;
+        let resp = batch(state, &[(&oid, PAYLOAD.len())]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{status}");
+    }
+}
+
+/// The fallback answers only a well-formed basic-transfer download batch; anything
+/// else keeps the upstream failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_refuses_a_malformed_batch() {
+    let (addr, _batches) = spawn_upstream(Mode::BatchStatus(StatusCode::GATEWAY_TIMEOUT)).await;
+    let cache = tempfile::tempdir().unwrap();
+    let state = proxy_state_with(addr, cache.path(), Arc::new(Metrics::new()), true);
+    let oid = seed(cache.path(), PAYLOAD).await;
+    let cached = serde_json::json!({ "oid": oid, "size": PAYLOAD.len() });
+    for body in [
+        serde_json::json!({ "operation": "download", "objects": [cached, { "size": 1 }] }),
+        serde_json::json!({ "operation": "download", "objects": [cached, { "oid": oid }] }),
+        serde_json::json!({ "operation": "download", "transfers": ["custom"], "objects": [cached] }),
+        serde_json::json!({ "objects": [cached] }),
+    ] {
+        let resp = post_batch(state.clone(), body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_is_off_by_default() {
+    let (addr, _batches) = spawn_upstream(Mode::BatchStatus(StatusCode::GATEWAY_TIMEOUT)).await;
+    let cache = tempfile::tempdir().unwrap();
+    let state = proxy_state(addr, cache.path(), Arc::new(Metrics::new()));
+    let oid = seed(cache.path(), PAYLOAD).await;
+    let resp = batch(state, &[(&oid, PAYLOAD.len())]).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
 // --- test helpers --------------------------------------------------------
 
 const REPO: &str = "group/repo.git";
@@ -307,6 +434,8 @@ enum Mode {
     Ok,
     Corrupt,
     Missing,
+    /// The batch endpoint itself fails with this status.
+    BatchStatus(StatusCode),
 }
 
 /// Shared state of the mock upstream: how many batch calls it has served (so a test
@@ -338,6 +467,9 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request<Body>) -> Res
 
     if parts.method == Method::POST && path.ends_with("/info/lfs/objects/batch") {
         up.batches.fetch_add(1, Ordering::SeqCst);
+        if let Mode::BatchStatus(status) = up.mode {
+            return (status, "mock: batch failed").into_response();
+        }
         let repo = path
             .trim_start_matches('/')
             .strip_suffix("/info/lfs/objects/batch")
@@ -382,7 +514,7 @@ async fn upstream_handler(State(up): State<Upstream>, req: Request<Body>) -> Res
         return match up.mode {
             Mode::Ok => (StatusCode::OK, PAYLOAD.to_vec()).into_response(),
             Mode::Corrupt => (StatusCode::OK, b"tampered".to_vec()).into_response(),
-            Mode::Missing => (StatusCode::NOT_FOUND, "gone").into_response(),
+            Mode::Missing | Mode::BatchStatus(_) => (StatusCode::NOT_FOUND, "gone").into_response(),
         };
     }
 
@@ -411,6 +543,16 @@ async fn spawn_upstream(mode: Mode) -> (SocketAddr, Arc<AtomicUsize>) {
 
 /// A proxy `AppState` whose LFS upstream is the mock at `addr`, cached under `cache`.
 fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>) -> AppState {
+    proxy_state_with(addr, cache, metrics, false)
+}
+
+/// `proxy_state`, with the batch cache fallback on when `batch_cache_fallback`.
+fn proxy_state_with(
+    addr: SocketAddr,
+    cache: &std::path::Path,
+    metrics: Arc<Metrics>,
+    batch_cache_fallback: bool,
+) -> AppState {
     let upstream = format!("http://{addr}");
     let idx = CacheIndex::new(cache.to_path_buf(), u64::MAX, metrics.clone());
     let cfg = GitConfig {
@@ -419,14 +561,17 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
     };
     AppState {
         cache: Arc::new(GitCache::new(cfg, metrics.clone(), Some(idx.clone()))),
-        lfs: Arc::new(Lfs::new(
-            LfsConfig {
-                upstream_base: upstream.clone(),
-                cache_root: cache.to_path_buf(),
-                upstream_auth_header: None,
-            },
-            Some(idx),
-        )),
+        lfs: Arc::new(
+            Lfs::new(
+                LfsConfig {
+                    upstream_base: upstream.clone(),
+                    cache_root: cache.to_path_buf(),
+                    upstream_auth_header: None,
+                },
+                Some(idx),
+            )
+            .with_batch_cache_fallback(batch_cache_fallback),
+        ),
         upstream_base: upstream,
         cache_root: cache.to_path_buf(),
         auth: Arc::new(Auth::anonymous()),
@@ -435,6 +580,49 @@ fn proxy_state(addr: SocketAddr, cache: &std::path::Path, metrics: Arc<Metrics>)
         max_concurrent: 8,
         metrics,
     }
+}
+
+/// Store `bytes` in the LFS cache as a previous download would have; returns its oid.
+async fn seed(cache: &std::path::Path, bytes: &[u8]) -> String {
+    let oid = oid_of(bytes);
+    let path = git_cache_proxy::repo::lfs_object_path(cache, &oid);
+    tokio::fs::create_dir_all(path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&path, bytes).await.unwrap();
+    oid
+}
+
+/// POST a download batch for `objects` (`(oid, size)` pairs) to the proxy.
+async fn batch(state: AppState, objects: &[(&str, usize)]) -> Response {
+    let objects: Vec<_> = objects
+        .iter()
+        .map(|(oid, size)| serde_json::json!({ "oid": oid, "size": size }))
+        .collect();
+    post_batch(
+        state,
+        serde_json::json!({
+            "operation": "download",
+            "transfers": ["basic"],
+            "objects": objects,
+        }),
+    )
+    .await
+}
+
+/// POST `body` to the proxy's batch endpoint.
+async fn post_batch(state: AppState, body: serde_json::Value) -> Response {
+    let body = serde_json::to_vec(&body).unwrap();
+    router(state)
+        .oneshot(
+            Request::post(format!("/{REPO}/info/lfs/objects/batch"))
+                .header(header::HOST, "proxy.test:8080")
+                .header(header::CONTENT_TYPE, "application/vnd.git-lfs+json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 fn batch_body(oid: &str, size: usize) -> Vec<u8> {

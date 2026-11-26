@@ -15,7 +15,8 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use git_cache_proxy::config::{
-    Config, LogFormat, UpstreamCredential, validate_upstream_credential,
+    Config, LogFormat, UpstreamCredential, validate_lfs_batch_cache_fallback,
+    validate_upstream_credential,
 };
 use git_cache_proxy::{auth, evict, git, lfs, metrics, repo, server};
 
@@ -47,6 +48,11 @@ async fn main() -> Result<()> {
         cfg.upstream_credential,
         cfg.auth_provider,
         upstream_auth_header.is_some(),
+    )?;
+    validate_lfs_batch_cache_fallback(
+        cfg.lfs_batch_cache_fallback,
+        cfg.upstream_credential,
+        cfg.auth_provider,
     )?;
     match cfg.upstream_credential {
         UpstreamCredential::Client => tracing::info!(
@@ -127,14 +133,17 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    let lfs = Arc::new(lfs::Lfs::new(
-        lfs::LfsConfig {
-            upstream_base: upstream_base.clone(),
-            cache_root: cfg.cache_root.clone(),
-            upstream_auth_header,
-        },
-        index.clone(),
-    ));
+    let lfs = Arc::new(
+        lfs::Lfs::new(
+            lfs::LfsConfig {
+                upstream_base: upstream_base.clone(),
+                cache_root: cfg.cache_root.clone(),
+                upstream_auth_header,
+            },
+            index.clone(),
+        )
+        .with_batch_cache_fallback(cfg.lfs_batch_cache_fallback),
+    );
 
     let state = server::AppState {
         cache: cache.clone(),
