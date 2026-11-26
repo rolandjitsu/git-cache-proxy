@@ -3,6 +3,21 @@
 All notable changes are documented here. This file is managed by
 [knope](https://knope.tech/) from the Conventional Commits on `main`; do not edit it by
 hand.
+## 0.3.0 (2026-11-26)
+
+### Breaking Changes
+
+- upstream_ops_total{result="error"} now counts only
+upstream failures, not cancelled operations.
+
+### Features
+
+- log upstream failures with stderr
+
+### Fixes
+
+- skip cancelled upstream ops
+
 ## 0.2.16 (2026-11-24)
 
 ### Fixes
